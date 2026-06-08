@@ -34,6 +34,7 @@ ${colors.bold("Options:")}
   --json                Print the raw JSON result instead of a rendered report.
   --max-files <n>       Inline-diff cutoff by changed-file count (default 50).
   --max-bytes <n>       Inline-diff cutoff by diff size in bytes (default 262144).
+  --allow-summary-review Allow API providers to review summary-only large diffs.
   --provider <name>     Force provider: anthropic | openai | gemini | <local-cli-cmd>.
   --model <name>        Force the model name.
   -h, --help            Show this help message.
@@ -62,13 +63,40 @@ export function parseArgs(argv) {
     json: false,
     maxFiles: 50,
     maxBytes: 256 * 1024,
+    allowSummaryReview: false,
     provider: null,
     model: null,
     help: false,
-    focus: ""
+    focus: "",
+    errors: []
   };
 
   const focusParts = [];
+
+  function readValue(option, index) {
+    const value = argv[index + 1];
+    if (!value || value.startsWith("-")) {
+      args.errors.push(`${option} requires a value.`);
+      return { value: null, nextIndex: index };
+    }
+    return { value, nextIndex: index + 1 };
+  }
+
+  function readEqualsValue(option, arg) {
+    const value = arg.slice(option.length + 1);
+    if (!value) args.errors.push(`${option} requires a value.`);
+    return value || null;
+  }
+
+  function parseNonNegativeInteger(option, value) {
+    if (value === null) return null;
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+      args.errors.push(`${option} must be a non-negative integer.`);
+      return null;
+    }
+    return parsed;
+  }
 
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
@@ -78,35 +106,49 @@ export function parseArgs(argv) {
       args.promptOnly = true;
     } else if (arg === "--json") {
       args.json = true;
+    } else if (arg === "--allow-summary-review") {
+      args.allowSummaryReview = true;
     } else if (arg === "--base") {
-      args.base = argv[++i];
+      const result = readValue("--base", i);
+      args.base = result.value;
+      i = result.nextIndex;
     } else if (arg.startsWith("--base=")) {
-      args.base = arg.split("=")[1];
+      args.base = readEqualsValue("--base", arg);
     } else if (arg === "--scope") {
-      args.scope = argv[++i];
+      const result = readValue("--scope", i);
+      args.scope = result.value;
+      i = result.nextIndex;
     } else if (arg.startsWith("--scope=")) {
-      args.scope = arg.split("=")[1];
+      args.scope = readEqualsValue("--scope", arg);
     } else if (arg === "--max-files") {
-      args.maxFiles = parseInt(argv[++i], 10);
+      const result = readValue("--max-files", i);
+      args.maxFiles = parseNonNegativeInteger("--max-files", result.value);
+      i = result.nextIndex;
     } else if (arg.startsWith("--max-files=")) {
-      args.maxFiles = parseInt(arg.split("=")[1], 10);
+      args.maxFiles = parseNonNegativeInteger("--max-files", readEqualsValue("--max-files", arg));
     } else if (arg === "--max-bytes") {
-      args.maxBytes = parseInt(argv[++i], 10);
+      const result = readValue("--max-bytes", i);
+      args.maxBytes = parseNonNegativeInteger("--max-bytes", result.value);
+      i = result.nextIndex;
     } else if (arg.startsWith("--max-bytes=")) {
-      args.maxBytes = parseInt(arg.split("=")[1], 10);
+      args.maxBytes = parseNonNegativeInteger("--max-bytes", readEqualsValue("--max-bytes", arg));
     } else if (arg === "--provider") {
-      args.provider = argv[++i];
+      const result = readValue("--provider", i);
+      args.provider = result.value;
+      i = result.nextIndex;
     } else if (arg.startsWith("--provider=")) {
-      args.provider = arg.split("=")[1];
+      args.provider = readEqualsValue("--provider", arg);
     } else if (arg === "--model") {
-      args.model = argv[++i];
+      const result = readValue("--model", i);
+      args.model = result.value;
+      i = result.nextIndex;
     } else if (arg.startsWith("--model=")) {
-      args.model = arg.split("=")[1];
+      args.model = readEqualsValue("--model", arg);
     } else if (arg === "--") {
       focusParts.push(...argv.slice(i + 1));
       break;
     } else if (arg.startsWith("-")) {
-      console.warn(colors.yellow(`Warning: Unknown option "${arg}"`));
+      args.errors.push(`Unknown option "${arg}".`);
     } else {
       focusParts.push(arg);
     }

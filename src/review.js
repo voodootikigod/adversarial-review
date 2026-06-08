@@ -25,11 +25,20 @@ export function buildPrompt(context, focus) {
   );
 }
 
-// Minimal validation against the structural contract in schema.json.
+// Validate against the structural contract in schema.json.
 export function validateResult(result) {
   const errors = [];
-  if (!result || typeof result !== "object") {
+  const rootKeys = ["verdict", "summary", "findings", "next_steps"];
+  const findingKeys = ["severity", "title", "body", "file", "line_start", "line_end", "confidence", "recommendation"];
+
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
     return ["result is not an object"];
+  }
+  for (const key of rootKeys) {
+    if (!(key in result)) errors.push(`${key} is required`);
+  }
+  for (const key of Object.keys(result)) {
+    if (!rootKeys.includes(key)) errors.push(`additional property not allowed: ${key}`);
   }
   if (!["approve", "needs-attention"].includes(result.verdict)) {
     errors.push(`verdict must be "approve" or "needs-attention" (got ${JSON.stringify(result.verdict)})`);
@@ -41,14 +50,33 @@ export function validateResult(result) {
     errors.push("findings must be an array");
   } else {
     result.findings.forEach((f, i) => {
+      if (!f || typeof f !== "object" || Array.isArray(f)) {
+        errors.push(`findings[${i}] must be an object`);
+        return;
+      }
+      for (const key of findingKeys) {
+        if (!(key in f)) errors.push(`findings[${i}].${key} is required`);
+      }
+      for (const key of Object.keys(f)) {
+        if (!findingKeys.includes(key)) errors.push(`findings[${i}] additional property not allowed: ${key}`);
+      }
       if (!["critical", "high", "medium", "low"].includes(f?.severity)) {
         errors.push(`findings[${i}].severity invalid`);
       }
       for (const field of ["title", "body", "file", "recommendation"]) {
-        if (typeof f?.[field] !== "string") errors.push(`findings[${i}].${field} must be a string`);
+        if (typeof f?.[field] !== "string") {
+          errors.push(`findings[${i}].${field} must be a string`);
+        } else if (field !== "recommendation" && !f[field].length) {
+          errors.push(`findings[${i}].${field} must be a non-empty string`);
+        }
       }
       if (!Number.isInteger(f?.line_start)) errors.push(`findings[${i}].line_start must be an integer`);
+      else if (f.line_start < 1) errors.push(`findings[${i}].line_start must be >= 1`);
       if (!Number.isInteger(f?.line_end)) errors.push(`findings[${i}].line_end must be an integer`);
+      else if (f.line_end < 1) errors.push(`findings[${i}].line_end must be >= 1`);
+      if (Number.isInteger(f?.line_start) && Number.isInteger(f?.line_end) && f.line_end < f.line_start) {
+        errors.push(`findings[${i}].line_end must be >= line_start`);
+      }
       if (typeof f?.confidence !== "number" || f.confidence < 0 || f.confidence > 1) {
         errors.push(`findings[${i}].confidence must be a number in [0,1]`);
       }
@@ -56,6 +84,12 @@ export function validateResult(result) {
   }
   if (!Array.isArray(result.next_steps)) {
     errors.push("next_steps must be an array");
+  } else {
+    result.next_steps.forEach((step, i) => {
+      if (typeof step !== "string" || !step.length) {
+        errors.push(`next_steps[${i}] must be a non-empty string`);
+      }
+    });
   }
   return errors;
 }

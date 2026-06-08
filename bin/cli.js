@@ -13,6 +13,11 @@ async function main() {
     process.exit(0);
   }
 
+  if (args.errors.length) {
+    log.error(args.errors.join("\n"));
+    process.exit(1);
+  }
+
   if (!["auto", "working-tree", "branch"].includes(args.scope)) {
     log.error(`Invalid --scope "${args.scope}". Use auto, working-tree, or branch.`);
     process.exit(1);
@@ -54,6 +59,14 @@ async function main() {
     config = configureLLM(args);
   } catch (err) {
     log.error(err.message);
+    process.exit(1);
+  }
+
+  if (!context.includeDiff && config.provider !== "cli" && !args.allowSummaryReview) {
+    log.error(
+      "The target diff is too large to inline, and API providers cannot inspect the repository themselves.\n" +
+        "Use a local CLI provider, raise --max-files/--max-bytes, narrow the review scope, or pass --allow-summary-review to explicitly accept a summary-only API review."
+    );
     process.exit(1);
   }
 

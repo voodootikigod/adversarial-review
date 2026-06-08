@@ -53,6 +53,7 @@ npx adversarial-review --base main --json
 --json                Print the raw JSON result instead of a rendered report.
 --max-files <n>       Inline-diff cutoff by changed-file count (default 50).
 --max-bytes <n>       Inline-diff cutoff by diff size in bytes (default 262144).
+--allow-summary-review Allow API providers to review summary-only large diffs.
 --provider <name>     anthropic | openai | gemini | <local-cli-cmd>.
 --model <name>        Force the model name.
 -h, --help            Show help.
@@ -90,6 +91,11 @@ Mirroring the original skill's collection logic:
 - **Large change**: only a **summary** (status, shortstat, file list) is inlined, and the
   model is told to inspect the diff itself with read-only git commands — useful when the
   model has shell/tool access.
+
+For API providers, summary-only large-diff reviews fail closed by default because the model
+cannot inspect your local repository. Use a local CLI provider, raise the inline limits,
+narrow the scope, or pass `--allow-summary-review` if you intentionally want an API model
+to review only the summary.
 
 ## CI example
 

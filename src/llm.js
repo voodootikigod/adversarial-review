@@ -1,4 +1,6 @@
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
+import fs from "fs";
+import path from "path";
 import { log } from "./utils.js";
 
 // Robustly extract JSON from a model response, even if wrapped in prose or a markdown fence.
@@ -36,12 +38,35 @@ export function cleanJsonResponse(text) {
 
 // Check if a shell command is installed and executable.
 function isCmdInstalled(cmd) {
-  try {
-    execSync(`command -v ${cmd}`, { stdio: "ignore" });
-    return true;
-  } catch {
+  if (!/^[A-Za-z0-9._-]+$/.test(cmd)) {
     return false;
   }
+  const pathDirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  return pathDirs.some((dir) => {
+    const candidate = path.join(dir, cmd);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
+
+function execCli(cliCmd, args, input = null) {
+  return execFileSync(cliCmd, args, {
+    input,
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    maxBuffer: 10 * 1024 * 1024,
+    timeout: 10 * 60 * 1000
+  }).trim();
+}
+
+function cliFallbackArgs(cliCmd, fullPrompt) {
+  if (cliCmd === "claude") return ["-p", fullPrompt];
+  if (cliCmd === "codex") return ["exec", fullPrompt];
+  return [fullPrompt];
 }
 
 // Invoke a local CLI agent (claude, codex, gemini, ...) by piping the prompt to stdin.
@@ -55,33 +80,15 @@ function callCliLLM(cliCmd, prompt, systemInstruction) {
   log.step(`Invoking local subscription agent via command: "${cliCmd}"...`);
 
   try {
-    const stdout = execSync(cliCmd, {
-      input: fullPrompt,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "ignore"],
-      maxBuffer: 10 * 1024 * 1024
-    });
-    return stdout.trim();
+    return execCli(cliCmd, [], fullPrompt);
   } catch (err) {
     try {
       log.substep(`Stdin piping not supported by ${cliCmd}, retrying as argument...`);
-      const escapedPrompt = fullPrompt.replace(/`/g, "\\`").replace(/\$/g, "\\$");
-      let cmdStr;
-      if (cliCmd === "claude") {
-        cmdStr = `claude -p "${escapedPrompt}"`;
-      } else if (cliCmd === "codex") {
-        cmdStr = `codex exec "${escapedPrompt}"`;
-      } else {
-        cmdStr = `${cliCmd} "${escapedPrompt}"`;
-      }
-      const stdout = execSync(cmdStr, {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        maxBuffer: 10 * 1024 * 1024
-      });
-      return stdout.trim();
+      return execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt));
     } catch (err2) {
-      throw new Error(`Failed to execute local CLI agent "${cliCmd}": ${err2.message || err.message}`);
+      const stderr = err2.stderr?.toString("utf8") || err.stderr?.toString("utf8") || "";
+      const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
+      throw new Error(`Failed to execute local CLI agent "${cliCmd}": ${err2.message || err.message}${suffix}`);
     }
   }
 }
