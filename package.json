@@ -1,0 +1,35 @@
+{
+  "name": "adversarial-review",
+  "version": "1.0.0",
+  "description": "Adversarial, ship/no-ship code review of a git diff or branch — runs against any LLM (API or local CLI agent) and returns structured findings",
+  "type": "module",
+  "bin": {
+    "adversarial-review": "bin/cli.js",
+    "adv-review": "bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "prompt-template.md",
+    "schema.json"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "code-review",
+    "adversarial",
+    "llm",
+    "ai",
+    "git",
+    "diff",
+    "static-analysis",
+    "ship-no-ship"
+  ],
+  "license": "MIT",
+  "author": "Chris Williams (@voodootikigod)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voodootikigod/adversarial-review.git"
+  }
+}
