@@ -7,6 +7,33 @@ import { log } from "./utils.js";
 export function cleanJsonResponse(text) {
   let cleaned = text.trim();
 
+  // Try parsing the raw text directly in case it's clean JSON
+  try {
+    JSON.parse(cleaned);
+    return cleaned;
+  } catch {}
+
+  // Strategy 1: Extract markdown JSON code block
+  const jsonBlockMatch = cleaned.match(/```json\s*([\s\S]*?)\s*```/);
+  if (jsonBlockMatch) {
+    const candidate = jsonBlockMatch[1].trim();
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {}
+  }
+
+  // Strategy 2: Extract generic code block
+  const genericBlockMatch = cleaned.match(/```\s*([\s\S]*?)\s*```/);
+  if (genericBlockMatch) {
+    const candidate = genericBlockMatch[1].trim();
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {}
+  }
+
+  // Strategy 3: Falling back to outer bounds index locator
   const firstBrace = cleaned.indexOf("{");
   const firstBracket = cleaned.indexOf("[");
   let startIdx = -1;
@@ -21,19 +48,32 @@ export function cleanJsonResponse(text) {
   }
 
   if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-    cleaned = cleaned.substring(startIdx, endIdx + 1);
+    const candidate = cleaned.substring(startIdx, endIdx + 1).trim();
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {}
+    
+    // Fallback cleanup if the boundary extraction left fences inside
+    let temp = candidate;
+    if (temp.startsWith("```json")) {
+      temp = temp.slice(7);
+    } else if (temp.startsWith("```")) {
+      temp = temp.slice(3);
+    }
+    if (temp.endsWith("```")) {
+      temp = temp.slice(0, -3);
+    }
+    temp = temp.trim();
+    try {
+      JSON.parse(temp);
+      return temp;
+    } catch {}
+    
+    return candidate;
   }
 
-  if (cleaned.startsWith("```json")) {
-    cleaned = cleaned.slice(7);
-  } else if (cleaned.startsWith("```")) {
-    cleaned = cleaned.slice(3);
-  }
-  if (cleaned.endsWith("```")) {
-    cleaned = cleaned.slice(0, -3);
-  }
-
-  return cleaned.trim();
+  return cleaned;
 }
 
 // Check if a shell command is installed and executable.
@@ -42,14 +82,24 @@ function isCmdInstalled(cmd) {
     return false;
   }
   const pathDirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const extensions = process.platform === "win32"
+    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").map(ext => ext.toLowerCase())
+    : [""];
+
   return pathDirs.some((dir) => {
-    const candidate = path.join(dir, cmd);
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return fs.statSync(candidate).isFile();
-    } catch {
-      return false;
+    for (const ext of extensions) {
+      const file = ext && cmd.toLowerCase().endsWith(ext) ? cmd : `${cmd}${ext}`;
+      const candidate = path.join(dir, file);
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        if (fs.statSync(candidate).isFile()) {
+          return true;
+        }
+      } catch {
+        // Continue
+      }
     }
+    return false;
   });
 }
 
@@ -59,7 +109,8 @@ function execCli(cliCmd, args, input = null) {
     encoding: "utf8",
     stdio: ["pipe", "pipe", "pipe"],
     maxBuffer: 10 * 1024 * 1024,
-    timeout: 10 * 60 * 1000
+    timeout: 10 * 60 * 1000,
+    shell: process.platform === "win32"
   }).trim();
 }
 
@@ -179,6 +230,9 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
   let delay = 1000;
 
   while (retries > 0) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
+
     try {
       if (provider === "gemini") {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
@@ -190,7 +244,8 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
         const res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body)
+          body: JSON.stringify(body),
+          signal: controller.signal
         });
         if (!res.ok) throw new Error(`Gemini API error (${res.status}): ${await res.text()}`);
         const data = await res.json();
@@ -209,7 +264,8 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
               { role: "user", content: prompt }
             ],
             response_format: jsonMode ? { type: "json_object" } : undefined
-          })
+          }),
+          signal: controller.signal
         });
         if (!res.ok) throw new Error(`OpenAI API error (${res.status}): ${await res.text()}`);
         const data = await res.json();
@@ -227,18 +283,23 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
             messages: [{ role: "user", content: prompt }],
             system: systemInstruction || undefined,
             max_tokens: 8000
-          })
+          }),
+          signal: controller.signal
         });
         if (!res.ok) throw new Error(`Anthropic API error (${res.status}): ${await res.text()}`);
         const data = await res.json();
         return data.content[0].text;
       }
     } catch (err) {
+      const isTimeout = err.name === "AbortError";
+      const errorMsg = isTimeout ? "request timed out after 60s" : err.message;
       retries--;
-      if (retries === 0) throw err;
-      log.warn(`LLM call failed: ${err.message}. Retrying in ${delay}ms...`);
+      if (retries === 0) throw new Error(isTimeout ? `LLM call failed: ${errorMsg}` : err.message);
+      log.warn(`LLM call failed: ${errorMsg}. Retrying in ${delay}ms...`);
       await new Promise((resolve) => setTimeout(resolve, delay));
       delay *= 2;
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 }

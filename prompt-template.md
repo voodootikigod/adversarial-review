@@ -18,6 +18,8 @@ If something only works on the happy path, treat that as a real weakness.
 
 <attack_surface>
 Prioritize the kinds of failures that are expensive, dangerous, or hard to detect:
+- accuracy, correctness, and completeness (incomplete logic, syntax/import hazards, missing edge cases)
+- adherence to engineering best practices (resource management, error isolation, invariant maintenance)
 - auth, permissions, tenant isolation, and trust boundaries
 - data loss, corruption, duplication, and irreversible state changes
 - rollback safety, retries, partial failure, and idempotency gaps

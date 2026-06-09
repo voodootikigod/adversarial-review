@@ -159,8 +159,25 @@ export function collectReviewContext(cwd, { scope = "auto", base = null, maxFile
   const useBranch = scope === "branch" || (scope === "auto" && base);
   let resolvedBase = base;
   if (useBranch && !resolvedBase) {
-    resolvedBase =
-      git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD@{upstream}"], { allowFail: true }).trim() || "main";
+    resolvedBase = git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD@{upstream}"], { allowFail: true }).trim();
+    if (!resolvedBase) {
+      const remoteHead = git(repoRoot, ["symbolic-ref", "refs/remotes/origin/HEAD"], { allowFail: true }).trim();
+      if (remoteHead) {
+        resolvedBase = remoteHead.split("/").pop();
+      } else {
+        const candidates = ["main", "develop", "master"];
+        for (const candidate of candidates) {
+          const verifyRef = git(repoRoot, ["show-ref", "--verify", `refs/heads/${candidate}`], { allowFail: true }).trim();
+          if (verifyRef) {
+            resolvedBase = candidate;
+            break;
+          }
+        }
+      }
+    }
+    if (!resolvedBase) {
+      resolvedBase = "main";
+    }
   }
 
   const details = useBranch
