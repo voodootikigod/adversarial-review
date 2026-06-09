@@ -1,7 +1,7 @@
 ---
 name: release
 description: Release a new version of adversarial-review (bumps version, tags git, pushes, triggers npm publish)
-license: MIT
+license: Apache-2.0
 user-invocable: true
 metadata:
   version: 1.0.0

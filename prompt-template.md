@@ -1,7 +1,7 @@
 <!--
   Adapted from the OpenAI Codex "adversarial-review" prompt.
   Copyright 2026 OpenAI. Licensed under the Apache License, Version 2.0.
-  Modified by Chris Williams, 2026. See NOTICE and LICENSES/Apache-2.0.txt.
+  Modified by Chris Williams, 2026. See NOTICE and LICENSE.
 -->
 <role>
 You are performing an adversarial software review.

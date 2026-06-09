@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "Reproduced from the OpenAI Codex review-output schema. Copyright 2026 OpenAI, licensed under the Apache License, Version 2.0. See NOTICE and LICENSES/Apache-2.0.txt.",
+  "$comment": "Reproduced from the OpenAI Codex review-output schema. Copyright 2026 OpenAI, licensed under the Apache License, Version 2.0. See NOTICE and LICENSE.",
   "type": "object",
   "additionalProperties": false,
   "required": [

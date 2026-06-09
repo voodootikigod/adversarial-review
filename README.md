@@ -15,10 +15,10 @@ response against a JSON Schema, and prints a report. The verdict is also the **e
 so it drops straight into CI and pre-push hooks.
 
 > The review prompt (`prompt-template.md`) and output schema (`schema.json`) are derived
-> from the OpenAI Codex `adversarial-review` skill (Copyright 2026 OpenAI), licensed under
-> the [Apache License, Version 2.0](LICENSES/Apache-2.0.txt). They have been generalized and
-> stripped of the Codex-specific runtime so the tool works with any model. All other code is
-> original work, licensed under the MIT License. See [NOTICE](NOTICE) for attribution details.
+> from the OpenAI Codex `adversarial-review` skill (Copyright 2026 OpenAI). They have been
+> generalized and stripped of the Codex-specific runtime so the tool works with any model.
+> This project is licensed under the [Apache License, Version 2.0](LICENSE); see
+> [NOTICE](NOTICE) for attribution details.
 
 ## Install
 
@@ -127,4 +127,5 @@ the output contract without touching code.
 
 ## License
 
-MIT © Chris Williams ([@voodootikigod](https://github.com/voodootikigod))
+Apache License, Version 2.0 © Chris Williams ([@voodootikigod](https://github.com/voodootikigod)).
+See [LICENSE](LICENSE) and [NOTICE](NOTICE).

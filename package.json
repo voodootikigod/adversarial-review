@@ -16,8 +16,7 @@
     "prompt-template.md",
     "schema.json",
     "NOTICE",
-    "LICENSE",
-    "LICENSES/"
+    "LICENSE"
   ],
   "engines": {
     "node": ">=18.0.0"
@@ -32,7 +31,7 @@
     "static-analysis",
     "ship-no-ship"
   ],
-  "license": "MIT",
+  "license": "Apache-2.0",
   "author": "Chris Williams (@voodootikigod)",
   "repository": {
     "type": "git",

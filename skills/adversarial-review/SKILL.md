@@ -9,7 +9,7 @@ description: >-
   branch", "will this break", "is this safe to ship", "adversarial review", "code review
   before merge", "review before push", "pre-push review", "CI review gate", "ship or
   no-ship", "find the strongest reason not to ship".
-license: MIT
+license: Apache-2.0
 user-invocable: true
 argument-hint: "[--base <ref>] [--scope auto|working-tree|branch] [focus...]"
 metadata:

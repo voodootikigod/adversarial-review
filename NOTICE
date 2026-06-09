@@ -1,15 +1,14 @@
 adversarial-review
-Copyright (c) 2026 Chris Williams (@voodootikigod)
+Copyright 2026 Chris Williams (@voodootikigod)
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------
+Third-party attribution required by the Apache License, Version 2.0
+------------------------------------------------------------------------
 
 This product includes software derived from the OpenAI Codex
-"adversarial-review" skill.
-
-------------------------------------------------------------------------
-Attribution required by the Apache License, Version 2.0 (Section 4d)
-------------------------------------------------------------------------
-
-The following files are derivative works of, or identical to, material
-from the OpenAI Codex plugin, licensed under the Apache License,
+"adversarial-review" skill, licensed under the Apache License,
 Version 2.0:
 
   - prompt-template.md
@@ -40,11 +39,3 @@ Upstream attribution notice, reproduced from the source NOTICE file:
     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
     implied. See the License for the specific language governing
     permissions and limitations under the License.
-
-A full copy of the Apache License, Version 2.0 is provided in
-LICENSES/Apache-2.0.txt.
-
-------------------------------------------------------------------------
-
-All other files in this project are original work and are licensed under
-the MIT License. See LICENSE.
