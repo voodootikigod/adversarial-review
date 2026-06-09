@@ -14,7 +14,10 @@
     "bin/",
     "src/",
     "prompt-template.md",
-    "schema.json"
+    "schema.json",
+    "NOTICE",
+    "LICENSE",
+    "LICENSES/"
   ],
   "engines": {
     "node": ">=18.0.0"

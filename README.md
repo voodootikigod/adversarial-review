@@ -14,8 +14,11 @@ Gemini API, or a local CLI agent like `claude` / `codex` / `gemini`), validates 
 response against a JSON Schema, and prints a report. The verdict is also the **exit code**,
 so it drops straight into CI and pre-push hooks.
 
-> Extracted and generalized from the Codex `adversarial-review` skill, stripped of its
-> Codex-specific runtime so it works with any model.
+> The review prompt (`prompt-template.md`) and output schema (`schema.json`) are derived
+> from the OpenAI Codex `adversarial-review` skill (Copyright 2026 OpenAI), licensed under
+> the [Apache License, Version 2.0](LICENSES/Apache-2.0.txt). They have been generalized and
+> stripped of the Codex-specific runtime so the tool works with any model. All other code is
+> original work, licensed under the MIT License. See [NOTICE](NOTICE) for attribution details.
 
 ## Install
 
