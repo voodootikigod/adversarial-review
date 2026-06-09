@@ -13,7 +13,7 @@ license: MIT
 user-invocable: true
 argument-hint: "[--base <ref>] [--scope auto|working-tree|branch] [focus...]"
 metadata:
-  version: 1.0.0
+  version: 1.1.0
   author: Chris Williams (@voodootikigod)
   homepage: https://github.com/voodootikigod/adversarial-review
 ---
