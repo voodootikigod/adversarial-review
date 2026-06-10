@@ -35,8 +35,11 @@ ${colors.bold("Options:")}
   --max-files <n>       Inline-diff cutoff by changed-file count (default 50).
   --max-bytes <n>       Inline-diff cutoff by diff size in bytes (default 262144).
   --allow-summary-review Allow API providers to review summary-only large diffs.
-  --provider <name>     Force provider: anthropic | openai | gemini | <local-cli-cmd>.
+  --provider <name>     Force provider: anthropic | openai | gemini | cursor | <local-cli-cmd>.
   --model <name>        Force the model name.
+  --api-base <url>      Override the active provider's API base URL.
+  --api-key <key>       Override the active provider's API key.
+  --headers <json>      Inject custom JSON headers into the LLM request.
   -h, --help            Show this help message.
 
 ${colors.bold("LLM selection (when not --prompt-only):")}
@@ -47,6 +50,11 @@ ${colors.bold("Environment Variables:")}
   ANTHROPIC_API_KEY     Use the Anthropic API.
   GEMINI_API_KEY        Use the Gemini API.
   OPENAI_API_KEY        Use the OpenAI API.
+  OPENAI_API_BASE       Override base URL for OpenAI provider.
+  ANTHROPIC_API_BASE    Override base URL for Anthropic provider.
+  GEMINI_API_BASE       Override base URL for Gemini provider.
+  LLM_API_KEY           Override API key for the active provider.
+  LLM_HEADERS           JSON string of custom headers to inject.
 
 ${colors.bold("Exit codes:")}
   0  approve            No material adversarial finding.
@@ -66,6 +74,9 @@ export function parseArgs(argv) {
     allowSummaryReview: false,
     provider: null,
     model: null,
+    apiBase: null,
+    apiKey: null,
+    headers: null,
     help: false,
     focus: "",
     errors: []
@@ -144,6 +155,24 @@ export function parseArgs(argv) {
       i = result.nextIndex;
     } else if (arg.startsWith("--model=")) {
       args.model = readEqualsValue("--model", arg);
+    } else if (arg === "--api-base") {
+      const result = readValue("--api-base", i);
+      args.apiBase = result.value;
+      i = result.nextIndex;
+    } else if (arg.startsWith("--api-base=")) {
+      args.apiBase = readEqualsValue("--api-base", arg);
+    } else if (arg === "--api-key") {
+      const result = readValue("--api-key", i);
+      args.apiKey = result.value;
+      i = result.nextIndex;
+    } else if (arg.startsWith("--api-key=")) {
+      args.apiKey = readEqualsValue("--api-key", arg);
+    } else if (arg === "--headers") {
+      const result = readValue("--headers", i);
+      args.headers = result.value;
+      i = result.nextIndex;
+    } else if (arg.startsWith("--headers=")) {
+      args.headers = readEqualsValue("--headers", arg);
     } else if (arg === "--") {
       focusParts.push(...argv.slice(i + 1));
       break;

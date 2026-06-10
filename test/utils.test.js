@@ -20,3 +20,37 @@ test("parseArgs accepts explicit summary-review opt in", () => {
   assert.equal(args.maxFiles, 0);
   assert.deepEqual(args.errors, []);
 });
+
+test("parseArgs parses --api-base, --api-key, and --headers", () => {
+  const args = parseArgs([
+    "node",
+    "cli",
+    "--api-base",
+    "https://gateway.ai.vercel.com/v1/providers/openai",
+    "--api-key",
+    "test-key",
+    "--headers",
+    '{"x-custom":"val"}'
+  ]);
+
+  assert.equal(args.apiBase, "https://gateway.ai.vercel.com/v1/providers/openai");
+  assert.equal(args.apiKey, "test-key");
+  assert.equal(args.headers, '{"x-custom":"val"}');
+  assert.deepEqual(args.errors, []);
+});
+
+test("parseArgs parses equals format for --api-base, --api-key, and --headers", () => {
+  const args = parseArgs([
+    "node",
+    "cli",
+    "--api-base=https://gateway.ai.vercel.com/v1/providers/openai",
+    "--api-key=test-key",
+    "--headers={\"x-custom\":\"val\"}"
+  ]);
+
+  assert.equal(args.apiBase, "https://gateway.ai.vercel.com/v1/providers/openai");
+  assert.equal(args.apiKey, "test-key");
+  assert.equal(args.headers, '{"x-custom":"val"}');
+  assert.deepEqual(args.errors, []);
+});
+

@@ -151,31 +151,90 @@ export function configureLLM(args) {
   let cliCmd = null;
 
   if (!provider) {
-    if (process.env.ANTHROPIC_API_KEY) {
-      provider = "anthropic";
-    } else if (process.env.GEMINI_API_KEY) {
-      provider = "gemini";
-    } else if (process.env.OPENAI_API_KEY) {
-      provider = "openai";
-    } else if (isCmdInstalled("claude")) {
-      provider = "cli";
-      cliCmd = "claude";
-    } else if (isCmdInstalled("codex")) {
-      provider = "cli";
-      cliCmd = "codex";
-    } else if (isCmdInstalled("gemini")) {
-      provider = "cli";
-      cliCmd = "gemini";
+    const isClaudeCodeEnv = !!(process.env.CLAUDECODE || process.env.CLAUDE_CODE);
+    const isCursorEnv = process.env.TERM_PROGRAM === "cursor";
+
+    if (isClaudeCodeEnv) {
+      // Builder is Claude. Try to find a non-Claude/Anthropic critic to break the monoculture.
+      if (process.env.GEMINI_API_KEY) {
+        provider = "gemini";
+      } else if (process.env.OPENAI_API_KEY) {
+        provider = "openai";
+      } else if (isCmdInstalled("codex")) {
+        provider = "cli";
+        cliCmd = "codex";
+      } else if (isCmdInstalled("gemini")) {
+        provider = "cli";
+        cliCmd = "gemini";
+      } else {
+        // Fall back to Claude/Anthropic if nothing else is available
+        if (process.env.ANTHROPIC_API_KEY) {
+          provider = "anthropic";
+        } else if (isCmdInstalled("claude")) {
+          provider = "cli";
+          cliCmd = "claude";
+        } else {
+          throw new Error(
+            "No LLM configuration found.\n" +
+            "Set an API key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY),\n" +
+            "or install a local CLI agent (claude, codex, or gemini).\n" +
+            "Or run with --prompt-only to just print the prompt."
+          );
+        }
+        log.warn("Running in Claude Code, but fell back to Claude for review.");
+        log.info("This review is not a pure adversarial review (same provider). To minimize bias, we will execute it in a fresh, isolated context window.");
+      }
+    } else if (isCursorEnv) {
+      // Builder is likely Cursor (OpenAI/Claude). Try to find an independent critic first.
+      if (process.env.GEMINI_API_KEY) {
+        provider = "gemini";
+      } else if (process.env.ANTHROPIC_API_KEY) {
+        provider = "anthropic";
+      } else if (process.env.OPENAI_API_KEY) {
+        provider = "openai";
+      } else if (isCmdInstalled("gemini")) {
+        provider = "cli";
+        cliCmd = "gemini";
+      } else if (isCmdInstalled("claude")) {
+        provider = "cli";
+        cliCmd = "claude";
+      } else if (isCmdInstalled("codex")) {
+        provider = "cli";
+        cliCmd = "codex";
+      } else {
+        // Default to Cursor's local proxy if no independent options are available
+        provider = "cursor";
+        log.warn("Running in Cursor, but fell back to Cursor's local LLM proxy.");
+        log.info("This review is not a pure adversarial review (same provider). To minimize bias, we will execute it in a fresh, isolated context window.");
+      }
     } else {
-      throw new Error(
-        "No LLM configuration found.\n" +
-        "Set an API key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY),\n" +
-        "or install a local CLI agent (claude, codex, or gemini).\n" +
-        "Or run with --prompt-only to just print the prompt."
-      );
+      // Default auto-detection order (Anthropic > Gemini > OpenAI > Local CLI agents)
+      if (process.env.ANTHROPIC_API_KEY) {
+        provider = "anthropic";
+      } else if (process.env.GEMINI_API_KEY) {
+        provider = "gemini";
+      } else if (process.env.OPENAI_API_KEY) {
+        provider = "openai";
+      } else if (isCmdInstalled("claude")) {
+        provider = "cli";
+        cliCmd = "claude";
+      } else if (isCmdInstalled("codex")) {
+        provider = "cli";
+        cliCmd = "codex";
+      } else if (isCmdInstalled("gemini")) {
+        provider = "cli";
+        cliCmd = "gemini";
+      } else {
+        throw new Error(
+          "No LLM configuration found.\n" +
+          "Set an API key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY),\n" +
+          "or install a local CLI agent (claude, codex, or gemini).\n" +
+          "Or run with --prompt-only to just print the prompt."
+        );
+      }
     }
   } else {
-    const knownApis = ["gemini", "openai", "anthropic"];
+    const knownApis = ["gemini", "openai", "anthropic", "cursor"];
     if (!knownApis.includes(provider)) {
       if (isCmdInstalled(provider)) {
         cliCmd = provider;
@@ -186,15 +245,41 @@ export function configureLLM(args) {
     }
   }
 
-  if (provider === "gemini") {
-    apiKey = process.env.GEMINI_API_KEY;
-  } else if (provider === "openai") {
-    apiKey = process.env.OPENAI_API_KEY;
-  } else if (provider === "anthropic") {
-    apiKey = process.env.ANTHROPIC_API_KEY;
+  // Resolve API Key (CLI flag > LLM_API_KEY > provider-specific env var)
+  apiKey = args.apiKey || process.env.LLM_API_KEY;
+  if (!apiKey) {
+    if (provider === "gemini") {
+      apiKey = process.env.GEMINI_API_KEY;
+    } else if (provider === "openai") {
+      apiKey = process.env.OPENAI_API_KEY;
+    } else if (provider === "anthropic") {
+      apiKey = process.env.ANTHROPIC_API_KEY;
+    } else if (provider === "cursor") {
+      apiKey = process.env.OPENAI_API_KEY || "dummy";
+    }
   }
 
-  if (provider !== "cli" && !apiKey) {
+  // Resolve API Base URL (CLI flag > provider-specific env var > default)
+  let apiBase = args.apiBase;
+  if (!apiBase) {
+    if (provider === "openai") {
+      apiBase = process.env.OPENAI_API_BASE || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
+    } else if (provider === "anthropic") {
+      apiBase = process.env.ANTHROPIC_API_BASE || process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com/v1";
+    } else if (provider === "gemini") {
+      apiBase = process.env.GEMINI_API_BASE || process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+    } else if (provider === "cursor") {
+      apiBase = "http://127.0.0.1:8765/v1";
+    }
+  }
+
+  const isCustomBase = !!(args.apiBase ||
+    (provider === "openai" && (process.env.OPENAI_API_BASE || process.env.OPENAI_BASE_URL)) ||
+    (provider === "anthropic" && (process.env.ANTHROPIC_API_BASE || process.env.ANTHROPIC_BASE_URL)) ||
+    (provider === "gemini" && (process.env.GEMINI_API_BASE || process.env.GEMINI_BASE_URL))
+  );
+
+  if (provider !== "cli" && !apiKey && !isCustomBase && provider !== "cursor") {
     throw new Error(`Provider "${provider}" requested but corresponding API key is not set in environment.`);
   }
 
@@ -206,6 +291,25 @@ export function configureLLM(args) {
       model = "gpt-4o";
     } else if (provider === "anthropic") {
       model = "claude-sonnet-4-6";
+    } else if (provider === "cursor") {
+      model = "gpt-4o";
+    }
+  }
+
+  // Resolve custom headers
+  let customHeaders = {};
+  if (process.env.LLM_HEADERS) {
+    try {
+      customHeaders = JSON.parse(process.env.LLM_HEADERS);
+    } catch (e) {
+      log.warn(`Failed to parse LLM_HEADERS environment variable: ${e.message}`);
+    }
+  }
+  if (args.headers) {
+    try {
+      customHeaders = { ...customHeaders, ...JSON.parse(args.headers) };
+    } catch (e) {
+      log.warn(`Failed to parse --headers CLI argument: ${e.message}`);
     }
   }
 
@@ -215,12 +319,12 @@ export function configureLLM(args) {
     log.info(`Using LLM provider: ${provider} (model: ${model})`);
   }
 
-  return { provider, model, apiKey, cliCmd };
+  return { provider, model, apiKey, cliCmd, apiBase, customHeaders };
 }
 
 // Universal LLM call wrapper with retry/backoff for API providers.
 export async function llmCall(config, prompt, systemInstruction = "", jsonMode = false) {
-  const { provider, model, apiKey, cliCmd } = config;
+  const { provider, model, apiKey, cliCmd, apiBase, customHeaders } = config;
 
   if (provider === "cli") {
     return callCliLLM(cliCmd, prompt, systemInstruction);
@@ -235,15 +339,22 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
 
     try {
       if (provider === "gemini") {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+        let url = `${apiBase.replace(/\/$/, "")}/v1beta/models/${model}:generateContent`;
+        if (apiKey) {
+          url += `?key=${apiKey}`;
+        }
         const body = {
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
           generationConfig: jsonMode ? { responseMimeType: "application/json" } : undefined
         };
+        const headers = {
+          "Content-Type": "application/json",
+          ...customHeaders
+        };
         const res = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: JSON.stringify(body),
           signal: controller.signal
         });
@@ -253,10 +364,18 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
           throw new Error("Invalid response format from Gemini API: " + JSON.stringify(data));
         }
         return data.candidates[0].content.parts[0].text;
-      } else if (provider === "openai") {
-        const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      } else if (provider === "openai" || provider === "cursor") {
+        const url = `${apiBase.replace(/\/$/, "")}/chat/completions`;
+        const headers = {
+          "Content-Type": "application/json",
+          ...customHeaders
+        };
+        if (apiKey) {
+          headers["Authorization"] = `Bearer ${apiKey}`;
+        }
+        const res = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          headers,
           body: JSON.stringify({
             model,
             messages: [
@@ -267,17 +386,22 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
           }),
           signal: controller.signal
         });
-        if (!res.ok) throw new Error(`OpenAI API error (${res.status}): ${await res.text()}`);
+        if (!res.ok) throw new Error(`${provider === "cursor" ? "Cursor" : "OpenAI"} API error (${res.status}): ${await res.text()}`);
         const data = await res.json();
         return data.choices[0].message.content;
       } else if (provider === "anthropic") {
-        const res = await fetch("https://api.anthropic.com/v1/messages", {
+        const url = `${apiBase.replace(/\/$/, "")}/messages`;
+        const headers = {
+          "Content-Type": "application/json",
+          "anthropic-version": "2023-06-01",
+          ...customHeaders
+        };
+        if (apiKey) {
+          headers["x-api-key"] = apiKey;
+        }
+        const res = await fetch(url, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKey,
-            "anthropic-version": "2023-06-01"
-          },
+          headers,
           body: JSON.stringify({
             model,
             messages: [{ role: "user", content: prompt }],
