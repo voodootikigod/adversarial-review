@@ -1,10 +1,12 @@
 {
   "name": "adversarial-review",
-  "version": "1.1.1",
+  "version": "2.0.0",
   "description": "Adversarial, ship/no-ship code review of a git diff or branch — runs against any LLM (API or local CLI agent) and returns structured findings",
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "sync-skill": "node -e \"const fs=require('fs');for(const f of ['prompt-template.md','schema.json'])fs.copyFileSync(f,'skills/adversarial-review/references/'+f)\"",
+    "prepublishOnly": "npm run sync-skill && npm test"
   },
   "bin": {
     "adversarial-review": "bin/cli.js",

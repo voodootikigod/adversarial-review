@@ -117,6 +117,10 @@ test("configureLLM auto-detects Cursor context when no provider/key specified", 
   delete process.env.OPENAI_API_KEY;
   delete process.env.ANTHROPIC_API_KEY;
   delete process.env.GEMINI_API_KEY;
+  // Running this suite inside Claude Code sets CLAUDECODE; clear it so the
+  // Cursor detection branch is actually exercised.
+  delete process.env.CLAUDECODE;
+  delete process.env.CLAUDE_CODE;
   process.env.TERM_PROGRAM = "cursor";
   process.env.PATH = ""; // Isolate PATH so no local CLI commands match
 
@@ -172,7 +176,7 @@ test("configureLLM prioritizes non-Anthropic critic in Claude Code if key is pre
   try {
     const config = configureLLM({});
     assert.equal(config.provider, "gemini");
-    assert.equal(config.model, "gemini-2.5-flash");
+    assert.equal(config.model, "gemini-2.5-pro");
     assert.equal(config.apiKey, "mock-gemini-key");
   } finally {
     process.env = oldEnv;

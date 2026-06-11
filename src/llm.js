@@ -2,6 +2,12 @@ import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { log } from "./utils.js";
+import { sanitizeSchemaForProvider } from "./schema-validate.js";
+
+const DEFAULT_TIMEOUT_MS = 120 * 1000;
+// Conservative argv-size guard: macOS caps a single argument well below Linux's
+// ARG_MAX; past this we refuse the argv fallback rather than fail with E2BIG.
+const MAX_ARGV_PROMPT_BYTES = 100 * 1024;
 
 // Robustly extract JSON from a model response, even if wrapped in prose or a markdown fence.
 export function cleanJsonResponse(text) {
@@ -53,7 +59,7 @@ export function cleanJsonResponse(text) {
       JSON.parse(candidate);
       return candidate;
     } catch {}
-    
+
     // Fallback cleanup if the boundary extraction left fences inside
     let temp = candidate;
     if (temp.startsWith("```json")) {
@@ -69,7 +75,7 @@ export function cleanJsonResponse(text) {
       JSON.parse(temp);
       return temp;
     } catch {}
-    
+
     return candidate;
   }
 
@@ -133,6 +139,15 @@ function callCliLLM(cliCmd, prompt, systemInstruction) {
   try {
     return execCli(cliCmd, [], fullPrompt);
   } catch (err) {
+    if (Buffer.byteLength(fullPrompt) > MAX_ARGV_PROMPT_BYTES) {
+      const stderr = err.stderr?.toString("utf8").trim() || "";
+      throw new Error(
+        `Local CLI agent "${cliCmd}" rejected the prompt on stdin, and the prompt is too large ` +
+          `(${Buffer.byteLength(fullPrompt)} bytes) to pass as a command-line argument. ` +
+          `Lower --max-bytes, narrow the scope, or use an API provider.` +
+          (stderr ? `\n${stderr}` : "")
+      );
+    }
     try {
       log.substep(`Stdin piping not supported by ${cliCmd}, retrying as argument...`);
       return execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt));
@@ -285,10 +300,12 @@ export function configureLLM(args) {
 
   let model = args.model;
   if (!model && provider !== "cli") {
+    // Gate quality tracks model tier — default to the strong tier of each
+    // provider, not the cheap one. Override with --model for cost control.
     if (provider === "gemini") {
-      model = "gemini-2.5-flash";
+      model = "gemini-2.5-pro";
     } else if (provider === "openai") {
-      model = "gpt-4o";
+      model = "gpt-5";
     } else if (provider === "anthropic") {
       model = "claude-sonnet-4-6";
     } else if (provider === "cursor") {
@@ -313,18 +330,51 @@ export function configureLLM(args) {
     }
   }
 
+  const timeoutMs = Number.isSafeInteger(args.timeout) && args.timeout > 0
+    ? args.timeout * 1000
+    : DEFAULT_TIMEOUT_MS;
+
   if (provider === "cli") {
     log.info(`Using local CLI agent: ${cliCmd} (active subscription/session)`);
   } else {
     log.info(`Using LLM provider: ${provider} (model: ${model})`);
   }
 
-  return { provider, model, apiKey, cliCmd, apiBase, customHeaders };
+  return { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs };
 }
 
-// Universal LLM call wrapper with retry/backoff for API providers.
-export async function llmCall(config, prompt, systemInstruction = "", jsonMode = false) {
-  const { provider, model, apiKey, cliCmd, apiBase, customHeaders } = config;
+function apiError(provider, status, bodyText) {
+  const err = new Error(`${provider} API error (${status}): ${bodyText}`);
+  err.status = status;
+  return err;
+}
+
+function truncationError(provider) {
+  const err = new Error(
+    `${provider} response was truncated by the output token limit before the JSON completed. ` +
+      `Narrow the scope or lower --max-bytes so the review fits.`
+  );
+  err.noRetry = true;
+  return err;
+}
+
+// Retry only failures that can plausibly succeed on a retry: rate limits,
+// server errors, timeouts, and network-level failures. 4xx (bad request, bad
+// key, bad model name) and truncation are deterministic — fail fast.
+function isRetryable(err) {
+  if (err.noRetry) return false;
+  if (err.name === "AbortError") return true;
+  if (typeof err.status === "number") return err.status === 429 || err.status >= 500;
+  return true; // No status: fetch network error, DNS failure, etc.
+}
+
+// Universal LLM call wrapper with selective retry/backoff for API providers.
+// When `schema` is provided, the provider's native structured-output mode is
+// used (Anthropic forced tool-use, OpenAI strict json_schema, Gemini
+// responseSchema) so well-formed JSON is enforced at the API layer, not by
+// post-hoc text scraping.
+export async function llmCall(config, prompt, systemInstruction = "", schema = null) {
+  const { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs } = config;
 
   if (provider === "cli") {
     return callCliLLM(cliCmd, prompt, systemInstruction);
@@ -332,38 +382,53 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
 
   let retries = 3;
   let delay = 1000;
+  // Custom OpenAI-compatible gateways may not support strict json_schema;
+  // remember a rejection and degrade to json_object for the rest of the run.
+  let strictSchemaUnsupported = false;
 
   while (retries > 0) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
     try {
       if (provider === "gemini") {
-        let url = `${apiBase.replace(/\/$/, "")}/v1beta/models/${model}:generateContent`;
-        if (apiKey) {
-          url += `?key=${apiKey}`;
-        }
+        // Tolerate custom bases that already include the version segment
+        // (e.g. a gateway configured as https://proxy/gemini/v1beta).
+        const base = apiBase.replace(/\/$/, "").replace(/\/v1(?:beta)?$/, "");
+        const url = `${base}/v1beta/models/${model}:generateContent`;
         const body = {
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
-          generationConfig: jsonMode ? { responseMimeType: "application/json" } : undefined
+          generationConfig: schema
+            ? {
+                responseMimeType: "application/json",
+                responseSchema: sanitizeSchemaForProvider(schema, { extraDrop: ["additionalProperties"] })
+              }
+            : undefined
         };
         const headers = {
           "Content-Type": "application/json",
           ...customHeaders
         };
+        if (apiKey) {
+          // Header, not query string: a key in the URL leaks into proxy and
+          // access logs and error messages.
+          headers["x-goog-api-key"] = apiKey;
+        }
         const res = await fetch(url, {
           method: "POST",
           headers,
           body: JSON.stringify(body),
           signal: controller.signal
         });
-        if (!res.ok) throw new Error(`Gemini API error (${res.status}): ${await res.text()}`);
+        if (!res.ok) throw apiError("Gemini", res.status, await res.text());
         const data = await res.json();
-        if (!data.candidates?.[0]?.content?.parts) {
+        const candidate = data.candidates?.[0];
+        if (!candidate?.content?.parts) {
           throw new Error("Invalid response format from Gemini API: " + JSON.stringify(data));
         }
-        return data.candidates[0].content.parts[0].text;
+        if (candidate.finishReason === "MAX_TOKENS") throw truncationError("Gemini");
+        return candidate.content.parts.map((p) => p.text || "").join("");
       } else if (provider === "openai" || provider === "cursor") {
         const url = `${apiBase.replace(/\/$/, "")}/chat/completions`;
         const headers = {
@@ -372,6 +437,16 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
         };
         if (apiKey) {
           headers["Authorization"] = `Bearer ${apiKey}`;
+        }
+        let responseFormat;
+        if (schema) {
+          responseFormat =
+            provider === "openai" && !strictSchemaUnsupported
+              ? {
+                  type: "json_schema",
+                  json_schema: { name: "adversarial_review", strict: true, schema: sanitizeSchemaForProvider(schema) }
+                }
+              : { type: "json_object" };
         }
         const res = await fetch(url, {
           method: "POST",
@@ -382,13 +457,33 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
               ...(systemInstruction ? [{ role: "system", content: systemInstruction }] : []),
               { role: "user", content: prompt }
             ],
-            response_format: jsonMode ? { type: "json_object" } : undefined
+            response_format: responseFormat
           }),
           signal: controller.signal
         });
-        if (!res.ok) throw new Error(`${provider === "cursor" ? "Cursor" : "OpenAI"} API error (${res.status}): ${await res.text()}`);
+        if (!res.ok) {
+          const text = await res.text();
+          if (
+            res.status === 400 &&
+            schema &&
+            !strictSchemaUnsupported &&
+            /response_format|json_schema/i.test(text)
+          ) {
+            log.warn("Endpoint rejected strict json_schema output; degrading to json_object mode.");
+            strictSchemaUnsupported = true;
+            retries--; // The degraded re-attempt counts against the retry budget.
+            if (retries === 0) throw apiError("OpenAI", res.status, text);
+            continue;
+          }
+          throw apiError(provider === "cursor" ? "Cursor" : "OpenAI", res.status, text);
+        }
         const data = await res.json();
-        return data.choices[0].message.content;
+        const choice = data.choices?.[0];
+        if (!choice?.message) {
+          throw new Error(`Invalid response format from ${provider} API: ` + JSON.stringify(data));
+        }
+        if (choice.finish_reason === "length") throw truncationError("OpenAI");
+        return choice.message.content;
       } else if (provider === "anthropic") {
         const url = `${apiBase.replace(/\/$/, "")}/messages`;
         const headers = {
@@ -399,26 +494,51 @@ export async function llmCall(config, prompt, systemInstruction = "", jsonMode =
         if (apiKey) {
           headers["x-api-key"] = apiKey;
         }
+        const body = {
+          model,
+          messages: [{ role: "user", content: prompt }],
+          system: systemInstruction || undefined,
+          max_tokens: 16000
+        };
+        if (schema) {
+          body.tools = [
+            {
+              name: "submit_review",
+              description: "Submit the structured adversarial review result.",
+              input_schema: sanitizeSchemaForProvider(schema, { keepConstraints: true })
+            }
+          ];
+          body.tool_choice = { type: "tool", name: "submit_review" };
+        }
         const res = await fetch(url, {
           method: "POST",
           headers,
-          body: JSON.stringify({
-            model,
-            messages: [{ role: "user", content: prompt }],
-            system: systemInstruction || undefined,
-            max_tokens: 8000
-          }),
+          body: JSON.stringify(body),
           signal: controller.signal
         });
-        if (!res.ok) throw new Error(`Anthropic API error (${res.status}): ${await res.text()}`);
+        if (!res.ok) throw apiError("Anthropic", res.status, await res.text());
         const data = await res.json();
-        return data.content[0].text;
+        if (data.stop_reason === "max_tokens") throw truncationError("Anthropic");
+        const toolUse = Array.isArray(data.content) ? data.content.find((b) => b.type === "tool_use") : null;
+        if (toolUse) return JSON.stringify(toolUse.input);
+        const textBlock = Array.isArray(data.content) ? data.content.find((b) => b.type === "text") : null;
+        if (!textBlock) {
+          throw new Error("Invalid response format from Anthropic API: " + JSON.stringify(data));
+        }
+        return textBlock.text;
+      } else {
+        const err = new Error(`Unsupported provider in llmCall: "${provider}"`);
+        err.noRetry = true;
+        throw err;
       }
     } catch (err) {
       const isTimeout = err.name === "AbortError";
-      const errorMsg = isTimeout ? "request timed out after 60s" : err.message;
+      const errorMsg = isTimeout ? `request timed out after ${(timeoutMs ?? DEFAULT_TIMEOUT_MS) / 1000}s` : err.message;
+      if (!isRetryable(err)) {
+        throw new Error(errorMsg);
+      }
       retries--;
-      if (retries === 0) throw new Error(isTimeout ? `LLM call failed: ${errorMsg}` : err.message);
+      if (retries === 0) throw new Error(`LLM call failed: ${errorMsg}`);
       log.warn(`LLM call failed: ${errorMsg}. Retrying in ${delay}ms...`);
       await new Promise((resolve) => setTimeout(resolve, delay));
       delay *= 2;

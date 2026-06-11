@@ -39,6 +39,65 @@ test("parseArgs parses --api-base, --api-key, and --headers", () => {
   assert.deepEqual(args.errors, []);
 });
 
+test("parseArgs parses gating, verification, and payload flags", () => {
+  const args = parseArgs([
+    "node",
+    "cli",
+    "--fail-on=high",
+    "--min-confidence=0.7",
+    "--passes=3",
+    "--verify",
+    "--fail-on-empty",
+    "--include-files",
+    "--allow-secrets",
+    "--context-lines=20",
+    "--timeout=300"
+  ]);
+
+  assert.equal(args.failOn, "high");
+  assert.equal(args.minConfidence, 0.7);
+  assert.equal(args.passes, 3);
+  assert.equal(args.verify, true);
+  assert.equal(args.failOnEmpty, true);
+  assert.equal(args.includeFiles, true);
+  assert.equal(args.allowSecrets, true);
+  assert.equal(args.contextLines, 20);
+  assert.equal(args.timeout, 300);
+  assert.deepEqual(args.errors, []);
+});
+
+test("parseArgs rejects invalid gating values", () => {
+  const args = parseArgs([
+    "node",
+    "cli",
+    "--fail-on=urgent",
+    "--min-confidence=2",
+    "--passes=0",
+    "--timeout=0"
+  ]);
+
+  assert.deepEqual(args.errors, [
+    "--fail-on must be one of: critical, high, medium, low.",
+    "--min-confidence must be a number between 0 and 1.",
+    "--passes must be a positive integer.",
+    "--timeout must be a positive integer."
+  ]);
+});
+
+test("parseArgs defaults match the documented gate", () => {
+  const args = parseArgs(["node", "cli"]);
+
+  assert.equal(args.failOn, "medium");
+  assert.equal(args.minConfidence, 0.5);
+  assert.equal(args.passes, 1);
+  assert.equal(args.contextLines, 10);
+  assert.equal(args.timeout, 120);
+  assert.equal(args.verify, false);
+  assert.equal(args.includeFiles, false);
+  assert.equal(args.failOnEmpty, false);
+  assert.equal(args.allowSecrets, false);
+});
+
 test("parseArgs parses equals format for --api-base, --api-key, and --headers", () => {
   const args = parseArgs([
     "node",

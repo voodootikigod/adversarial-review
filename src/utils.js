@@ -34,7 +34,18 @@ ${colors.bold("Options:")}
   --json                Print the raw JSON result instead of a rendered report.
   --max-files <n>       Inline-diff cutoff by changed-file count (default 50).
   --max-bytes <n>       Inline-diff cutoff by diff size in bytes (default 262144).
+  --context-lines <n>   Diff context lines passed to git diff -U<n> (default 10).
+  --include-files       Also inline full post-change file contents (budgeted).
   --allow-summary-review Allow API providers to review summary-only large diffs.
+  --fail-on <severity>  Gate threshold: critical | high | medium (default) | low.
+  --min-confidence <x>  Findings below this confidence don't gate (default 0.5).
+  --fail-on-empty       Exit 1 (instead of 0) when there is nothing to review.
+  --verify              Second adversarial pass that tries to refute each finding;
+                        refuted findings are dropped (1 extra call per finding).
+  --passes <n>          Run the review n times and merge findings (default 1).
+  --allow-secrets       Send the payload even if the secret scan finds likely
+                        credentials in the diff (off by default).
+  --timeout <seconds>   Per-request API timeout (default 120).
   --provider <name>     Force provider: anthropic | openai | gemini | cursor | <local-cli-cmd>.
   --model <name>        Force the model name.
   --api-base <url>      Override the active provider's API base URL.
@@ -71,7 +82,16 @@ export function parseArgs(argv) {
     json: false,
     maxFiles: 50,
     maxBytes: 256 * 1024,
+    contextLines: 10,
+    includeFiles: false,
     allowSummaryReview: false,
+    failOn: "medium",
+    minConfidence: 0.5,
+    failOnEmpty: false,
+    verify: false,
+    passes: 1,
+    allowSecrets: false,
+    timeout: 120,
     provider: null,
     model: null,
     apiBase: null,
@@ -109,6 +129,34 @@ export function parseArgs(argv) {
     return parsed;
   }
 
+  function parsePositiveInteger(option, value) {
+    const parsed = parseNonNegativeInteger(option, value);
+    if (parsed === 0) {
+      args.errors.push(`${option} must be a positive integer.`);
+      return null;
+    }
+    return parsed;
+  }
+
+  function parseSeverity(option, value) {
+    if (value === null) return null;
+    if (!["critical", "high", "medium", "low"].includes(value)) {
+      args.errors.push(`${option} must be one of: critical, high, medium, low.`);
+      return null;
+    }
+    return value;
+  }
+
+  function parseUnitFraction(option, value) {
+    if (value === null) return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+      args.errors.push(`${option} must be a number between 0 and 1.`);
+      return null;
+    }
+    return parsed;
+  }
+
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "-h" || arg === "--help") {
@@ -119,6 +167,44 @@ export function parseArgs(argv) {
       args.json = true;
     } else if (arg === "--allow-summary-review") {
       args.allowSummaryReview = true;
+    } else if (arg === "--include-files") {
+      args.includeFiles = true;
+    } else if (arg === "--fail-on-empty") {
+      args.failOnEmpty = true;
+    } else if (arg === "--verify") {
+      args.verify = true;
+    } else if (arg === "--allow-secrets") {
+      args.allowSecrets = true;
+    } else if (arg === "--context-lines") {
+      const result = readValue("--context-lines", i);
+      args.contextLines = parseNonNegativeInteger("--context-lines", result.value);
+      i = result.nextIndex;
+    } else if (arg.startsWith("--context-lines=")) {
+      args.contextLines = parseNonNegativeInteger("--context-lines", readEqualsValue("--context-lines", arg));
+    } else if (arg === "--fail-on") {
+      const result = readValue("--fail-on", i);
+      args.failOn = parseSeverity("--fail-on", result.value);
+      i = result.nextIndex;
+    } else if (arg.startsWith("--fail-on=")) {
+      args.failOn = parseSeverity("--fail-on", readEqualsValue("--fail-on", arg));
+    } else if (arg === "--min-confidence") {
+      const result = readValue("--min-confidence", i);
+      args.minConfidence = parseUnitFraction("--min-confidence", result.value);
+      i = result.nextIndex;
+    } else if (arg.startsWith("--min-confidence=")) {
+      args.minConfidence = parseUnitFraction("--min-confidence", readEqualsValue("--min-confidence", arg));
+    } else if (arg === "--passes") {
+      const result = readValue("--passes", i);
+      args.passes = parsePositiveInteger("--passes", result.value);
+      i = result.nextIndex;
+    } else if (arg.startsWith("--passes=")) {
+      args.passes = parsePositiveInteger("--passes", readEqualsValue("--passes", arg));
+    } else if (arg === "--timeout") {
+      const result = readValue("--timeout", i);
+      args.timeout = parsePositiveInteger("--timeout", result.value);
+      i = result.nextIndex;
+    } else if (arg.startsWith("--timeout=")) {
+      args.timeout = parsePositiveInteger("--timeout", readEqualsValue("--timeout", arg));
     } else if (arg === "--base") {
       const result = readValue("--base", i);
       args.base = result.value;

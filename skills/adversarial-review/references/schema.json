@@ -1,11 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "Reproduced from the OpenAI Codex review-output schema. Copyright 2026 OpenAI, licensed under the Apache License, Version 2.0. See NOTICE and LICENSE.",
+  "$comment": "Derived from the OpenAI Codex review-output schema (Copyright 2026 OpenAI, Apache-2.0) and extended: category, exploit_scenario, evidence, coverage, and file-level findings (line_start/line_end = 0). See NOTICE and LICENSE.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "verdict",
     "summary",
+    "coverage",
     "findings",
     "next_steps"
   ],
@@ -21,6 +22,30 @@
       "type": "string",
       "minLength": 1
     },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files_examined",
+        "files_skipped"
+      ],
+      "properties": {
+        "files_examined": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "files_skipped": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
     "findings": {
       "type": "array",
       "items": {
@@ -28,8 +53,11 @@
         "additionalProperties": false,
         "required": [
           "severity",
+          "category",
           "title",
           "body",
+          "exploit_scenario",
+          "evidence",
           "file",
           "line_start",
           "line_end",
@@ -46,6 +74,29 @@
               "low"
             ]
           },
+          "category": {
+            "type": "string",
+            "enum": [
+              "correctness",
+              "security",
+              "auth",
+              "injection",
+              "secrets",
+              "data-loss",
+              "rollback",
+              "concurrency",
+              "compatibility",
+              "observability",
+              "resource-exhaustion",
+              "supply-chain",
+              "ci-cd",
+              "test-integrity",
+              "error-handling",
+              "privacy",
+              "performance",
+              "other"
+            ]
+          },
           "title": {
             "type": "string",
             "minLength": 1
@@ -54,17 +105,24 @@
             "type": "string",
             "minLength": 1
           },
+          "exploit_scenario": {
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence": {
+            "type": "string"
+          },
           "file": {
             "type": "string",
             "minLength": 1
           },
           "line_start": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 0
           },
           "line_end": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 0
           },
           "confidence": {
             "type": "number",
@@ -72,7 +130,8 @@
             "maximum": 1
           },
           "recommendation": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           }
         }
       }
