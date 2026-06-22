@@ -1,5 +1,9 @@
 # adversarial-review
 
+[![npm version](https://img.shields.io/npm/v/adversarial-review.svg)](https://www.npmjs.com/package/adversarial-review)
+[![CI](https://github.com/voodootikigod/adversarial-review/actions/workflows/ci.yml/badge.svg)](https://github.com/voodootikigod/adversarial-review/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Skeptical, **ship/no-ship** code review of a git diff or branch — run against any LLM.
 
 The reviewer's only job is to **break confidence in a change, not validate it**. It hunts
@@ -56,6 +60,44 @@ npx adversarial-review --prompt-only > prompt.txt
 
 # Machine-readable output for CI
 npx adversarial-review --base main --json
+```
+
+### Example output
+
+```
+ NEEDS ATTENTION   working tree on branch main
+
+Summary
+  Two findings worth addressing before shipping: an unguarded secret assignment
+  and a missing rate-limit on the new endpoint.
+
+Coverage
+  4 file(s) examined
+
+Findings (2)
+
+  CRITICAL [secrets] Hardcoded API key in environment helper  conf 0.95
+    src/env.js:12-12
+    The string literal assigned to `STRIPE_SECRET` is a live API key, not a
+    placeholder. It will be committed to version control and included in the
+    review payload sent to the model provider.
+    ✗ failure: Any developer cloning the repo or any CI system gains full
+      Stripe API access.
+    → fix: Remove the key, rotate it immediately, and load from an env var or
+      secret manager instead.
+
+  MEDIUM [resource-exhaustion] /api/events returns unbounded results  conf 0.80
+    src/routes/events.js:34-34
+    The database query has no LIMIT clause. A single request can return every
+    row in the events table.
+    ✗ failure: A large events table causes the response to time out or OOM the
+      process under normal traffic.
+    → fix: Add pagination (LIMIT + OFFSET or cursor-based) and document the
+      page-size cap in the API contract.
+
+Next steps
+  • Rotate the Stripe key immediately — treat it as compromised.
+  • Add a LIMIT clause and pagination to the /api/events query.
 ```
 
 ### Options
@@ -188,6 +230,10 @@ the output contract without touching code. The runtime validates against `schema
 itself, so schema edits really do change the enforced contract. `npm run sync-skill`
 copies both into the bundled skill (`skills/adversarial-review/references/`); a test fails
 if they drift.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 

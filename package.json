@@ -35,6 +35,10 @@
   ],
   "license": "Apache-2.0",
   "author": "Chris Williams (@voodootikigod)",
+  "homepage": "https://github.com/voodootikigod/adversarial-review#readme",
+  "bugs": {
+    "url": "https://github.com/voodootikigod/adversarial-review/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/voodootikigod/adversarial-review.git"
