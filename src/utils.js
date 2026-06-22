@@ -53,6 +53,18 @@ ${colors.bold("Options:")}
   --headers <json>      Inject custom JSON headers into the LLM request.
   -h, --help            Show this help message.
 
+${colors.bold("Loop mode (--loop):")}
+  --loop                Review → fix → repeat until no gating findings remain.
+                        Only works with --scope working-tree (not branch/auto-branch).
+  --loop-max <n>        Max fix iterations (default 3). Runs N fixes + final review.
+  --loop-fixer <cmd>    Override fixer CLI (default: auto-detect codex→claude→gemini).
+  --loop-fixer-scope    sc2 (default): only finding-cited files. unrestricted: all repo files.
+  --loop-fixer-file-cap Max files listed in unrestricted mode (default 100).
+  --loop-unsafe         Required on macOS (no write sandbox). On Linux: skip probe error.
+  --loop-unsafe-allow-fix-secrets
+                        Bypass secret scan on the fix prompt. Verifies same provider
+                        for known fixers; warns and proceeds for custom --loop-fixer.
+
 ${colors.bold("LLM selection (when not --prompt-only):")}
   Auto-detected in order: ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY,
   then a local CLI agent (claude, codex, gemini). Override with --provider.
@@ -99,7 +111,15 @@ export function parseArgs(argv) {
     headers: null,
     help: false,
     focus: "",
-    errors: []
+    errors: [],
+    // Loop flags
+    loop: false,
+    loopMax: 3,
+    loopFixer: null,
+    loopFixerScope: "sc2",
+    loopFixerFileCap: 100,
+    loopUnsafe: false,
+    loopUnsafeAllowFixSecrets: false
   };
 
   const focusParts = [];
@@ -259,6 +279,45 @@ export function parseArgs(argv) {
       i = result.nextIndex;
     } else if (arg.startsWith("--headers=")) {
       args.headers = readEqualsValue("--headers", arg);
+    } else if (arg === "--loop") {
+      args.loop = true;
+    } else if (arg === "--loop-max") {
+      const result = readValue("--loop-max", i);
+      args.loopMax = parsePositiveInteger("--loop-max", result.value) ?? args.loopMax;
+      i = result.nextIndex;
+    } else if (arg.startsWith("--loop-max=")) {
+      args.loopMax = parsePositiveInteger("--loop-max", readEqualsValue("--loop-max", arg)) ?? args.loopMax;
+    } else if (arg === "--loop-fixer") {
+      const result = readValue("--loop-fixer", i);
+      args.loopFixer = result.value;
+      i = result.nextIndex;
+    } else if (arg.startsWith("--loop-fixer=")) {
+      args.loopFixer = readEqualsValue("--loop-fixer", arg);
+    } else if (arg === "--loop-fixer-scope") {
+      const result = readValue("--loop-fixer-scope", i);
+      if (result.value && !["sc2", "unrestricted"].includes(result.value)) {
+        args.errors.push(`--loop-fixer-scope must be sc2 or unrestricted.`);
+      } else {
+        args.loopFixerScope = result.value;
+      }
+      i = result.nextIndex;
+    } else if (arg.startsWith("--loop-fixer-scope=")) {
+      const val = readEqualsValue("--loop-fixer-scope", arg);
+      if (val && !["sc2", "unrestricted"].includes(val)) {
+        args.errors.push(`--loop-fixer-scope must be sc2 or unrestricted.`);
+      } else {
+        args.loopFixerScope = val;
+      }
+    } else if (arg === "--loop-fixer-file-cap") {
+      const result = readValue("--loop-fixer-file-cap", i);
+      args.loopFixerFileCap = parsePositiveInteger("--loop-fixer-file-cap", result.value) ?? args.loopFixerFileCap;
+      i = result.nextIndex;
+    } else if (arg.startsWith("--loop-fixer-file-cap=")) {
+      args.loopFixerFileCap = parsePositiveInteger("--loop-fixer-file-cap", readEqualsValue("--loop-fixer-file-cap", arg)) ?? args.loopFixerFileCap;
+    } else if (arg === "--loop-unsafe") {
+      args.loopUnsafe = true;
+    } else if (arg === "--loop-unsafe-allow-fix-secrets") {
+      args.loopUnsafeAllowFixSecrets = true;
     } else if (arg === "--") {
       focusParts.push(...argv.slice(i + 1));
       break;

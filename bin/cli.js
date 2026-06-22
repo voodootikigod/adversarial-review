@@ -12,6 +12,7 @@ import {
   deriveVerdict,
   renderReport
 } from "../src/review.js";
+import { runLoop } from "../src/loop.js";
 
 async function main() {
   const args = parseArgs(process.argv);
@@ -29,6 +30,12 @@ async function main() {
   if (!["auto", "working-tree", "branch"].includes(args.scope)) {
     log.error(`Invalid --scope "${args.scope}". Use auto, working-tree, or branch.`);
     process.exit(1);
+  }
+
+  // Loop mode: hand off entirely to the loop orchestrator.
+  if (args.loop) {
+    await runLoop(process.cwd(), args);
+    return;
   }
 
   if (args.base && args.scope === "working-tree") {

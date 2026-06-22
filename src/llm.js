@@ -84,7 +84,7 @@ export function cleanJsonResponse(text) {
 }
 
 // Check if a shell command is installed and executable.
-function isCmdInstalled(cmd) {
+export function isCmdInstalled(cmd) {
   if (!/^[A-Za-z0-9._-]+$/.test(cmd)) {
     return false;
   }
