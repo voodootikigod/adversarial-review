@@ -183,5 +183,82 @@ test("configureLLM prioritizes non-Anthropic critic in Claude Code if key is pre
   }
 });
 
+test("codex CLI path uses exec --output-last-message and delivers full prompt via stdin", async () => {
+  const { llmCall } = await import("../src/llm.js");
 
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-test-"));
+  const binPath = path.join(tmpDir, "codex");
+  const sentinelSystem = "be adversarial sentinel";
+  const sentinelPrompt = "review this sentinel";
+  const expectedResponse = '{"verdict":"approve","summary":"ok"}';
+
+  // Mock codex binary that enforces the full invocation contract:
+  //   1. --output-last-message <file> must be present (reliable output capture)
+  //   2. Isolation flags --sandbox read-only, --ignore-rules, --ephemeral must be present
+  //   3. `-` must appear as the positional prompt (stdin mode, not argv mode)
+  //   4. Stdin must contain both the system instruction and the user prompt
+  // The mock exits non-zero on any violation so the test fails if the contract breaks.
+  fs.writeFileSync(
+    binPath,
+    `#!/bin/sh
+output_file=""
+read_stdin=false
+has_sandbox=false
+has_ignore_rules=false
+has_ephemeral=false
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--output-last-message" ]; then
+    output_file="$arg"
+  fi
+  if [ "$prev" = "--sandbox" ] && [ "$arg" = "read-only" ]; then
+    has_sandbox=true
+  fi
+  if [ "$arg" = "--ignore-rules" ]; then
+    has_ignore_rules=true
+  fi
+  if [ "$arg" = "--ephemeral" ]; then
+    has_ephemeral=true
+  fi
+  if [ "$arg" = "-" ]; then
+    read_stdin=true
+  fi
+  prev="$arg"
+done
+if [ -z "$output_file" ]; then
+  echo "FAIL: --output-last-message not passed" >&2; exit 1
+fi
+if [ "$has_sandbox" = "false" ]; then
+  echo "FAIL: --sandbox read-only not passed" >&2; exit 1
+fi
+if [ "$has_ignore_rules" = "false" ]; then
+  echo "FAIL: --ignore-rules not passed" >&2; exit 1
+fi
+if [ "$has_ephemeral" = "false" ]; then
+  echo "FAIL: --ephemeral not passed" >&2; exit 1
+fi
+if [ "$read_stdin" = "false" ]; then
+  echo "FAIL: stdin indicator (-) not passed as positional" >&2; exit 1
+fi
+stdin_content=$(cat)
+echo "$stdin_content" | grep -q "${sentinelSystem}" || { echo "FAIL: system instruction missing from stdin" >&2; exit 1; }
+echo "$stdin_content" | grep -q "${sentinelPrompt}" || { echo "FAIL: prompt content missing from stdin" >&2; exit 1; }
+printf '%s' '${expectedResponse}' > "$output_file"
+`
+  );
+  fs.chmodSync(binPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+
+  try {
+    const config = { provider: "cli", cliCmd: "codex", timeoutMs: 10000 };
+    const result = await llmCall(config, sentinelPrompt, sentinelSystem);
+    assert.equal(result, expectedResponse, "should return the content written to --output-last-message");
+  } finally {
+    process.env.PATH = oldPath;
+    try { fs.unlinkSync(binPath); } catch {}
+    try { fs.rmdirSync(tmpDir); } catch {}
+  }
+});
 

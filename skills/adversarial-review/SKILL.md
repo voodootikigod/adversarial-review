@@ -117,14 +117,29 @@ Procedure:
 
 ## Choosing the model (Tier 1)
 
-If `--provider` is not given, the model is auto-detected (and, inside Claude Code or
-Cursor, a *different* provider from the builder is preferred to break the monoculture —
-a model reviewing its own output is a weaker critic):
+If `--provider` is not given, the model is auto-detected. **Inside Claude Code or Cursor
+the detection order is deliberately inverted** — a model reviewing its own output is a
+weaker critic, so non-Anthropic providers are preferred first:
 
-1. `ANTHROPIC_API_KEY` → Anthropic API (default `claude-sonnet-4-6`)
+**Inside Claude Code** (`CLAUDECODE` / `CLAUDE_CODE` env set):
+1. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
+2. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
+3. Local `codex` CLI on `PATH`
+4. Local `gemini` CLI on `PATH`
+5. `ANTHROPIC_API_KEY` → Anthropic API (`claude-sonnet-4-6`) ← last resort, with warning
+6. Local `claude` CLI on `PATH` ← last resort, with warning
+
+**Inside Cursor** (`TERM_PROGRAM=cursor`):
+1. `GEMINI_API_KEY` → Gemini API
+2. `ANTHROPIC_API_KEY` → Anthropic API
+3. `OPENAI_API_KEY` → OpenAI API
+4. Local `gemini`, `claude`, or `codex` CLI
+
+**Everywhere else** (default order):
+1. `ANTHROPIC_API_KEY` → Anthropic API (`claude-sonnet-4-6`)
 2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
-4. A local CLI agent on `PATH`: `claude`, `codex`, or `gemini` (uses your active session)
+4. Local `claude`, `codex`, or `gemini` CLI
 
 Force with `--provider <name>`; override the model with `--model <name>`. Gate quality
 tracks model tier — defaults are the strong tier of each provider; use `--model` to trade
@@ -161,8 +176,10 @@ to surface risk, not to apply changes.
 
 ## Verification
 
-- Tier 1/2: `npx adversarial-review --help` exits `0`; `npx adversarial-review --prompt-only`
-  prints a non-empty prompt with no model call.
+- Tier 1/2: `npx adversarial-review --help` exits `0`.
+  `npx adversarial-review --prompt-only` prints the assembled prompt to stdout with no
+  model call (works even on a clean working tree — prints the template with empty diff
+  sections, which is enough to confirm the template is intact).
 - Tier 3: `references/prompt-template.md` and `references/schema.json` exist and are
   non-empty.
 

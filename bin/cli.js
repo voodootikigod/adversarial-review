@@ -52,7 +52,16 @@ async function main() {
     process.exit(1);
   }
 
+  // 2. Build the prompt.
+  const prompt = buildPrompt(context, args.focus);
+
   if (context.isEmpty) {
+    // --prompt-only prints the template even on an empty scope so callers can
+    // verify the template is well-formed without needing staged changes.
+    if (args.promptOnly) {
+      process.stdout.write(prompt + "\n");
+      process.exit(0);
+    }
     if (args.failOnEmpty) {
       log.error("Nothing to review — the target scope is empty (--fail-on-empty set).");
       process.exit(1);
@@ -61,9 +70,6 @@ async function main() {
     log.warn("In CI, pass --fail-on-empty so a misconfigured base ref cannot silently pass the gate.");
     process.exit(0);
   }
-
-  // 2. Build the prompt.
-  const prompt = buildPrompt(context, args.focus);
 
   // Secret scan: the payload leaves the machine for a third-party provider.
   const secretHits = scanForSecrets(context.content);

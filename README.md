@@ -36,6 +36,33 @@ npm install -g adversarial-review
 npx adversarial-review --help
 ```
 
+## Installing as a Claude Code skill
+
+The npm package ships a bundled Claude Code skill under `skills/adversarial-review/`.
+Installing it lets Claude Code invoke the review automatically when you type phrases like
+"review this branch" or "is this safe to ship", and gives it the full three-tier fallback
+(Tier 3 works with no CLI and no API key).
+
+**Global skill (available in all projects):**
+
+```bash
+# After npm install -g:
+cp -r "$(npm root -g)/adversarial-review/skills/adversarial-review" ~/.claude/skills/
+
+# Or from a cloned repo:
+cp -r skills/adversarial-review ~/.claude/skills/
+```
+
+**Project skill (this repo only):**
+
+```bash
+mkdir -p .claude/skills
+cp -r "$(npm root -g)/adversarial-review/skills/adversarial-review" .claude/skills/
+```
+
+Restart Claude Code after copying. Verify with `/find-skills adversarial-review` or by asking
+Claude Code "what skills are available?"
+
 ## Usage
 
 ```bash
@@ -202,11 +229,13 @@ review payload as leaving your machine.
 ```yaml
 # .github/workflows/review.yml
 - run: |
+    set -o pipefail
     npx adversarial-review --base "origin/${{ github.base_ref }}" \
       --fail-on high --fail-on-empty --json | tee review.json
   env:
     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 # Exit code 2 fails the job when a finding meets the gate.
+# set -o pipefail ensures the exit code from adversarial-review is not swallowed by tee.
 # --fail-on-empty guards against a misconfigured base ref silently passing.
 # Note: use actions/checkout with fetch-depth: 0 so merge-base resolution works.
 ```

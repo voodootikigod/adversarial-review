@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "sync-skill": "node -e \"const fs=require('fs');for(const f of ['prompt-template.md','schema.json'])fs.copyFileSync(f,'skills/adversarial-review/references/'+f)\"",
+    "sync-skill": "node --input-type=module -e \"import{copyFileSync}from'fs';for(const f of['prompt-template.md','schema.json'])copyFileSync(f,'skills/adversarial-review/references/'+f);\"",
     "prepublishOnly": "npm run sync-skill && npm test"
   },
   "bin": {
@@ -15,6 +15,7 @@
   "files": [
     "bin/",
     "src/",
+    "skills/adversarial-review/",
     "prompt-template.md",
     "schema.json",
     "NOTICE",

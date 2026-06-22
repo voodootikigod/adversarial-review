@@ -1,5 +1,6 @@
 import { execFileSync } from "child_process";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { log } from "./utils.js";
 import { sanitizeSchemaForProvider } from "./schema-validate.js";
@@ -122,12 +123,78 @@ function execCli(cliCmd, args, input = null) {
 
 function cliFallbackArgs(cliCmd, fullPrompt) {
   if (cliCmd === "claude") return ["-p", fullPrompt];
-  if (cliCmd === "codex") return ["exec", fullPrompt];
   return [fullPrompt];
 }
 
-// Invoke a local CLI agent (claude, codex, gemini, ...) by piping the prompt to stdin.
-function callCliLLM(cliCmd, prompt, systemInstruction) {
+// Invoke the Codex CLI non-interactively via `codex exec`.
+// Uses --output-last-message to capture only the final agent response (not the
+// full JSONL event stream), and --output-schema when a JSON Schema is provided
+// so Codex enforces the output shape natively rather than relying on scraping.
+// The prompt is piped via stdin (`-`) to avoid argv size limits on large diffs;
+// the argv path is used as a fallback if stdin is rejected.
+function callCodexCli(fullPrompt, schema) {
+  // Create a private temp directory so path prediction / symlink race attacks
+  // against shared /tmp are not possible; the directory is owned by this process.
+  const privateDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-review-codex-"));
+  const outFile = path.join(privateDir, "out.txt");
+  const schemaFile = schema ? path.join(privateDir, "schema.json") : null;
+
+  try {
+    // wx flag: exclusive create — fails if the file already exists (defense in depth
+    // inside the already-private directory).
+    if (schemaFile) fs.writeFileSync(schemaFile, JSON.stringify(schema), { mode: 0o600, flag: "wx" });
+
+    const baseArgs = [
+      "exec",
+      // Harden against prompt-injection in untrusted diffs: enforce read-only sandbox so
+      // the nested agent cannot write files or run commands, ignore project/user .rules
+      // that could be weaponized, and run ephemerally (no session persistence).
+      "--sandbox", "read-only",
+      "--ignore-rules",
+      "--ephemeral",
+      "--output-last-message", outFile,
+    ];
+    if (schemaFile) baseArgs.push("--output-schema", schemaFile);
+
+    try {
+      // Primary path: pipe prompt via stdin. Codex's non-interactive exec accepts `-` as
+      // the positional prompt argument to signal "read from stdin" (per `codex exec --help`:
+      // "If not provided as an argument (or if `-` is used), instructions are read from
+      // stdin"). We rely on execFileSync's `input` option to wire the full prompt payload
+      // to that stdin pipe, so the review content is never truncated by argv size limits.
+      execCli("codex", [...baseArgs, "-"], fullPrompt);
+    } catch (stdinErr) {
+      if (Buffer.byteLength(fullPrompt) > MAX_ARGV_PROMPT_BYTES) {
+        const stderr = stdinErr.stderr?.toString("utf8").trim() || "";
+        throw new Error(
+          `Codex rejected the prompt on stdin, and the prompt is too large ` +
+            `(${Buffer.byteLength(fullPrompt)} bytes) to pass as a command-line argument. ` +
+            `Lower --max-bytes, narrow the scope, or use an API provider.` +
+            (stderr ? `\n${stderr}` : "")
+        );
+      }
+      // Argv fallback: pass prompt as positional argument
+      log.substep("Codex stdin path failed, retrying as argument...");
+      try {
+        execCli("codex", [...baseArgs, fullPrompt]);
+      } catch (argvErr) {
+        const stderr = argvErr.stderr?.toString("utf8") || stdinErr.stderr?.toString("utf8") || "";
+        throw new Error(
+          `Failed to execute codex: ${argvErr.message || stdinErr.message}` +
+            (stderr.trim() ? `\n${stderr.trim()}` : "")
+        );
+      }
+    }
+
+    return fs.readFileSync(outFile, "utf8").trim();
+  } finally {
+    // Remove the entire private directory and its contents in one pass.
+    try { fs.rmSync(privateDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// Invoke a local CLI agent (claude, gemini, ...) by piping the prompt to stdin.
+function callCliLLM(cliCmd, prompt, systemInstruction, schema = null) {
   let fullPrompt = "";
   if (systemInstruction) {
     fullPrompt += `System Instructions:\n${systemInstruction}\n\n`;
@@ -135,6 +202,10 @@ function callCliLLM(cliCmd, prompt, systemInstruction) {
   fullPrompt += `Prompt:\n${prompt}`;
 
   log.step(`Invoking local subscription agent via command: "${cliCmd}"...`);
+
+  if (cliCmd === "codex") {
+    return callCodexCli(fullPrompt, schema);
+  }
 
   try {
     return execCli(cliCmd, [], fullPrompt);
@@ -377,7 +448,7 @@ export async function llmCall(config, prompt, systemInstruction = "", schema = n
   const { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs } = config;
 
   if (provider === "cli") {
-    return callCliLLM(cliCmd, prompt, systemInstruction);
+    return callCliLLM(cliCmd, prompt, systemInstruction, schema);
   }
 
   let retries = 3;
