@@ -126,18 +126,26 @@ async function runMultiProvider(args, context, prompt) {
     minConfidence: args.minConfidence,
     quorum: args.quorum
   });
-  // The exit code is the quorum verdict; the JSON/report verdict must match it so
-  // a CI consumer of --json never sees a verdict that contradicts the exit code.
+  // The exit code is the quorum verdict; the JSON/report verdict AND summary must
+  // match it so a CI consumer of --json never sees a verdict that contradicts the
+  // exit code or a summary that contradicts the verdict.
   merged.verdict = derived.verdict;
+  if (derived.verdict === "approve") {
+    const approving = perProvider.find((pp) => pp.result.verdict === "approve");
+    merged.summary = approving
+      ? approving.result.summary
+      : "No provider's findings met the quorum gate; approving.";
+  }
   log.info(
-    `Quorum verdict: ${derived.flaggingCount}/${providers.length} provider(s) flagged ` +
+    `Quorum verdict: ${derived.flaggingCount}/${perProvider.length} provider(s) flagged ` +
       `(effective quorum ${derived.effectiveQuorum} of requested ${derived.quorum}) → ${derived.verdict}`
   );
 
-  // Surface grounding/hallucination warnings on the merged findings (apiMode if
-  // any participating provider was an API, which applies the stricter check).
+  // Surface grounding/hallucination warnings on the merged findings. apiMode is
+  // based on providers that ACTUALLY produced results (a selected API provider may
+  // have failed), so the strictness matches what really participated.
   const mergedAssessments = assessFindings(merged, context, {
-    apiMode: providers.some((p) => p.config.provider !== "cli")
+    apiMode: perProvider.some((pp) => byId.get(pp.provider).provider !== "cli")
   });
   // Log grounding warnings to stderr (as the single-provider path does) so they
   // are visible even with --json. The quorum verdict already gated on each

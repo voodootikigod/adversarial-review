@@ -232,6 +232,25 @@ test("AC11: distinct root causes at the same (file,category,range) are preserved
   for (const f of merged.findings) assert.equal(f.corroborated_by.length, 1);
 });
 
+test("#1(r5): distinct vulnerabilities at the same location are not collapsed by generic terms", () => {
+  // Same file/category/range, titles share generic terms (injection/vulnerability/in)
+  // but name DIFFERENT root causes — must stay separate.
+  const loc = { category: "injection", file: "src/db.js", line_start: 5, line_end: 10 };
+  const a = validResult({ findings: [validFinding({ ...loc, title: "SQL injection vulnerability in database helper" })] });
+  const b = validResult({ findings: [validFinding({ ...loc, title: "Command injection vulnerability in database helper" })] });
+  const merged = mergeProviderResults([{ provider: "gpt", result: a }, { provider: "gemini", result: b }]);
+  assert.equal(merged.findings.length, 2, "sql vs command injection must not collapse");
+});
+
+test("#1(r5): differently-worded descriptions of the SAME defect still corroborate", () => {
+  const loc = { category: "injection", file: "src/db.js", line_start: 5, line_end: 10 };
+  const a = validResult({ findings: [validFinding({ ...loc, title: "SQL injection in query builder" })] });
+  const b = validResult({ findings: [validFinding({ ...loc, title: "SQL injection in the query builder" })] });
+  const merged = mergeProviderResults([{ provider: "gpt", result: a }, { provider: "gemini", result: b }]);
+  assert.equal(merged.findings.length, 1, "same defect, trivially different wording → corroborated");
+  assert.deepEqual([...merged.findings[0].corroborated_by].sort(), ["gemini", "gpt"]);
+});
+
 // ─── Quorum-aware verdict (AC6) ─────────────────────────────────────────────
 
 test("AC6: quorum verdict — one approve + one needs-attention gates by default (quorum 1)", () => {

@@ -365,6 +365,9 @@ export function parseArgs(argv) {
   if (args.providers && args.provider) {
     args.errors.push("--providers cannot be combined with --provider; use one or the other.");
   }
+  if (args.providers && args.model) {
+    args.errors.push("--model cannot be combined with --providers; model names are provider-specific and would be applied to every family. Each provider uses its own default model.");
+  }
 
   args.focus = focusParts.join(" ").trim();
   return args;

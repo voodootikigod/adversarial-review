@@ -148,3 +148,8 @@ test("parseArgs defaults: providers null, quorum 1", () => {
   assert.equal(args.providers, null);
   assert.equal(args.quorum, 1);
 });
+
+test("parseArgs rejects --model combined with --providers", () => {
+  const args = parseArgs(["node", "cli", "--providers", "gpt,gemini", "--model", "gpt-4o"]);
+  assert.ok(args.errors.some((e) => /--model.*--providers|--providers.*--model/.test(e)));
+});

@@ -276,20 +276,33 @@ function mergeResults(results) {
 // title). The title guard is load-bearing: two providers can flag DIFFERENT bugs
 // at the same location, and collapsing them would discard a real finding — the
 // exact cross-provider catch this mode exists to surface (ADR-0007).
+// Generic words that carry no distinguishing signal for a finding title. Without
+// stripping these, "SQL injection vulnerability in X" and "Command injection
+// vulnerability in X" share enough tokens to look identical — collapsing two
+// genuinely distinct bugs. Removing them lets the meaningful nouns (sql/command)
+// drive the comparison.
+const TITLE_STOPWORDS = new Set([
+  "a", "an", "the", "in", "on", "of", "to", "and", "or", "for", "with", "via", "at",
+  "is", "are", "be", "by", "from", "into", "vulnerability", "vuln", "issue", "issues",
+  "error", "errors", "bug", "bugs", "problem", "risk", "risks", "finding", "possible",
+  "potential", "unsafe", "insecure", "missing", "improper", "incorrect"
+]);
+
 function titleSimilar(a, b) {
-  const toks = (s) => new Set((s || "").toLowerCase().match(/[a-z0-9]+/g) || []);
+  const toks = (s) =>
+    new Set((String(s || "").toLowerCase().match(/[a-z0-9]+/g) || []).filter((t) => t.length > 1 && !TITLE_STOPWORDS.has(t)));
   const A = toks(a), B = toks(b);
-  if (A.size === 0 || B.size === 0) return (a || "").trim() === (b || "").trim();
+  // If stripping leaves nothing distinctive, fall back to exact (normalized) match.
+  if (A.size === 0 || B.size === 0) return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
   let inter = 0;
   for (const t of A) if (B.has(t)) inter++;
   const union = A.size + B.size - inter;
-  // The PRIMARY same-issue key is sameIssue() — same file, same category, and an
-  // overlapping line range. This title check is only a secondary distinctness
-  // guard for the rare "two different bugs at the same location" case. 0.5 is
-  // moderate: high enough that genuinely distinct titles (disjoint wording) stay
-  // separate, low enough that two providers' differently-worded descriptions of
-  // the SAME defect still corroborate rather than double-report.
-  return inter / union >= 0.5;
+  // The PRIMARY same-issue key is sameIssue() — same file, category, overlapping
+  // range. This is the secondary distinctness guard: after removing generic terms,
+  // require 70% overlap of the MEANINGFUL tokens. Distinct root causes at the same
+  // location (sql vs command injection) stay separate; differently-worded
+  // descriptions of the SAME defect still corroborate.
+  return inter / union >= 0.7;
 }
 
 function sameFindingAcrossProviders(a, b) {

@@ -93,6 +93,20 @@ test("CLI #2: --json verdict matches the quorum exit verdict (no contradiction)"
   assert.equal(out.verdict, "approve", "JSON verdict must match the exit-code (quorum) verdict");
 });
 
+test("CLI #2(r5): when quorum is not met, the JSON summary matches the approve verdict", () => {
+  // claude flags, gemini approves, --quorum 2 → effective quorum 2 not met → approve.
+  // The summary must NOT be the flagging provider's (no approve+problem-summary).
+  const r = runCli(
+    ["--providers", "claude,gemini", "--quorum", "2", "--json", "--scope", "working-tree", "--allow-secrets"],
+    { mocks: { claude: FLAG, agy: APPROVE } }
+  );
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.verdict, "approve");
+  assert.notEqual(out.summary, "bad", "summary must not be copied from the flagging provider when approving");
+  assert.equal(out.summary, "ok", "summary should reflect the approving provider");
+});
+
 test("CLI #6: an API provider on a non-inlinable diff is dropped, CLI provider proceeds", () => {
   // gemini resolves to the API (key set); --max-bytes 1 forces summary mode so it
   // cannot inspect the diff. It must be dropped (loud), and claude (CLI) proceeds.
