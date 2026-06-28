@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateResult, assessFindings, deriveVerdict, mergeProviderResults, deriveQuorumVerdict } from "../src/review.js";
+import { validateResult, assessFindings, deriveVerdict, mergeProviderResults, deriveQuorumVerdict, renderReport } from "../src/review.js";
 
 function validFinding(overrides = {}) {
   return {
@@ -233,4 +233,23 @@ test("AC6: quorum verdict — one approve + one needs-attention gates by default
   const d2 = deriveQuorumVerdict(perProvider, { failOn: "medium", minConfidence: 0.5, quorum: 2 });
   assert.equal(d2.verdict, "approve", "quorum 2 not met by a single flagging provider");
   assert.equal(d2.verdict === "needs-attention" ? 2 : 0, 0);
+});
+
+test("quorum is capped to the number of providers that ran (no fail-open)", () => {
+  // Only ONE provider reachable but --quorum 2: the requested quorum is
+  // unsatisfiable, which must NOT silently approve. Effective quorum caps to 1.
+  const flag = validResult({ findings: [validFinding({ severity: "high", confidence: 0.9 })] });
+  const d = deriveQuorumVerdict([{ provider: "gemini", result: flag }], {
+    failOn: "medium", minConfidence: 0.5, quorum: 2
+  });
+  assert.equal(d.effectiveQuorum, 1);
+  assert.equal(d.verdict, "needs-attention", "a lone reachable provider's finding must still gate");
+});
+
+test("#8: renderReport surfaces ungrounded warnings when assessments are provided", () => {
+  const result = validResult({ findings: [validFinding({ corroborated_by: ["gpt"] })] });
+  const context = { label: "x", changedFiles: [], includeDiff: false, content: "" };
+  const assessments = [{ notes: ["evidence not found in provided context"], effectiveConfidence: 0.45 }];
+  const out = renderReport(result, context, assessments, { verdict: "needs-attention" });
+  assert.match(out, /ungrounded/);
 });

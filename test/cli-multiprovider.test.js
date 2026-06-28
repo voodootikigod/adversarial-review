@@ -7,41 +7,51 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // End-to-end coverage for the bin/cli.js multi-provider orchestration glue
-// (runMultiProvider): under-satisfied notice emission, the API-without-diff guard,
-// and verdict→exit-code mapping. Drives the real binary with mock provider CLIs.
+// (runMultiProvider): under-satisfied notice, the drop-API-on-uninlinable-diff
+// path, JSON/exit verdict unification, and verdict→exit-code mapping. Drives the
+// real binary against a SELF-CONTAINED temp git repo so the tests do not depend
+// on the host working tree being dirty (a clean checkout/CI must still pass).
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "bin", "cli.js");
 const nodeBinDir = path.dirname(process.execPath); // has node (+ codex, which we don't request)
 
-const APPROVE = '{"verdict":"approve","summary":"ok","coverage":{"files_examined":["a"],"files_skipped":[]},"findings":[],"next_steps":[]}';
-const FLAG = '{"verdict":"needs-attention","summary":"bad","coverage":{"files_examined":["a"],"files_skipped":[]},"findings":[{"severity":"high","category":"security","title":"t","body":"b","exploit_scenario":"e","evidence":"","file":"a","line_start":1,"line_end":2,"confidence":0.9,"recommendation":"r"}],"next_steps":["n"]}';
+const APPROVE = '{"verdict":"approve","summary":"ok","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[],"next_steps":[]}';
+const FLAG = '{"verdict":"needs-attention","summary":"bad","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[{"severity":"high","category":"security","title":"t","body":"b","exploit_scenario":"e","evidence":"","file":"code.js","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}],"next_steps":["n"]}';
 
-// Run bin/cli.js with a PATH containing only: our mock dir, the node bin dir, and
-// system dirs for git. Notably EXCLUDES ~/.local/bin, so claude/agy are reachable
-// only via the mocks we plant. Returns { status, stdout, stderr }.
+// Run bin/cli.js against a throwaway git repo that has a real uncommitted change,
+// with PATH limited to a mock dir + node + system git (EXCLUDES ~/.local/bin, so
+// claude/agy are reachable only via the mocks we plant). Returns {status,stdout,stderr}.
 function runCli(args, { mocks = {}, env = {} } = {}) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cli-"));
+  const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cli-mocks-"));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cli-repo-"));
   try {
     for (const [name, body] of Object.entries(mocks)) {
       const binName = process.platform === "win32" ? `${name}.cmd` : name;
-      const p = path.join(tempDir, binName);
+      const p = path.join(mocksDir, binName);
       fs.writeFileSync(p, `#!/bin/sh\ncat >/dev/null\ncat <<'JSON'\n${body}\nJSON\n`);
       if (process.platform !== "win32") fs.chmodSync(p, 0o755);
     }
-    const PATH = [tempDir, nodeBinDir, "/usr/bin", "/bin"].join(path.delimiter);
-    const baseEnv = {
-      HOME: process.env.HOME,
-      PATH
-    };
+    const git = (a) => spawnSync("git", a, { cwd: repoDir, encoding: "utf8" });
+    git(["init", "-q"]);
+    git(["config", "user.email", "t@example.com"]);
+    git(["config", "user.name", "Test"]);
+    fs.writeFileSync(path.join(repoDir, "code.js"), "export const x = 1;\n");
+    git(["add", "."]);
+    git(["commit", "-qm", "init"]);
+    // Uncommitted change so --scope working-tree is non-empty regardless of host state.
+    fs.writeFileSync(path.join(repoDir, "code.js"), "export const x = 2; // changed\n");
+
+    const PATH = [mocksDir, nodeBinDir, "/usr/bin", "/bin"].join(path.delimiter);
     const r = spawnSync(process.execPath, [cli, ...args], {
-      cwd: root,
+      cwd: repoDir,
       encoding: "utf8",
-      env: { ...baseEnv, ...env }
+      env: { HOME: process.env.HOME, PATH, ...env }
     });
     return { status: r.status, stdout: r.stdout || "", stderr: r.stderr || "" };
   } finally {
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(mocksDir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(repoDir, { recursive: true, force: true }); } catch {}
   }
 }
 
@@ -55,9 +65,8 @@ test("CLI: multi-provider needs-attention maps to exit 2 (both providers reachab
 });
 
 test("CLI: under-satisfied emits a loud notice and proceeds (AC7 end-to-end)", () => {
-  // Request claude+gemini, but only mock claude is present (agy not on PATH, no keys).
   const r = runCli(["--providers", "claude,gemini", "--scope", "working-tree", "--allow-secrets"], {
-    mocks: { claude: FLAG }
+    mocks: { claude: FLAG } // agy absent, no keys → gemini unreachable
   });
   assert.match(r.stderr, /Under-satisfied/, "loud under-satisfied notice must reach stderr");
   assert.match(r.stderr, /1 of 2/);
@@ -72,13 +81,35 @@ test("CLI: under-satisfied single approve proceeds to exit 0", () => {
   assert.equal(r.status, 0);
 });
 
-test("CLI: API provider without an inlinable diff is blocked (exit 1)", () => {
-  // gemini API key present (no CLI needed); --max-bytes 1 forces summary mode so the
-  // diff cannot be inlined → the apiWithoutDiff guard must block before any API call.
+test("CLI #2: --json verdict matches the quorum exit verdict (no contradiction)", () => {
+  // One provider flags, but --quorum 2 with two providers → effective quorum 2 not
+  // met → approve/exit 0. The JSON verdict must agree (not the raw merge verdict).
+  const r = runCli(
+    ["--providers", "claude,gemini", "--quorum", "2", "--json", "--scope", "working-tree", "--allow-secrets"],
+    { mocks: { claude: FLAG, agy: APPROVE } }
+  );
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.verdict, "approve", "JSON verdict must match the exit-code (quorum) verdict");
+});
+
+test("CLI #6: an API provider on a non-inlinable diff is dropped, CLI provider proceeds", () => {
+  // gemini resolves to the API (key set); --max-bytes 1 forces summary mode so it
+  // cannot inspect the diff. It must be dropped (loud), and claude (CLI) proceeds.
+  const r = runCli(
+    ["--providers", "claude,gemini", "--scope", "working-tree", "--allow-secrets", "--max-bytes", "1"],
+    { mocks: { claude: FLAG }, env: { GEMINI_API_KEY: "dummy" } }
+  );
+  assert.match(r.stderr, /Dropping 1 API provider/);
+  assert.match(r.stderr, /gemini/);
+  assert.equal(r.status, 2, "claude (CLI) still reviews and flags → exit 2");
+});
+
+test("CLI #6: all-API selection on a non-inlinable diff exits 1 (nothing usable)", () => {
   const r = runCli(
     ["--providers", "gemini", "--scope", "working-tree", "--allow-secrets", "--max-bytes", "1"],
     { env: { GEMINI_API_KEY: "dummy" } }
   );
   assert.equal(r.status, 1, r.stderr);
-  assert.match(r.stderr, /too large to inline|allow-summary-review/);
+  assert.match(r.stderr, /No usable providers/);
 });

@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { selectProviders, underSatisfiedNotice } from "../src/llm.js";
+import { selectProviders, underSatisfiedNotice, resolveProviderToken } from "../src/llm.js";
 import { runMultiProviderReview } from "../src/review.js";
 
 function approveResult() {
@@ -97,6 +97,34 @@ test("explicit --providers resolves family tokens to concrete providers (API key
     assert.equal(sel.providers.length, 1);
     assert.equal(sel.providers[0].family, "gemini");
     assert.equal(sel.providers[0].config.provider, "gemini", "API key present → API provider, not CLI");
+    assert.equal(sel.underSatisfied, false);
+  });
+});
+
+test("#3/#5: a generic LLM_API_KEY does NOT force API mode for a family without its own key", () => {
+  // agy installed, no GEMINI_API_KEY, but a generic LLM_API_KEY is set (an OpenAI
+  // key, say). gemini must resolve to the CLI fallback, not the API with a wrong key.
+  withMockBins(["agy"], { LLM_API_KEY: "sk-not-gemini" }, () => {
+    const sel = selectProviders({ providers: ["gemini"] });
+    assert.equal(sel.providers.length, 1);
+    assert.equal(sel.providers[0].config.provider, "cli", "no family key → CLI fallback, not API");
+    assert.equal(sel.providers[0].config.cliCmd, "agy");
+  });
+});
+
+test("#3/#5: a family with neither its own key nor a CLI is unreachable despite LLM_API_KEY", () => {
+  withMockBins([], { LLM_API_KEY: "sk-generic" }, () => {
+    const r = resolveProviderToken("gemini", { apiKey: "sk-generic" });
+    assert.equal(r.config, null, "generic key must not fake reachability");
+  });
+});
+
+test("#7: synonym tokens for one family are deduped (no quorum inflation)", () => {
+  withMockBins(["codex"], {}, () => {
+    const sel = selectProviders({ providers: ["gpt", "openai"] });
+    assert.equal(sel.providers.length, 1, "gpt and openai collapse to one openai-family provider");
+    assert.equal(sel.providers[0].family, "openai");
+    assert.equal(sel.requestedCount, 1, "requested diversity is 1 distinct family");
     assert.equal(sel.underSatisfied, false);
   });
 });

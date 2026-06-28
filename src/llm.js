@@ -452,13 +452,21 @@ export function builderFamily() {
 export function resolveProviderToken(token, args = {}) {
   const id = String(token).toLowerCase();
   const family = TOKEN_FAMILY[id] || null;
-  const apiKeyOverride = args.apiKey || process.env.LLM_API_KEY;
-  const build = (provider) => ({ id, family, config: { ...configureLLM({ ...args, provider, providers: undefined }), id } });
+  // Each family resolves with its OWN credentials. A generic --api-key / LLM_API_KEY
+  // is NOT proof that a given family's API is reachable (an OpenAI key cannot auth
+  // Gemini), so it must never force API mode or skip a working CLI fallback. We pass
+  // the matched family key explicitly and suppress the generic override.
+  const build = (provider, apiKey = null) => ({
+    id,
+    family,
+    config: { ...configureLLM({ ...args, provider, providers: undefined, apiKey }), id }
+  });
 
   if (family) {
     for (const cand of FAMILY_CANDIDATES[family]) {
-      if (cand.kind === "api" && (apiKeyOverride || cand.envKeys.some((e) => process.env[e]))) {
-        return build(cand.provider);
+      if (cand.kind === "api") {
+        const matched = cand.envKeys.find((e) => process.env[e]);
+        if (matched) return build(cand.provider, process.env[matched]);
       }
       if (cand.kind === "cli" && isCmdInstalled(cand.cliCmd)) {
         return build(cand.cliCmd);
@@ -485,19 +493,26 @@ export function selectProviders(args = {}) {
     tokens = spec;
   }
 
+  // Diversity is measured in distinct FAMILIES — synonym tokens (gpt/openai)
+  // collapse to one, so duplicates cannot inflate the quorum or fake under-
+  // satisfaction. Unknown tokens (raw CLI commands) key on their own id.
+  const familyKey = (t) => TOKEN_FAMILY[String(t).toLowerCase()] || String(t).toLowerCase();
+  const requestedFamilies = new Set(tokens.map(familyKey));
+
   const resolved = tokens.map((t) => resolveProviderToken(t, args));
   const seen = new Set();
   const providers = [];
   for (const r of resolved) {
-    if (r.config && !seen.has(r.id)) {
-      seen.add(r.id);
-      providers.push(r);
-    }
+    if (!r.config) continue;
+    const key = r.family || r.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    providers.push(r);
   }
 
-  const requestedCount = tokens.length;
+  const requestedCount = requestedFamilies.size;
   const reachableCount = providers.length;
-  // auto wants >=2 distinct families; explicit wants every requested token.
+  // auto wants >=2 distinct families; explicit wants every requested family.
   const underSatisfied = auto ? reachableCount < 2 : reachableCount < requestedCount;
   return { providers, requestedCount, reachableCount, underSatisfied, auto };
 }

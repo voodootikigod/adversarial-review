@@ -341,10 +341,16 @@ export function deriveQuorumVerdict(perProvider, { failOn = "medium", minConfide
     return { provider, gatingCount: d.gatingCount, flags: d.gatingCount > 0 };
   });
   const flaggingCount = perProviderVerdicts.filter((p) => p.flags).length;
+  // Cap the quorum to the number of providers that actually ran. Otherwise a
+  // requested quorum higher than the reachable provider count would be
+  // mathematically unsatisfiable, silently producing a false "approve" (an
+  // unreachable provider must never disable the gate — fail safe, not open).
+  const effectiveQuorum = Math.max(1, Math.min(quorum, perProviderVerdicts.length));
   return {
-    verdict: flaggingCount >= quorum ? "needs-attention" : "approve",
+    verdict: flaggingCount >= effectiveQuorum ? "needs-attention" : "approve",
     flaggingCount,
     quorum,
+    effectiveQuorum,
     perProvider: perProviderVerdicts
   };
 }

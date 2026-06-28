@@ -41,22 +41,36 @@ async function runMultiProvider(args, context, prompt) {
   const notice = underSatisfiedNotice(sel);
   if (notice) log.warn(notice);
 
-  const apiWithoutDiff =
-    !context.includeDiff && !args.allowSummaryReview && sel.providers.some((p) => p.config.provider !== "cli");
-  if (apiWithoutDiff) {
+  // API providers cannot inspect a non-inlinable diff. Rather than aborting the
+  // whole diverse review, DROP those providers (loudly) and proceed with the CLI
+  // providers — preserving the reviewer diversity that is actually reachable
+  // (AC7 warn + proceed). Only abort if nothing usable remains.
+  let providers = sel.providers;
+  if (!context.includeDiff && !args.allowSummaryReview) {
+    const apiProviders = providers.filter((p) => p.config.provider !== "cli");
+    if (apiProviders.length) {
+      log.warn(
+        `Dropping ${apiProviders.length} API provider(s) that cannot inspect a non-inlinable diff: ` +
+          `${apiProviders.map((p) => p.id).join(", ")}. Raise --max-files/--max-bytes or pass ` +
+          `--allow-summary-review to include them.`
+      );
+      providers = providers.filter((p) => p.config.provider === "cli");
+    }
+  }
+  if (!providers.length) {
     log.error(
-      "The target diff is too large to inline, and API providers cannot inspect the repository themselves.\n" +
-        "Use local CLI providers, raise --max-files/--max-bytes, narrow the scope, or pass --allow-summary-review."
+      "No usable providers: the diff is too large to inline and every selected provider is API-only.\n" +
+        "Use a local CLI provider, raise --max-files/--max-bytes, narrow the scope, or pass --allow-summary-review."
     );
     process.exit(1);
   }
 
-  log.info(`Multi-provider review: ${sel.providers.map((p) => `${p.id}[${p.family}]`).join(", ")} (quorum ${args.quorum})`);
+  log.info(`Multi-provider review: ${providers.map((p) => `${p.id}[${p.family}]`).join(", ")} (quorum ${args.quorum})`);
 
-  const byId = new Map(sel.providers.map((p) => [p.id, p.config]));
+  const byId = new Map(providers.map((p) => [p.id, p.config]));
   let perProvider;
   try {
-    perProvider = await runMultiProviderReview(sel.providers, prompt, { passes: args.passes });
+    perProvider = await runMultiProviderReview(providers, prompt, { passes: args.passes });
     if (args.verify) {
       for (const pp of perProvider) {
         if (pp.result.findings.length) {
@@ -83,15 +97,24 @@ async function runMultiProvider(args, context, prompt) {
     minConfidence: args.minConfidence,
     quorum: args.quorum
   });
+  // The exit code is the quorum verdict; the JSON/report verdict must match it so
+  // a CI consumer of --json never sees a verdict that contradicts the exit code.
+  merged.verdict = derived.verdict;
   log.info(
-    `Quorum verdict: ${derived.flaggingCount}/${sel.providers.length} provider(s) flagged ` +
-      `(quorum ${derived.quorum}) → ${derived.verdict}`
+    `Quorum verdict: ${derived.flaggingCount}/${providers.length} provider(s) flagged ` +
+      `(effective quorum ${derived.effectiveQuorum} of requested ${derived.quorum}) → ${derived.verdict}`
   );
+
+  // Surface grounding/hallucination warnings on the merged findings (apiMode if
+  // any participating provider was an API, which applies the stricter check).
+  const mergedAssessments = assessFindings(merged, context, {
+    apiMode: providers.some((p) => p.config.provider !== "cli")
+  });
 
   if (args.json) {
     process.stdout.write(JSON.stringify(merged, null, 2) + "\n");
   } else {
-    console.log(renderReport(merged, context, null, derived));
+    console.log(renderReport(merged, context, mergedAssessments, derived));
   }
   process.exit(derived.verdict === "needs-attention" ? 2 : 0);
 }
