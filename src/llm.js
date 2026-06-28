@@ -421,6 +421,99 @@ export function configureLLM(args) {
   return { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs };
 }
 
+// ─── Multi-provider selection (--providers) ─────────────────────────────────
+
+// Family token → provider family. Diversity is keyed on FAMILY, not provider id.
+const TOKEN_FAMILY = {
+  gpt: "openai", openai: "openai", codex: "openai",
+  claude: "anthropic", anthropic: "anthropic",
+  gemini: "gemini", agy: "gemini"
+};
+
+// Ordered concrete candidates per family: prefer the API (key present) over the
+// local CLI, mirroring the single-provider auto-detection bias.
+const FAMILY_CANDIDATES = {
+  openai: [{ kind: "api", provider: "openai", envKeys: ["OPENAI_API_KEY"] }, { kind: "cli", cliCmd: "codex" }],
+  anthropic: [{ kind: "api", provider: "anthropic", envKeys: ["ANTHROPIC_API_KEY"] }, { kind: "cli", cliCmd: "claude" }],
+  gemini: [{ kind: "api", provider: "gemini", envKeys: ["GEMINI_API_KEY"] }, { kind: "cli", cliCmd: "agy" }]
+};
+
+// The family of the agent running this review, so auto-selection never picks the
+// builder's own family (a same-family critic is not an independent verdict).
+export function builderFamily() {
+  if (process.env.CLAUDECODE || process.env.CLAUDE_CODE) return "anthropic";
+  if (process.env.TERM_PROGRAM === "cursor") return "openai";
+  return null;
+}
+
+// Resolve a single --providers token to a concrete, REACHABLE provider config.
+// Returns { id, family, config } with config=null when nothing in the family is
+// reachable (no API key and no installed CLI).
+export function resolveProviderToken(token, args = {}) {
+  const id = String(token).toLowerCase();
+  const family = TOKEN_FAMILY[id] || null;
+  const apiKeyOverride = args.apiKey || process.env.LLM_API_KEY;
+  const build = (provider) => ({ id, family, config: { ...configureLLM({ ...args, provider, providers: undefined }), id } });
+
+  if (family) {
+    for (const cand of FAMILY_CANDIDATES[family]) {
+      if (cand.kind === "api" && (apiKeyOverride || cand.envKeys.some((e) => process.env[e]))) {
+        return build(cand.provider);
+      }
+      if (cand.kind === "cli" && isCmdInstalled(cand.cliCmd)) {
+        return build(cand.cliCmd);
+      }
+    }
+    return { id, family, config: null };
+  }
+  // Unknown token: treat as a raw local CLI command if installed.
+  if (isCmdInstalled(id)) return build(id);
+  return { id, family: null, config: null };
+}
+
+// Resolve args.providers (an array of tokens, or the sentinel "auto") into the
+// concrete set of reachable providers, plus under-satisfaction accounting (AC7).
+export function selectProviders(args = {}) {
+  const spec = args.providers;
+  let tokens = [];
+  let auto = false;
+  if (spec === "auto") {
+    auto = true;
+    const exclude = builderFamily();
+    tokens = ["openai", "anthropic", "gemini"].filter((f) => f !== exclude);
+  } else if (Array.isArray(spec)) {
+    tokens = spec;
+  }
+
+  const resolved = tokens.map((t) => resolveProviderToken(t, args));
+  const seen = new Set();
+  const providers = [];
+  for (const r of resolved) {
+    if (r.config && !seen.has(r.id)) {
+      seen.add(r.id);
+      providers.push(r);
+    }
+  }
+
+  const requestedCount = tokens.length;
+  const reachableCount = providers.length;
+  // auto wants >=2 distinct families; explicit wants every requested token.
+  const underSatisfied = auto ? reachableCount < 2 : reachableCount < requestedCount;
+  return { providers, requestedCount, reachableCount, underSatisfied, auto };
+}
+
+// Loud notice (AC7) when fewer providers were reachable than requested. Returns
+// null when the selection was fully satisfied. The verdict is NOT downgraded
+// (R6 warn + proceed) — this message is the safeguard.
+export function underSatisfiedNotice(sel) {
+  if (!sel || !sel.underSatisfied) return null;
+  return (
+    `Under-satisfied multi-provider review: only ${sel.reachableCount} of ${sel.requestedCount} ` +
+    `requested provider(s) were reachable. Reviewer diversity is reduced — this result reflects ` +
+    `${sel.reachableCount} provider(s), not the diversity you asked for.`
+  );
+}
+
 function apiError(provider, status, bodyText) {
   const err = new Error(`${provider} API error (${status}): ${bodyText}`);
   err.status = status;

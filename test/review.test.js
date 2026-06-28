@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateResult, assessFindings, deriveVerdict } from "../src/review.js";
+import { validateResult, assessFindings, deriveVerdict, mergeProviderResults, deriveQuorumVerdict } from "../src/review.js";
 
 function validFinding(overrides = {}) {
   return {
@@ -159,4 +159,78 @@ test("deriveVerdict uses grounding-adjusted confidence", () => {
   const assessments = [{ notes: ["ungrounded"], effectiveConfidence: 0.4 }];
   const derived = deriveVerdict(result, assessments, { failOn: "medium", minConfidence: 0.5 });
   assert.equal(derived.verdict, "approve");
+});
+
+// ─── Multi-provider merge / corroboration (AC5, AC11) ───────────────────────
+
+test("AC5: mergeProviderResults dedups shared finding + tags corroborators, keeps uniques", () => {
+  const shared = { title: "SQL injection in query builder", category: "injection", file: "src/db.js", line_start: 10, line_end: 12 };
+  const gptResult = validResult({
+    findings: [
+      validFinding(shared),
+      validFinding({ title: "Unbounded retry loop", category: "correctness", file: "src/job.js", line_start: 40, line_end: 45 })
+    ]
+  });
+  const gemResult = validResult({
+    findings: [
+      validFinding(shared),
+      validFinding({ title: "Missing auth check on admin route", category: "auth", file: "src/api.js", line_start: 5, line_end: 7 })
+    ]
+  });
+
+  const merged = mergeProviderResults([
+    { provider: "gpt", result: gptResult },
+    { provider: "gemini", result: gemResult }
+  ]);
+
+  assert.equal(merged.findings.length, 3, "shared finding deduped → 3 total");
+  const sharedMerged = merged.findings.find((f) => f.title === "SQL injection in query builder");
+  assert.deepEqual([...sharedMerged.corroborated_by].sort(), ["gemini", "gpt"], "shared tagged by both");
+  const gptUnique = merged.findings.find((f) => f.title === "Unbounded retry loop");
+  const gemUnique = merged.findings.find((f) => f.title === "Missing auth check on admin route");
+  assert.deepEqual(gptUnique.corroborated_by, ["gpt"]);
+  assert.deepEqual(gemUnique.corroborated_by, ["gemini"]);
+  // Merged result is schema-valid (corroborated_by is an accepted optional field).
+  assert.deepEqual(validateResult(merged), []);
+});
+
+test("AC11: distinct root causes at the same (file,category,range) are preserved, not collapsed", () => {
+  const loc = { category: "security", file: "src/auth.js", line_start: 20, line_end: 25 };
+  const gptResult = validResult({
+    findings: [validFinding({ ...loc, title: "Timing-unsafe token comparison" })]
+  });
+  const gemResult = validResult({
+    findings: [validFinding({ ...loc, title: "Hardcoded fallback signing secret" })]
+  });
+
+  const merged = mergeProviderResults([
+    { provider: "gpt", result: gptResult },
+    { provider: "gemini", result: gemResult }
+  ]);
+
+  assert.equal(merged.findings.length, 2, "different root causes at same location must NOT collapse");
+  const titles = merged.findings.map((f) => f.title).sort();
+  assert.deepEqual(titles, ["Hardcoded fallback signing secret", "Timing-unsafe token comparison"]);
+  for (const f of merged.findings) assert.equal(f.corroborated_by.length, 1);
+});
+
+// ─── Quorum-aware verdict (AC6) ─────────────────────────────────────────────
+
+test("AC6: quorum verdict — one approve + one needs-attention gates by default (quorum 1)", () => {
+  const approve = validResult({ verdict: "approve", findings: [] });
+  const flag = validResult({ findings: [validFinding({ severity: "high", confidence: 0.9 })] });
+  const perProvider = [
+    { provider: "gpt", result: approve },
+    { provider: "gemini", result: flag }
+  ];
+
+  const d1 = deriveQuorumVerdict(perProvider, { failOn: "medium", minConfidence: 0.5, quorum: 1 });
+  assert.equal(d1.verdict, "needs-attention");
+  assert.equal(d1.flaggingCount, 1);
+  // Exit-code mapping (shared with single-provider path): needs-attention → 2.
+  assert.equal(d1.verdict === "needs-attention" ? 2 : 0, 2);
+
+  const d2 = deriveQuorumVerdict(perProvider, { failOn: "medium", minConfidence: 0.5, quorum: 2 });
+  assert.equal(d2.verdict, "approve", "quorum 2 not met by a single flagging provider");
+  assert.equal(d2.verdict === "needs-attention" ? 2 : 0, 0);
 });

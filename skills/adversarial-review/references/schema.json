@@ -132,6 +132,12 @@
           "recommendation": {
             "type": "string",
             "minLength": 1
+          },
+          "corroborated_by": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       }

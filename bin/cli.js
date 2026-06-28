@@ -2,17 +2,99 @@
 
 import { parseArgs, log, HELP_TEXT } from "../src/utils.js";
 import { collectReviewContext } from "../src/git-context.js";
-import { configureLLM } from "../src/llm.js";
+import { configureLLM, selectProviders, underSatisfiedNotice } from "../src/llm.js";
 import { scanForSecrets } from "../src/secrets.js";
 import {
   buildPrompt,
   runReview,
+  runMultiProviderReview,
+  mergeProviderResults,
+  deriveQuorumVerdict,
   verifyFindings,
   assessFindings,
   deriveVerdict,
   renderReport
 } from "../src/review.js";
 import { runLoop } from "../src/loop.js";
+
+// Multi-provider review: fan the same prompt out to each selected provider
+// independently, merge with cross-provider corroboration, and derive a
+// quorum-aware verdict. Diversity, not count (ADR-0007).
+async function runMultiProvider(args, context, prompt) {
+  let sel;
+  try {
+    sel = selectProviders(args);
+  } catch (err) {
+    log.error(err.message);
+    process.exit(1);
+  }
+
+  if (!sel.providers.length) {
+    log.error(
+      "None of the requested providers are reachable (no API key and no installed CLI).\n" +
+        "Set an API key, install a local CLI agent (claude/codex/agy), or use --provider for single-provider review."
+    );
+    process.exit(1);
+  }
+
+  // R6: warn + proceed when under-satisfied; never silently downgrade the verdict.
+  const notice = underSatisfiedNotice(sel);
+  if (notice) log.warn(notice);
+
+  const apiWithoutDiff =
+    !context.includeDiff && !args.allowSummaryReview && sel.providers.some((p) => p.config.provider !== "cli");
+  if (apiWithoutDiff) {
+    log.error(
+      "The target diff is too large to inline, and API providers cannot inspect the repository themselves.\n" +
+        "Use local CLI providers, raise --max-files/--max-bytes, narrow the scope, or pass --allow-summary-review."
+    );
+    process.exit(1);
+  }
+
+  log.info(`Multi-provider review: ${sel.providers.map((p) => `${p.id}[${p.family}]`).join(", ")} (quorum ${args.quorum})`);
+
+  const byId = new Map(sel.providers.map((p) => [p.id, p.config]));
+  let perProvider;
+  try {
+    perProvider = await runMultiProviderReview(sel.providers, prompt, { passes: args.passes });
+    if (args.verify) {
+      for (const pp of perProvider) {
+        if (pp.result.findings.length) {
+          log.step(`Verification pass (${pp.provider}): refuting ${pp.result.findings.length} finding(s)...`);
+          const verified = await verifyFindings(byId.get(pp.provider), context, pp.result);
+          pp.result = verified.result;
+        }
+      }
+    }
+  } catch (err) {
+    log.error(err.message);
+    process.exit(1);
+  }
+
+  // Ground each provider's findings, then derive the quorum verdict from the
+  // per-provider grounded confidences.
+  for (const pp of perProvider) {
+    const cfg = byId.get(pp.provider);
+    pp.assessments = assessFindings(pp.result, context, { apiMode: cfg.provider !== "cli" });
+  }
+  const merged = mergeProviderResults(perProvider);
+  const derived = deriveQuorumVerdict(perProvider, {
+    failOn: args.failOn,
+    minConfidence: args.minConfidence,
+    quorum: args.quorum
+  });
+  log.info(
+    `Quorum verdict: ${derived.flaggingCount}/${sel.providers.length} provider(s) flagged ` +
+      `(quorum ${derived.quorum}) → ${derived.verdict}`
+  );
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(merged, null, 2) + "\n");
+  } else {
+    console.log(renderReport(merged, context, null, derived));
+  }
+  process.exit(derived.verdict === "needs-attention" ? 2 : 0);
+}
 
 async function main() {
   const args = parseArgs(process.argv);
@@ -101,6 +183,12 @@ async function main() {
 
   log.info(`Target: ${context.label}`);
   log.step(`${context.fileCount} file(s), ${context.diffBytes} diff bytes, mode: ${context.includeDiff ? "inline-diff" : "summary"}`);
+
+  // Multi-provider mode (--providers): independent fan-out + merge + quorum.
+  if (args.providers) {
+    await runMultiProvider(args, context, prompt);
+    return;
+  }
 
   // 3. Configure the LLM and run the review.
   let config;
