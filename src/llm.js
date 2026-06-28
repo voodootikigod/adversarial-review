@@ -453,6 +453,9 @@ const FAMILY_CANDIDATES = {
 export function builderFamily() {
   if (process.env.CLAUDECODE || process.env.CLAUDE_CODE) return "anthropic";
   if (process.env.TERM_PROGRAM === "cursor") return "openai";
+  // Antigravity (the `agy` CLI) runs Gemini-family models; exclude that family
+  // from auto-selection so the critic isn't the builder's own family.
+  if (process.env.ANTIGRAVITY_AGENT || process.env.ANTIGRAVITY_CONVERSATION_ID) return "gemini";
   return null;
 }
 
@@ -494,6 +497,19 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
   // Unknown token: treat as a raw local CLI command if installed.
   if (isCmdInstalled(id)) return build(id);
   return { id, family: null, config: null };
+}
+
+// The local CLI that belongs to each family, for downgrading a non-inlinable API
+// provider to its on-host CLI (which can inspect the repo) instead of dropping it.
+const FAMILY_CLI = { openai: "codex", anthropic: "claude", gemini: "agy" };
+
+// Return a CLI provider entry for `family` if its local CLI is installed, else null.
+export function cliFallbackForFamily(family, args = {}) {
+  const cliCmd = FAMILY_CLI[family];
+  if (cliCmd && isCmdInstalled(cliCmd)) {
+    return { id: cliCmd, family, config: { ...configureLLM({ ...args, provider: cliCmd, providers: undefined, apiKey: null }), id: cliCmd } };
+  }
+  return null;
 }
 
 // Resolve args.providers (an array of tokens, or the sentinel "auto") into the
@@ -543,7 +559,7 @@ export function underSatisfiedNotice(sel) {
   if (!sel || !sel.underSatisfied) return null;
   return (
     `Under-satisfied multi-provider review: only ${sel.reachableCount} of ${sel.requestedCount} ` +
-    `requested provider(s) were reachable. Reviewer diversity is reduced — this result reflects ` +
+    `requested provider(s) contributed a result. Reviewer diversity is reduced — this result reflects ` +
     `${sel.reachableCount} provider(s), not the diversity you asked for.`
   );
 }

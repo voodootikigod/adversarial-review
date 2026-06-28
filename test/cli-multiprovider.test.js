@@ -104,7 +104,27 @@ test("CLI #2(r5): when quorum is not met, the JSON summary matches the approve v
   const out = JSON.parse(r.stdout);
   assert.equal(out.verdict, "approve");
   assert.notEqual(out.summary, "bad", "summary must not be copied from the flagging provider when approving");
-  assert.equal(out.summary, "ok", "summary should reflect the approving provider");
+  assert.match(out.summary, /approving/i, "summary reflects the approve verdict");
+});
+
+test("CLI #2(r7): a needs-attention verdict never carries an approving summary", () => {
+  const r = runCli(
+    ["--providers", "claude,gemini", "--json", "--scope", "working-tree", "--allow-secrets"],
+    { mocks: { claude: FLAG, agy: APPROVE } }
+  );
+  assert.equal(r.status, 2, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.verdict, "needs-attention");
+  assert.match(out.summary, /raised gating findings/, "summary must reflect the gate, not a provider's approve prose");
+});
+
+test("CLI #1(r7): a non-inlinable API provider falls back to its local CLI instead of being dropped", () => {
+  const r = runCli(
+    ["--providers", "gemini", "--scope", "working-tree", "--allow-secrets", "--max-bytes", "1"],
+    { mocks: { agy: FLAG }, env: { GEMINI_API_KEY: "dummy" } }
+  );
+  assert.match(r.stderr, /using local agy/, "API gemini downgrades to the agy CLI");
+  assert.equal(r.status, 2, "agy reviews the summary-mode diff and flags → exit 2");
 });
 
 test("CLI #6: an API provider on a non-inlinable diff is dropped, CLI provider proceeds", () => {

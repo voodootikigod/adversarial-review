@@ -2,7 +2,7 @@
 
 import { parseArgs, log, HELP_TEXT } from "../src/utils.js";
 import { collectReviewContext } from "../src/git-context.js";
-import { configureLLM, selectProviders, underSatisfiedNotice } from "../src/llm.js";
+import { configureLLM, selectProviders, underSatisfiedNotice, cliFallbackForFamily } from "../src/llm.js";
 import { scanForSecrets } from "../src/secrets.js";
 import {
   buildPrompt,
@@ -44,15 +44,27 @@ async function runMultiProvider(args, context, prompt) {
   // (AC7 warn + proceed). Only abort if nothing usable remains.
   let providers = sel.providers;
   if (!context.includeDiff && !args.allowSummaryReview) {
-    const apiProviders = providers.filter((p) => p.config.provider !== "cli");
-    if (apiProviders.length) {
-      log.warn(
-        `Dropping ${apiProviders.length} API provider(s) that cannot inspect a non-inlinable diff: ` +
-          `${apiProviders.map((p) => p.id).join(", ")}. Raise --max-files/--max-bytes or pass ` +
-          `--allow-summary-review to include them.`
-      );
-      providers = providers.filter((p) => p.config.provider === "cli");
+    const kept = [];
+    const dropped = [];
+    for (const p of providers) {
+      if (p.config.provider === "cli") { kept.push(p); continue; }
+      // The API can't inspect a non-inlinable diff — downgrade to the family's
+      // local CLI (which can) before giving up on the family entirely.
+      const fallback = cliFallbackForFamily(p.family, args);
+      if (fallback) {
+        log.warn(`Provider ${p.id} (API) cannot inspect a non-inlinable diff; using local ${fallback.id} instead.`);
+        kept.push(fallback);
+      } else {
+        dropped.push(p.id);
+      }
     }
+    if (dropped.length) {
+      log.warn(
+        `Dropping ${dropped.length} API provider(s) with no local CLI fallback: ${dropped.join(", ")}. ` +
+          `Raise --max-files/--max-bytes or pass --allow-summary-review to include them.`
+      );
+    }
+    providers = kept;
   }
   if (!providers.length) {
     log.error(
@@ -131,15 +143,15 @@ async function runMultiProvider(args, context, prompt) {
     quorum: args.quorum
   });
   // The exit code is the quorum verdict; the JSON/report verdict AND summary must
-  // match it so a CI consumer of --json never sees a verdict that contradicts the
-  // exit code or a summary that contradicts the verdict.
+  // match it. A single provider's prose summary can contradict the derived gate
+  // (e.g. a provider says "approve"/"Safe to ship" but its findings gate locally),
+  // so synthesize an unambiguous quorum-state summary instead of copying one.
   merged.verdict = derived.verdict;
-  if (derived.verdict === "approve") {
-    const approving = perProvider.find((pp) => pp.result.verdict === "approve");
-    merged.summary = approving
-      ? approving.result.summary
-      : "No provider's findings met the quorum gate; approving.";
-  }
+  merged.summary =
+    derived.verdict === "needs-attention"
+      ? `${derived.flaggingCount} of ${perProvider.length} provider(s) raised gating findings ` +
+        `(effective quorum ${derived.effectiveQuorum}). See findings below.`
+      : `No provider's findings met the gate across ${perProvider.length} provider(s); approving.`;
   log.info(
     `Quorum verdict: ${derived.flaggingCount}/${perProvider.length} provider(s) flagged ` +
       `(effective quorum ${derived.effectiveQuorum} of requested ${derived.quorum}) → ${derived.verdict}`
