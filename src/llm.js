@@ -121,8 +121,10 @@ function execCli(cliCmd, args, input = null) {
   }).trim();
 }
 
-function cliFallbackArgs(cliCmd, fullPrompt) {
-  if (cliCmd === "claude") return ["-p", fullPrompt];
+export function cliFallbackArgs(cliCmd, fullPrompt) {
+  // claude and agy are Claude-Code-compatible: they need -p (print mode) when
+  // the prompt is passed as a command-line argument.
+  if (cliCmd === "claude" || cliCmd === "agy") return ["-p", fullPrompt];
   return [fullPrompt];
 }
 
@@ -193,7 +195,7 @@ function callCodexCli(fullPrompt, schema) {
   }
 }
 
-// Invoke a local CLI agent (claude, gemini, ...) by piping the prompt to stdin.
+// Invoke a local CLI agent (claude, agy, ...) by piping the prompt to stdin.
 function callCliLLM(cliCmd, prompt, systemInstruction, schema = null) {
   let fullPrompt = "";
   if (systemInstruction) {
@@ -207,8 +209,13 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null) {
     return callCodexCli(fullPrompt, schema);
   }
 
+  // agy is a Claude-Code-compatible CLI: it must run in -p (print) mode reading
+  // the prompt from the `-` stdin sentinel. A bare `agy` invocation would launch
+  // interactively and hang until the subprocess timeout.
+  const primaryArgs = cliCmd === "agy" ? ["-p", "-"] : [];
+
   try {
-    return execCli(cliCmd, [], fullPrompt);
+    return execCli(cliCmd, primaryArgs, fullPrompt);
   } catch (err) {
     if (Buffer.byteLength(fullPrompt) > MAX_ARGV_PROMPT_BYTES) {
       const stderr = err.stderr?.toString("utf8").trim() || "";
@@ -249,9 +256,9 @@ export function configureLLM(args) {
       } else if (isCmdInstalled("codex")) {
         provider = "cli";
         cliCmd = "codex";
-      } else if (isCmdInstalled("gemini")) {
+      } else if (isCmdInstalled("agy")) {
         provider = "cli";
-        cliCmd = "gemini";
+        cliCmd = "agy";
       } else {
         // Fall back to Claude/Anthropic if nothing else is available
         if (process.env.ANTHROPIC_API_KEY) {
@@ -263,7 +270,7 @@ export function configureLLM(args) {
           throw new Error(
             "No LLM configuration found.\n" +
             "Set an API key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY),\n" +
-            "or install a local CLI agent (claude, codex, or gemini).\n" +
+            "or install a local CLI agent (claude, codex, or agy).\n" +
             "Or run with --prompt-only to just print the prompt."
           );
         }
@@ -278,9 +285,9 @@ export function configureLLM(args) {
         provider = "anthropic";
       } else if (process.env.OPENAI_API_KEY) {
         provider = "openai";
-      } else if (isCmdInstalled("gemini")) {
+      } else if (isCmdInstalled("agy")) {
         provider = "cli";
-        cliCmd = "gemini";
+        cliCmd = "agy";
       } else if (isCmdInstalled("claude")) {
         provider = "cli";
         cliCmd = "claude";
@@ -307,14 +314,14 @@ export function configureLLM(args) {
       } else if (isCmdInstalled("codex")) {
         provider = "cli";
         cliCmd = "codex";
-      } else if (isCmdInstalled("gemini")) {
+      } else if (isCmdInstalled("agy")) {
         provider = "cli";
-        cliCmd = "gemini";
+        cliCmd = "agy";
       } else {
         throw new Error(
           "No LLM configuration found.\n" +
           "Set an API key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY),\n" +
-          "or install a local CLI agent (claude, codex, or gemini).\n" +
+          "or install a local CLI agent (claude, codex, or agy).\n" +
           "Or run with --prompt-only to just print the prompt."
         );
       }

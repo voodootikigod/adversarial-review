@@ -135,24 +135,26 @@ function probeFixer(cmd) {
   }
 }
 
-function detectFixer(args) {
+export function detectFixer(args) {
   if (args.loopFixer) {
     if (!isCmdInstalled(args.loopFixer)) {
       throw new Error(`--loop-fixer "${args.loopFixer}" not found in PATH.`);
     }
     return args.loopFixer;
   }
-  for (const cmd of ["codex", "claude", "gemini"]) {
+  for (const cmd of ["codex", "claude", "agy"]) {
     if (isCmdInstalled(cmd) && probeFixer(cmd)) return cmd;
   }
   throw new Error(
-    "No fixer CLI found (tried codex, claude, gemini).\n" +
+    "No fixer CLI found (tried codex, claude, agy).\n" +
     "Install one or specify --loop-fixer <cmd>."
   );
 }
 
 // Map known fixer CLIs to their provider family for the same-provider check.
-const FIXER_PROVIDER_MAP = { codex: "openai", claude: "anthropic", gemini: "gemini" };
+// agy runs Gemini models, so it is the "gemini" family even though its CLI
+// interface mirrors claude. The legacy `gemini` binary is deprecated and dropped.
+export const FIXER_PROVIDER_MAP = { codex: "openai", claude: "anthropic", agy: "gemini" };
 
 // ─── OS write constraint ──────────────────────────────────────────────────────
 
@@ -299,17 +301,18 @@ function buildFixPrompt(findings, files) {
 // ─── Fixer spawning ───────────────────────────────────────────────────────────
 
 // Build the command + args for the write-capable fixer invocation.
-function buildFixerCmd(fixerCmd, constraint) {
+export function buildFixerCmd(fixerCmd, constraint) {
   let cmd, args;
 
   if (fixerCmd === "codex") {
     cmd = "codex";
     args = ["exec", "--ephemeral", "--ignore-rules", "-"];
-  } else if (fixerCmd === "claude") {
-    cmd = "claude";
+  } else if (fixerCmd === "claude" || fixerCmd === "agy") {
+    // agy is Claude-Code-compatible: same write-capable print-mode invocation.
+    cmd = fixerCmd;
     args = ["--dangerously-skip-permissions", "-p", "-"];
   } else {
-    // gemini or custom: try piping via stdin
+    // unknown custom CLI: try piping via stdin
     cmd = fixerCmd;
     args = ["-"];
   }

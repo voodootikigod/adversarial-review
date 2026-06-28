@@ -2,7 +2,7 @@
 name: adversarial-review
 description: >-
   Skeptical ship/no-ship code review of a git diff or branch, run against any LLM
-  (Anthropic / OpenAI / Gemini API, or a local claude / codex / gemini CLI). Use before
+  (Anthropic / OpenAI / Gemini API, or a local claude / codex / agy CLI). Use before
   merging or pushing to catch the expensive failure classes a normal review misses: auth
   and trust-boundary holes, injection, secrets, data loss, rollback safety, race
   conditions, schema drift, supply-chain and CI/CD changes, test weakening, and
@@ -31,7 +31,7 @@ grounded findings (severity, category, file, line range, confidence, exploit sce
 quoted evidence, recommendation), and next steps.
 
 Model-agnostic: it runs against an Anthropic / OpenAI / Gemini API key, a local `claude` /
-`codex` / `gemini` CLI session, or — with no tooling at all — by handing you the prompt to
+`codex` / `agy` CLI session, or — with no tooling at all — by handing you the prompt to
 run yourself.
 
 ## When to use
@@ -125,7 +125,7 @@ weaker critic, so non-Anthropic providers are preferred first:
 1. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 2. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
 3. Local `codex` CLI on `PATH`
-4. Local `gemini` CLI on `PATH`
+4. Local `agy` CLI on `PATH`
 5. `ANTHROPIC_API_KEY` → Anthropic API (`claude-sonnet-4-6`) ← last resort, with warning
 6. Local `claude` CLI on `PATH` ← last resort, with warning
 
@@ -133,13 +133,13 @@ weaker critic, so non-Anthropic providers are preferred first:
 1. `GEMINI_API_KEY` → Gemini API
 2. `ANTHROPIC_API_KEY` → Anthropic API
 3. `OPENAI_API_KEY` → OpenAI API
-4. Local `gemini`, `claude`, or `codex` CLI
+4. Local `agy`, `claude`, or `codex` CLI
 
 **Everywhere else** (default order):
 1. `ANTHROPIC_API_KEY` → Anthropic API (`claude-sonnet-4-6`)
 2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
-4. Local `claude`, `codex`, or `gemini` CLI
+4. Local `claude`, `codex`, or `agy` CLI
 
 Force with `--provider <name>`; override the model with `--model <name>`. Gate quality
 tracks model tier — defaults are the strong tier of each provider; use `--model` to trade

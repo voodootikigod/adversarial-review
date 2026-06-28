@@ -15,7 +15,7 @@ terse summary, coverage, grounded findings (severity, category, file, line range
 confidence, exploit scenario, quoted evidence, recommendation), and next steps.
 
 It collects your git context, builds the prompt, calls a model (Anthropic / OpenAI /
-Gemini API, or a local CLI agent like `claude` / `codex` / `gemini`) using the provider's
+Gemini API, or a local CLI agent like `claude` / `codex` / `agy`) using the provider's
 **native structured-output mode**, validates the response against the JSON Schema, grounds
 each finding against the actual change set, and prints a report. The exit code is
 **derived deterministically from the findings** (severity + confidence thresholds), so it
@@ -196,7 +196,7 @@ a weaker critic. Otherwise:
 1. `ANTHROPIC_API_KEY` → Anthropic API (default model `claude-sonnet-4-6`)
 2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
-4. A local CLI agent on `PATH`: `claude`, `codex`, or `gemini` (uses your active session)
+4. A local CLI agent on `PATH`: `claude`, `codex`, or `agy` (uses your active session)
 
 Force any of them with `--provider`, and override the model with `--model`. A local CLI
 agent is selected by passing its command name, e.g. `--provider claude`. Defaults are the
