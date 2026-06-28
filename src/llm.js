@@ -421,6 +421,149 @@ export function configureLLM(args) {
   return { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs };
 }
 
+// ─── Multi-provider selection (--providers) ─────────────────────────────────
+
+// Family token → provider family. Diversity is keyed on FAMILY, not provider id.
+// `cursor` is intentionally NOT a multi-provider family: it is a local proxy that
+// forwards to the same frontier models (OpenAI/Anthropic), so it adds no INDEPENDENT
+// family diversity — the whole point of this mode. It remains available for
+// single-provider review via --provider cursor.
+const TOKEN_FAMILY = {
+  gpt: "openai", openai: "openai", codex: "openai",
+  claude: "anthropic", anthropic: "anthropic",
+  gemini: "gemini", agy: "gemini"
+};
+
+// Tokens that are the NAME of a local CLI binary. Naming one is an explicit request
+// for that on-host CLI, so it resolves CLI-only and is NEVER silently upgraded to
+// the family's API (which would send the diff off-host despite the user's intent).
+// Their family label is still used for diversity grouping.
+const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy"]);
+
+// Ordered concrete candidates per family: prefer the API (key present) over the
+// local CLI, mirroring the single-provider auto-detection bias.
+const FAMILY_CANDIDATES = {
+  openai: [{ kind: "api", provider: "openai", envKeys: ["OPENAI_API_KEY"] }, { kind: "cli", cliCmd: "codex" }],
+  anthropic: [{ kind: "api", provider: "anthropic", envKeys: ["ANTHROPIC_API_KEY"] }, { kind: "cli", cliCmd: "claude" }],
+  gemini: [{ kind: "api", provider: "gemini", envKeys: ["GEMINI_API_KEY"] }, { kind: "cli", cliCmd: "agy" }]
+};
+
+// The family of the agent running this review, so auto-selection never picks the
+// builder's own family (a same-family critic is not an independent verdict).
+export function builderFamily() {
+  if (process.env.CLAUDECODE || process.env.CLAUDE_CODE) return "anthropic";
+  if (process.env.TERM_PROGRAM === "cursor") return "openai";
+  // Antigravity (the `agy` CLI) runs Gemini-family models; exclude that family
+  // from auto-selection so the critic isn't the builder's own family.
+  if (process.env.ANTIGRAVITY_AGENT || process.env.ANTIGRAVITY_CONVERSATION_ID) return "gemini";
+  return null;
+}
+
+// Resolve a single --providers token to a concrete, REACHABLE provider config.
+// Returns { id, family, config } with config=null when nothing in the family is
+// reachable (no API key and no installed CLI).
+export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = false } = {}) {
+  const id = String(token).toLowerCase();
+  const family = TOKEN_FAMILY[id] || null;
+  // Each family resolves with its OWN credentials. A *generic* LLM_API_KEY is NOT
+  // proof that a given family's API is reachable (an OpenAI key cannot auth Gemini),
+  // so it never forces API mode. An *explicit* --api-key (args.apiKey) IS honored —
+  // but only when a single family is requested (allowApiKeyFallback), so it can't be
+  // blindly applied across families. Family-specific env keys always win.
+  const build = (provider, apiKey = null) => ({
+    id,
+    family,
+    config: { ...configureLLM({ ...args, provider, providers: undefined, apiKey }), id }
+  });
+
+  // Explicit local-CLI token: resolve to that CLI only, never the family API.
+  if (CLI_ONLY_TOKENS.has(id)) {
+    return isCmdInstalled(id) ? build(id) : { id, family, config: null };
+  }
+
+  if (family) {
+    for (const cand of FAMILY_CANDIDATES[family]) {
+      if (cand.kind === "api") {
+        const matched = cand.envKeys.find((e) => process.env[e]);
+        const key = matched ? process.env[matched] : (allowApiKeyFallback && args.apiKey ? args.apiKey : null);
+        if (key) return build(cand.provider, key);
+      }
+      if (cand.kind === "cli" && isCmdInstalled(cand.cliCmd)) {
+        return build(cand.cliCmd);
+      }
+    }
+    return { id, family, config: null };
+  }
+  // Unknown token: treat as a raw local CLI command if installed.
+  if (isCmdInstalled(id)) return build(id);
+  return { id, family: null, config: null };
+}
+
+// The local CLI that belongs to each family, for downgrading a non-inlinable API
+// provider to its on-host CLI (which can inspect the repo) instead of dropping it.
+const FAMILY_CLI = { openai: "codex", anthropic: "claude", gemini: "agy" };
+
+// Return a CLI provider entry for `family` if its local CLI is installed, else null.
+export function cliFallbackForFamily(family, args = {}) {
+  const cliCmd = FAMILY_CLI[family];
+  if (cliCmd && isCmdInstalled(cliCmd)) {
+    return { id: cliCmd, family, config: { ...configureLLM({ ...args, provider: cliCmd, providers: undefined, apiKey: null }), id: cliCmd } };
+  }
+  return null;
+}
+
+// Resolve args.providers (an array of tokens, or the sentinel "auto") into the
+// concrete set of reachable providers, plus under-satisfaction accounting (AC7).
+export function selectProviders(args = {}) {
+  const spec = args.providers;
+  let tokens = [];
+  let auto = false;
+  if (spec === "auto") {
+    auto = true;
+    const exclude = builderFamily();
+    tokens = ["openai", "anthropic", "gemini"].filter((f) => f !== exclude);
+  } else if (Array.isArray(spec)) {
+    tokens = spec;
+  }
+
+  // Diversity is measured in distinct FAMILIES — synonym tokens (gpt/openai)
+  // collapse to one, so duplicates cannot inflate the quorum or fake under-
+  // satisfaction. Unknown tokens (raw CLI commands) key on their own id.
+  const familyKey = (t) => TOKEN_FAMILY[String(t).toLowerCase()] || String(t).toLowerCase();
+  const requestedFamilies = new Set(tokens.map(familyKey));
+
+  // An explicit --api-key is unambiguous only when a single family is requested.
+  const allowApiKeyFallback = requestedFamilies.size === 1;
+  const resolved = tokens.map((t) => resolveProviderToken(t, args, { allowApiKeyFallback }));
+  const seen = new Set();
+  const providers = [];
+  for (const r of resolved) {
+    if (!r.config) continue;
+    const key = r.family || r.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    providers.push(r);
+  }
+
+  const requestedCount = requestedFamilies.size;
+  const reachableCount = providers.length;
+  // auto wants >=2 distinct families; explicit wants every requested family.
+  const underSatisfied = auto ? reachableCount < 2 : reachableCount < requestedCount;
+  return { providers, requestedCount, reachableCount, underSatisfied, auto };
+}
+
+// Loud notice (AC7) when fewer providers were reachable than requested. Returns
+// null when the selection was fully satisfied. The verdict is NOT downgraded
+// (R6 warn + proceed) — this message is the safeguard.
+export function underSatisfiedNotice(sel) {
+  if (!sel || !sel.underSatisfied) return null;
+  return (
+    `Under-satisfied multi-provider review: only ${sel.reachableCount} of ${sel.requestedCount} ` +
+    `requested provider(s) contributed a result. Reviewer diversity is reduced — this result reflects ` +
+    `${sel.reachableCount} provider(s), not the diversity you asked for.`
+  );
+}
+
 function apiError(provider, status, bodyText) {
   const err = new Error(`${provider} API error (${status}): ${bodyText}`);
   err.status = status;

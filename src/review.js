@@ -151,6 +151,11 @@ export function renderReport(result, context, assessments = null, derived = null
       lines.push("");
       lines.push(`  ${sev} ${cat} ${colors.bold(f.title)}  ${conf}`);
       lines.push(`    ${colors.cyan(findingLocation(f))}`);
+      if (f.corroborated_by?.length > 1) {
+        lines.push(`    ${colors.green(`✓ corroborated by ${f.corroborated_by.length} providers: ${f.corroborated_by.join(", ")}`)}`);
+      } else if (f.corroborated_by?.length === 1) {
+        lines.push(`    ${colors.dim(`raised by: ${f.corroborated_by[0]}`)}`);
+      }
       for (const l of f.body.split("\n")) lines.push(`    ${l}`);
       if (f.exploit_scenario) {
         lines.push(`    ${colors.yellow("✗ failure:")} ${f.exploit_scenario}`);
@@ -266,6 +271,122 @@ function mergeResults(results) {
   return merged;
 }
 
+// Two findings are "the same" across providers only when they hit the same issue
+// (file, category, overlapping range) AND describe the same root cause (similar
+// title). The title guard is load-bearing: two providers can flag DIFFERENT bugs
+// at the same location, and collapsing them would discard a real finding — the
+// exact cross-provider catch this mode exists to surface (ADR-0007).
+// Generic words that carry no distinguishing signal for a finding title. Without
+// stripping these, "SQL injection vulnerability in X" and "Command injection
+// vulnerability in X" share enough tokens to look identical — collapsing two
+// genuinely distinct bugs. Removing them lets the meaningful nouns (sql/command)
+// drive the comparison.
+const TITLE_STOPWORDS = new Set([
+  "a", "an", "the", "in", "on", "of", "to", "and", "or", "for", "with", "via", "at",
+  "is", "are", "be", "by", "from", "into", "vulnerability", "vuln", "issue", "issues",
+  "error", "errors", "bug", "bugs", "problem", "risk", "risks", "finding", "possible",
+  "potential", "unsafe", "insecure", "missing", "improper", "incorrect"
+]);
+
+function titleSimilar(a, b) {
+  const toks = (s) =>
+    new Set((String(s || "").toLowerCase().match(/[a-z0-9]+/g) || []).filter((t) => t.length > 1 && !TITLE_STOPWORDS.has(t)));
+  const A = toks(a), B = toks(b);
+  // If stripping leaves nothing distinctive, fall back to exact (normalized) match.
+  if (A.size === 0 || B.size === 0) return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  const union = A.size + B.size - inter;
+  // The PRIMARY same-issue key is sameIssue() — same file, category, overlapping
+  // range. This is the secondary distinctness guard: after removing generic terms,
+  // require 70% overlap of the MEANINGFUL tokens. Distinct root causes at the same
+  // location (sql vs command injection) stay separate; differently-worded
+  // descriptions of the SAME defect still corroborate.
+  return inter / union >= 0.7;
+}
+
+function sameFindingAcrossProviders(a, b) {
+  return sameIssue(a, b) && titleSimilar(a.title, b.title);
+}
+
+// Merge findings from independent providers. UNLIKE mergeResults (same-model
+// passes, which collapses to one), this preserves distinct findings and records
+// cross-provider corroboration: every merged finding carries `corroborated_by`,
+// the sorted list of providers that raised it. A finding raised by >1 provider
+// is one entry tagged with all its corroborators (higher severity/confidence kept
+// as the representative); distinct findings are kept separate.
+export function mergeProviderResults(perProvider, { failOn = "medium", minConfidence = 0.5 } = {}) {
+  const results = perProvider.map((p) => p.result);
+  const flagged = results.find((r) => r.verdict === "needs-attention");
+  // A finding "gates" under the active thresholds. The representative is chosen so
+  // a low-confidence (likely hallucinated) finding can never mask a well-grounded
+  // one: prefer a gating finding, then higher severity, then higher confidence.
+  const gates = (f) => SEVERITY_RANK[f.severity] >= SEVERITY_RANK[failOn] && f.confidence >= minConfidence;
+  const groups = [];
+  for (const { provider, result } of perProvider) {
+    for (const f of result.findings) {
+      const g = groups.find((grp) => sameFindingAcrossProviders(grp.rep, f));
+      if (!g) {
+        groups.push({ rep: { ...f }, providers: new Set([provider]) });
+      } else {
+        g.providers.add(provider);
+        const better =
+          (gates(f) && !gates(g.rep)) ||
+          (gates(f) === gates(g.rep) &&
+            (SEVERITY_RANK[f.severity] > SEVERITY_RANK[g.rep.severity] ||
+              (f.severity === g.rep.severity && f.confidence > g.rep.confidence)));
+        if (better) g.rep = { ...f };
+      }
+    }
+  }
+  return {
+    verdict: flagged ? "needs-attention" : "approve",
+    summary: (flagged || results[0]).summary,
+    coverage: {
+      files_examined: [...new Set(results.flatMap((r) => r.coverage?.files_examined || []))],
+      files_skipped: [...new Set(results.flatMap((r) => r.coverage?.files_skipped || []))]
+    },
+    findings: groups.map((g) => {
+      const rep = { ...g.rep };
+      delete rep.corroborated_by;
+      return { ...rep, corroborated_by: [...g.providers].sort() };
+    }),
+    next_steps: [...new Set(results.flatMap((r) => r.next_steps || []))]
+  };
+}
+
+// Quorum-aware verdict across providers. A provider "flags" when its own derived
+// verdict gates (>=1 finding at/above failOn after confidence gating). The merged
+// verdict is needs-attention when the number of DISTINCT flagging providers is
+// >= quorum (default 1: any one provider's material finding gates). Quorum counts
+// providers, never passes.
+export function deriveQuorumVerdict(perProvider, { failOn = "medium", minConfidence = 0.5, quorum = 1 } = {}) {
+  const perProviderVerdicts = perProvider.map(({ provider, result, assessments }) => {
+    const d = deriveVerdict(result, assessments ?? null, { failOn, minConfidence });
+    return { provider, gatingCount: d.gatingCount, flags: d.gatingCount > 0 };
+  });
+  const flaggingCount = perProviderVerdicts.filter((p) => p.flags).length;
+  // Cap the quorum to the number of providers that actually ran. Otherwise a
+  // requested quorum higher than the reachable provider count would be
+  // mathematically unsatisfiable, silently producing a false "approve" (an
+  // unreachable provider must never disable the gate — fail safe, not open).
+  //
+  // This is a deliberate tension: capping means a lone reachable provider's flag
+  // still gates (R6 "proceed + exit by result"), rather than being ignored because
+  // the requested quorum can't be met (which would be the dangerous fail-OPEN).
+  // We favour not ignoring a real finding. An opt-in strict mode (honour the raw
+  // quorum and approve when unmet) could be a future flag, but the safe default is
+  // to let the available evidence gate.
+  const effectiveQuorum = Math.max(1, Math.min(quorum, perProviderVerdicts.length));
+  return {
+    verdict: flaggingCount >= effectiveQuorum ? "needs-attention" : "approve",
+    flaggingCount,
+    quorum,
+    effectiveQuorum,
+    perProvider: perProviderVerdicts
+  };
+}
+
 // Run the review `passes` times and merge findings. Sampling the reviewer more
 // than once materially improves recall on adversarial review; duplicates are
 // collapsed by (file, category, overlapping line range).
@@ -282,6 +403,35 @@ export async function runReview(config, prompt, { passes = 1 } = {}) {
     throw new Error("Merged multi-pass result failed schema validation:\n  - " + errors.join("\n  - "));
   }
   return merged;
+}
+
+// Fan the same prompt out to multiple independent providers SEQUENTIALLY (R4 —
+// local CLI agents may not run concurrently safely). Each provider runs the full
+// `runReview` (so it composes with --passes: each provider samples `passes`
+// times internally). `reviewFn` is injectable for testing. Returns
+// [{ provider, result }] for the cross-provider merge + quorum verdict.
+// True when selected API providers cannot review: the diff was too large to inline
+// AND the user did not opt into summary-only review. (CLI providers can always
+// inspect the repo, so this only constrains API providers.)
+export function apiProvidersCannotReview(context, args) {
+  return !context.includeDiff && !args.allowSummaryReview;
+}
+
+export async function runMultiProviderReview(providers, prompt, { passes = 1 } = {}, reviewFn = runReview) {
+  const perProvider = [];
+  const failures = [];
+  for (const p of providers) {
+    log.step(`Provider ${p.id}...`);
+    // Tolerate a single provider failing (transient API error, bad config): record
+    // it and proceed with the rest, rather than aborting the whole diverse review.
+    try {
+      const result = await reviewFn(p.config, prompt, { passes });
+      perProvider.push({ provider: p.id, result });
+    } catch (err) {
+      failures.push({ provider: p.id, error: err?.message || String(err) });
+    }
+  }
+  return { perProvider, failures };
 }
 
 const VERIFY_SCHEMA = {

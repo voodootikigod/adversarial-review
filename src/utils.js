@@ -43,6 +43,13 @@ ${colors.bold("Options:")}
   --verify              Second adversarial pass that tries to refute each finding;
                         refuted findings are dropped (1 extra call per finding).
   --passes <n>          Run the review n times and merge findings (default 1).
+  --providers <list>    Multi-provider mode: run the review independently against
+                        each family token (e.g. gpt,gemini,claude) and merge with
+                        cross-provider corroboration. Use "auto" to pick >=2
+                        distinct families. Diversity, not count — distinct from
+                        --passes. Cannot be combined with --provider.
+  --quorum <n>          Multi-provider verdict gates as needs-attention when >= n
+                        providers each flag a material finding (default 1).
   --allow-secrets       Send the payload even if the secret scan finds likely
                         credentials in the diff (off by default).
   --timeout <seconds>   Per-request API timeout (default 120).
@@ -102,6 +109,8 @@ export function parseArgs(argv) {
     failOnEmpty: false,
     verify: false,
     passes: 1,
+    providers: null,
+    quorum: 1,
     allowSecrets: false,
     timeout: 120,
     provider: null,
@@ -137,6 +146,19 @@ export function parseArgs(argv) {
     const value = arg.slice(option.length + 1);
     if (!value) args.errors.push(`${option} requires a value.`);
     return value || null;
+  }
+
+  // --providers takes either the sentinel "auto" or a comma-separated list of
+  // family tokens (e.g. gpt,gemini,claude). Empty/whitespace entries are dropped.
+  function parseProvidersValue(option, value) {
+    if (value === null) return null;
+    if (value === "auto") return "auto";
+    const list = value.split(",").map((s) => s.trim()).filter(Boolean);
+    if (list.length === 0) {
+      args.errors.push(`${option} requires at least one provider token, or "auto".`);
+      return null;
+    }
+    return list;
   }
 
   function parseNonNegativeInteger(option, value) {
@@ -219,6 +241,18 @@ export function parseArgs(argv) {
       i = result.nextIndex;
     } else if (arg.startsWith("--passes=")) {
       args.passes = parsePositiveInteger("--passes", readEqualsValue("--passes", arg));
+    } else if (arg === "--providers") {
+      const result = readValue("--providers", i);
+      args.providers = parseProvidersValue("--providers", result.value);
+      i = result.nextIndex;
+    } else if (arg.startsWith("--providers=")) {
+      args.providers = parseProvidersValue("--providers", readEqualsValue("--providers", arg));
+    } else if (arg === "--quorum") {
+      const result = readValue("--quorum", i);
+      args.quorum = parsePositiveInteger("--quorum", result.value) ?? args.quorum;
+      i = result.nextIndex;
+    } else if (arg.startsWith("--quorum=")) {
+      args.quorum = parsePositiveInteger("--quorum", readEqualsValue("--quorum", arg)) ?? args.quorum;
     } else if (arg === "--timeout") {
       const result = readValue("--timeout", i);
       args.timeout = parsePositiveInteger("--timeout", result.value);
@@ -326,6 +360,13 @@ export function parseArgs(argv) {
     } else {
       focusParts.push(arg);
     }
+  }
+
+  if (args.providers && args.provider) {
+    args.errors.push("--providers cannot be combined with --provider; use one or the other.");
+  }
+  if (args.providers && args.model) {
+    args.errors.push("--model cannot be combined with --providers; model names are provider-specific and would be applied to every family. Each provider uses its own default model.");
   }
 
   args.focus = focusParts.join(" ").trim();

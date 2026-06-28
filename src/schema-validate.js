@@ -87,9 +87,14 @@ export function validateAgainstSchema(schema, value) {
 // (type/properties/required/additionalProperties/enum/items) are preserved; the
 // stripped constraints are still enforced locally by validateAgainstSchema.
 export function sanitizeSchemaForProvider(schema, { keepConstraints = false, extraDrop = [] } = {}) {
+  // corroborated_by is a merge-time annotation, never produced by a provider.
+  // Always strip it from the provider-facing schema: leaving an optional property
+  // in an additionalProperties:false object breaks OpenAI strict json_schema
+  // (which requires every property be in `required`).
+  const ALWAYS_DROP = ["$schema", "$comment", "corroborated_by"];
   const DROP = keepConstraints
-    ? new Set(["$schema", "$comment", ...extraDrop])
-    : new Set(["$schema", "$comment", "minLength", "minimum", "maximum", ...extraDrop]);
+    ? new Set([...ALWAYS_DROP, ...extraDrop])
+    : new Set([...ALWAYS_DROP, "minLength", "minimum", "maximum", ...extraDrop]);
 
   function walk(node) {
     if (Array.isArray(node)) return node.map(walk);

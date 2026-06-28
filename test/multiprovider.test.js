@@ -1,0 +1,201 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { selectProviders, underSatisfiedNotice, resolveProviderToken, builderFamily } from "../src/llm.js";
+import { runMultiProviderReview } from "../src/review.js";
+
+function approveResult() {
+  return { verdict: "approve", summary: "ok", coverage: { files_examined: [], files_skipped: [] }, findings: [], next_steps: [] };
+}
+
+// Build a temp dir of mock executables and isolate PATH to it.
+function withMockBins(cmds, env, fn) {
+  const oldEnv = { ...process.env };
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-mp-"));
+  try {
+    for (const cmd of cmds) {
+      const binName = process.platform === "win32" ? `${cmd}.cmd` : cmd;
+      const binPath = path.join(tempDir, binName);
+      fs.writeFileSync(binPath, "#!/bin/sh\necho 1.0.0");
+      if (process.platform !== "win32") fs.chmodSync(binPath, 0o755);
+    }
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.LLM_API_KEY;
+    delete process.env.CLAUDECODE;
+    delete process.env.CLAUDE_CODE;
+    delete process.env.TERM_PROGRAM;
+    Object.assign(process.env, env || {});
+    process.env.PATH = tempDir;
+    return fn();
+  } finally {
+    process.env = oldEnv;
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+test("AC4: runMultiProviderReview invokes each provider once with the same prompt", async () => {
+  const calls = [];
+  const stubReview = async (config, prompt) => {
+    calls.push({ id: config.id, prompt });
+    return approveResult();
+  };
+  const providers = [
+    { id: "gpt", family: "openai", config: { id: "gpt", provider: "cli", cliCmd: "codex" } },
+    { id: "gemini", family: "gemini", config: { id: "gemini", provider: "cli", cliCmd: "agy" } }
+  ];
+  const { perProvider, failures } = await runMultiProviderReview(providers, "THE PROMPT", { passes: 1 }, stubReview);
+
+  assert.equal(calls.length, 2, "each provider invoked exactly once");
+  assert.deepEqual(calls.map((c) => c.id).sort(), ["gemini", "gpt"]);
+  assert.deepEqual(calls.map((c) => c.prompt), ["THE PROMPT", "THE PROMPT"], "same prompt to each");
+  assert.deepEqual(perProvider.map((p) => p.provider).sort(), ["gemini", "gpt"]);
+  assert.equal(failures.length, 0);
+});
+
+test("#1: a single provider failure is recorded and the rest proceed (degrade-and-proceed)", async () => {
+  const stubReview = async (config) => {
+    if (config.id === "gpt") throw new Error("transient 500");
+    return approveResult();
+  };
+  const providers = [
+    { id: "gpt", family: "openai", config: { id: "gpt", provider: "cli", cliCmd: "codex" } },
+    { id: "gemini", family: "gemini", config: { id: "gemini", provider: "cli", cliCmd: "agy" } }
+  ];
+  const { perProvider, failures } = await runMultiProviderReview(providers, "P", { passes: 1 }, stubReview);
+  assert.deepEqual(perProvider.map((p) => p.provider), ["gemini"], "surviving provider proceeds");
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].provider, "gpt");
+  assert.match(failures[0].error, /transient 500/);
+});
+
+test("AC8: --providers auto selects >=2 distinct families, excluding the builder's family", () => {
+  // Builder = Claude (anthropic). codex(openai), agy(gemini), claude(anthropic) all installed.
+  withMockBins(["codex", "agy", "claude"], { CLAUDE_CODE: "1" }, () => {
+    const sel = selectProviders({ providers: "auto" });
+    const fams = new Set(sel.providers.map((p) => p.family));
+    assert.ok(fams.size >= 2, `expected >=2 distinct families, got ${[...fams]}`);
+    assert.ok(!fams.has("anthropic"), "must exclude the builder's family (anthropic)");
+    assert.equal(sel.underSatisfied, false, "auto with >=2 families is satisfied");
+  });
+});
+
+test("builderFamily detects Antigravity (Gemini) from either env var alone", () => {
+  const oldEnv = { ...process.env };
+  for (const key of ["CLAUDECODE", "CLAUDE_CODE", "TERM_PROGRAM", "ANTIGRAVITY_AGENT", "ANTIGRAVITY_CONVERSATION_ID"]) {
+    delete process.env[key];
+  }
+  try {
+    process.env.ANTIGRAVITY_AGENT = "1";
+    assert.equal(builderFamily(), "gemini", "ANTIGRAVITY_AGENT alone → gemini");
+    delete process.env.ANTIGRAVITY_AGENT;
+    process.env.ANTIGRAVITY_CONVERSATION_ID = "abc";
+    assert.equal(builderFamily(), "gemini", "ANTIGRAVITY_CONVERSATION_ID alone → gemini");
+  } finally {
+    process.env = oldEnv;
+  }
+});
+
+test("AC8: --providers auto excludes the builder family in Cursor too", () => {
+  // Builder = Cursor (openai family). codex(openai), agy(gemini), claude(anthropic) installed.
+  withMockBins(["codex", "agy", "claude"], { TERM_PROGRAM: "cursor" }, () => {
+    const sel = selectProviders({ providers: "auto" });
+    const fams = new Set(sel.providers.map((p) => p.family));
+    assert.ok(fams.size >= 2, `expected >=2 distinct families, got ${[...fams]}`);
+    assert.ok(!fams.has("openai"), "must exclude the builder's family (openai) in Cursor");
+  });
+});
+
+test("AC7: under-satisfied when fewer providers are reachable than requested", () => {
+  // Request gpt+gemini, but only agy (gemini family) is installed and no API keys.
+  withMockBins(["agy"], {}, () => {
+    const sel = selectProviders({ providers: ["gpt", "gemini"] });
+    assert.equal(sel.providers.length, 1, "only the reachable provider runs");
+    assert.equal(sel.providers[0].family, "gemini");
+    assert.equal(sel.underSatisfied, true);
+    assert.equal(sel.requestedCount, 2);
+    assert.equal(sel.reachableCount, 1);
+
+    const notice = underSatisfiedNotice(sel);
+    assert.ok(notice, "a loud under-satisfied notice must be produced");
+    assert.match(notice, /1 of 2/);
+  });
+});
+
+test("explicit --providers resolves family tokens to concrete providers (API key wins over CLI)", () => {
+  withMockBins(["agy"], { GEMINI_API_KEY: "k" }, () => {
+    const sel = selectProviders({ providers: ["gemini"] });
+    assert.equal(sel.providers.length, 1);
+    assert.equal(sel.providers[0].family, "gemini");
+    assert.equal(sel.providers[0].config.provider, "gemini", "API key present → API provider, not CLI");
+    assert.equal(sel.underSatisfied, false);
+  });
+});
+
+test("#1(r6): a CLI-name token (codex) resolves to the local CLI, never the family API", () => {
+  // OPENAI_API_KEY is set, but naming the local `codex` binary must NOT exfiltrate
+  // the diff to the OpenAI API — it resolves to the on-host CLI.
+  withMockBins(["codex"], { OPENAI_API_KEY: "sk-present" }, () => {
+    const sel = selectProviders({ providers: ["codex"] });
+    assert.equal(sel.providers.length, 1);
+    assert.equal(sel.providers[0].config.provider, "cli", "codex must resolve to the local CLI");
+    assert.equal(sel.providers[0].config.cliCmd, "codex");
+  });
+});
+
+test("#1(r6): a CLI-name token is unreachable (not API) when its binary is absent", () => {
+  withMockBins([], { OPENAI_API_KEY: "sk-present" }, () => {
+    const sel = selectProviders({ providers: ["codex"] });
+    assert.equal(sel.providers.length, 0, "no codex binary → unreachable, must not fall back to OpenAI API");
+  });
+});
+
+test("#3/#5: a generic LLM_API_KEY does NOT force API mode for a family without its own key", () => {
+  // agy installed, no GEMINI_API_KEY, but a generic LLM_API_KEY is set (an OpenAI
+  // key, say). gemini must resolve to the CLI fallback, not the API with a wrong key.
+  withMockBins(["agy"], { LLM_API_KEY: "sk-not-gemini" }, () => {
+    const sel = selectProviders({ providers: ["gemini"] });
+    assert.equal(sel.providers.length, 1);
+    assert.equal(sel.providers[0].config.provider, "cli", "no family key → CLI fallback, not API");
+    assert.equal(sel.providers[0].config.cliCmd, "agy");
+  });
+});
+
+test("#3/#5: a family with neither its own key nor a CLI is unreachable despite LLM_API_KEY", () => {
+  withMockBins([], { LLM_API_KEY: "sk-generic" }, () => {
+    const r = resolveProviderToken("gemini", { apiKey: "sk-generic" });
+    assert.equal(r.config, null, "generic key must not fake reachability");
+  });
+});
+
+test("explicit --api-key is honored for a single requested family (single-provider parity)", () => {
+  // No env key, no CLI, but an explicit --api-key for the one requested family.
+  withMockBins([], {}, () => {
+    const sel = selectProviders({ providers: ["openai"], apiKey: "sk-explicit" });
+    assert.equal(sel.providers.length, 1);
+    assert.equal(sel.providers[0].config.provider, "openai", "explicit --api-key selects the API");
+    assert.equal(sel.providers[0].config.apiKey, "sk-explicit");
+  });
+});
+
+test("explicit --api-key is NOT applied across multiple requested families", () => {
+  // Two families, one --api-key: it must not be blindly used for both.
+  withMockBins([], {}, () => {
+    const sel = selectProviders({ providers: ["openai", "gemini"], apiKey: "sk-explicit" });
+    assert.equal(sel.providers.length, 0, "ambiguous --api-key must not fake reachability for either family");
+    assert.equal(sel.underSatisfied, true);
+  });
+});
+
+test("#7: synonym tokens for one family are deduped (no quorum inflation)", () => {
+  withMockBins(["codex"], {}, () => {
+    const sel = selectProviders({ providers: ["gpt", "openai"] });
+    assert.equal(sel.providers.length, 1, "gpt and openai collapse to one openai-family provider");
+    assert.equal(sel.providers[0].family, "openai");
+    assert.equal(sel.requestedCount, 1, "requested diversity is 1 distinct family");
+    assert.equal(sel.underSatisfied, false);
+  });
+});

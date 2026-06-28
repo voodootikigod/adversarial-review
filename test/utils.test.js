@@ -113,3 +113,43 @@ test("parseArgs parses equals format for --api-base, --api-key, and --headers", 
   assert.deepEqual(args.errors, []);
 });
 
+
+test("parseArgs parses --providers as a comma-separated list and --quorum", () => {
+  const args = parseArgs(["node", "cli", "--providers", "gpt,gemini,claude", "--quorum", "2"]);
+  assert.deepEqual(args.providers, ["gpt", "gemini", "claude"]);
+  assert.equal(args.quorum, 2);
+  assert.deepEqual(args.errors, []);
+});
+
+test("parseArgs accepts --providers=auto sentinel and defaults quorum to 1", () => {
+  const args = parseArgs(["node", "cli", "--providers=auto"]);
+  assert.equal(args.providers, "auto");
+  assert.equal(args.quorum, 1);
+  assert.deepEqual(args.errors, []);
+});
+
+test("parseArgs trims and drops empty --providers entries", () => {
+  const args = parseArgs(["node", "cli", "--providers", " gpt , , gemini "]);
+  assert.deepEqual(args.providers, ["gpt", "gemini"]);
+});
+
+test("parseArgs rejects an empty --providers list", () => {
+  const args = parseArgs(["node", "cli", "--providers", ","]);
+  assert.ok(args.errors.some((e) => /--providers/.test(e)));
+});
+
+test("parseArgs rejects --providers combined with --provider", () => {
+  const args = parseArgs(["node", "cli", "--provider", "openai", "--providers", "gpt,gemini"]);
+  assert.ok(args.errors.some((e) => /--providers.*--provider|--provider.*--providers/.test(e)));
+});
+
+test("parseArgs defaults: providers null, quorum 1", () => {
+  const args = parseArgs(["node", "cli"]);
+  assert.equal(args.providers, null);
+  assert.equal(args.quorum, 1);
+});
+
+test("parseArgs rejects --model combined with --providers", () => {
+  const args = parseArgs(["node", "cli", "--providers", "gpt,gemini", "--model", "gpt-4o"]);
+  assert.ok(args.errors.some((e) => /--model.*--providers|--providers.*--model/.test(e)));
+});
