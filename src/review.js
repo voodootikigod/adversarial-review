@@ -283,10 +283,13 @@ function titleSimilar(a, b) {
   let inter = 0;
   for (const t of A) if (B.has(t)) inter++;
   const union = A.size + B.size - inter;
-  // High bar (0.7): only near-identical titles collapse, so two genuinely
-  // distinct bugs at the same location with merely overlapping wording stay
-  // separate. Losing a real finding is worse than a duplicate.
-  return inter / union >= 0.7;
+  // The PRIMARY same-issue key is sameIssue() — same file, same category, and an
+  // overlapping line range. This title check is only a secondary distinctness
+  // guard for the rare "two different bugs at the same location" case. 0.5 is
+  // moderate: high enough that genuinely distinct titles (disjoint wording) stay
+  // separate, low enough that two providers' differently-worded descriptions of
+  // the SAME defect still corroborate rather than double-report.
+  return inter / union >= 0.5;
 }
 
 function sameFindingAcrossProviders(a, b) {
@@ -299,9 +302,13 @@ function sameFindingAcrossProviders(a, b) {
 // the sorted list of providers that raised it. A finding raised by >1 provider
 // is one entry tagged with all its corroborators (higher severity/confidence kept
 // as the representative); distinct findings are kept separate.
-export function mergeProviderResults(perProvider) {
+export function mergeProviderResults(perProvider, { failOn = "medium", minConfidence = 0.5 } = {}) {
   const results = perProvider.map((p) => p.result);
   const flagged = results.find((r) => r.verdict === "needs-attention");
+  // A finding "gates" under the active thresholds. The representative is chosen so
+  // a low-confidence (likely hallucinated) finding can never mask a well-grounded
+  // one: prefer a gating finding, then higher severity, then higher confidence.
+  const gates = (f) => SEVERITY_RANK[f.severity] >= SEVERITY_RANK[failOn] && f.confidence >= minConfidence;
   const groups = [];
   for (const { provider, result } of perProvider) {
     for (const f of result.findings) {
@@ -311,8 +318,10 @@ export function mergeProviderResults(perProvider) {
       } else {
         g.providers.add(provider);
         const better =
-          SEVERITY_RANK[f.severity] > SEVERITY_RANK[g.rep.severity] ||
-          (f.severity === g.rep.severity && f.confidence > g.rep.confidence);
+          (gates(f) && !gates(g.rep)) ||
+          (gates(f) === gates(g.rep) &&
+            (SEVERITY_RANK[f.severity] > SEVERITY_RANK[g.rep.severity] ||
+              (f.severity === g.rep.severity && f.confidence > g.rep.confidence)));
         if (better) g.rep = { ...f };
       }
     }

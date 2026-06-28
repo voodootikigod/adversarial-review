@@ -92,7 +92,10 @@ async function runMultiProvider(args, context, prompt) {
     const cfg = byId.get(pp.provider);
     pp.assessments = assessFindings(pp.result, context, { apiMode: cfg.provider !== "cli" });
   }
-  const merged = mergeProviderResults(perProvider);
+  const merged = mergeProviderResults(perProvider, {
+    failOn: args.failOn,
+    minConfidence: args.minConfidence
+  });
   // Parity with the --passes merge path: never emit a cross-provider result that
   // doesn't satisfy the schema (a CI --json consumer must be able to trust it).
   const mergeErrors = validateResult(merged);
@@ -117,6 +120,13 @@ async function runMultiProvider(args, context, prompt) {
   // any participating provider was an API, which applies the stricter check).
   const mergedAssessments = assessFindings(merged, context, {
     apiMode: providers.some((p) => p.config.provider !== "cli")
+  });
+  // Log warnings to stderr (as the single-provider path does) so they are visible
+  // even with --json, where the rendered report is not printed.
+  mergedAssessments.forEach((a, i) => {
+    for (const note of a.notes) {
+      log.warn(`Finding "${merged.findings[i].title}": ${note} — confidence halved for gating.`);
+    }
   });
 
   if (args.json) {

@@ -194,6 +194,24 @@ test("AC5: mergeProviderResults dedups shared finding + tags corroborators, keep
   assert.deepEqual(validateResult(merged), []);
 });
 
+test("#6: representative selection never lets a low-confidence finding mask a gating one", () => {
+  const loc = { category: "concurrency", file: "src/x.js", line_start: 5, line_end: 8, title: "Race condition on shared cache" };
+  const wellGrounded = validResult({ findings: [validFinding({ ...loc, severity: "medium", confidence: 0.9 })] });
+  const flashy = validResult({ findings: [validFinding({ ...loc, severity: "critical", confidence: 0.1 })] });
+
+  // Try both orderings — the representative must be the gating medium/0.9 either way.
+  for (const order of [[wellGrounded, flashy], [flashy, wellGrounded]]) {
+    const merged = mergeProviderResults(
+      [{ provider: "gpt", result: order[0] }, { provider: "gemini", result: order[1] }],
+      { failOn: "medium", minConfidence: 0.5 }
+    );
+    assert.equal(merged.findings.length, 1);
+    assert.equal(merged.findings[0].severity, "medium");
+    assert.equal(merged.findings[0].confidence, 0.9);
+    assert.deepEqual([...merged.findings[0].corroborated_by].sort(), ["gemini", "gpt"]);
+  }
+});
+
 test("AC11: distinct root causes at the same (file,category,range) are preserved, not collapsed", () => {
   const loc = { category: "security", file: "src/auth.js", line_start: 20, line_end: 25 };
   const gptResult = validResult({

@@ -424,6 +424,10 @@ export function configureLLM(args) {
 // ─── Multi-provider selection (--providers) ─────────────────────────────────
 
 // Family token → provider family. Diversity is keyed on FAMILY, not provider id.
+// `cursor` is intentionally NOT a multi-provider family: it is a local proxy that
+// forwards to the same frontier models (OpenAI/Anthropic), so it adds no INDEPENDENT
+// family diversity — the whole point of this mode. It remains available for
+// single-provider review via --provider cursor.
 const TOKEN_FAMILY = {
   gpt: "openai", openai: "openai", codex: "openai",
   claude: "anthropic", anthropic: "anthropic",

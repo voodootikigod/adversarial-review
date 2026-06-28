@@ -105,6 +105,18 @@ test("CLI #6: an API provider on a non-inlinable diff is dropped, CLI provider p
   assert.equal(r.status, 2, "claude (CLI) still reviews and flags → exit 2");
 });
 
+test("CLI #5: grounding warnings reach stderr even with --json", () => {
+  // A finding quoting evidence that does not appear in the diff must be flagged
+  // ungrounded on stderr even though --json suppresses the rendered report.
+  const UNGROUNDED = '{"verdict":"needs-attention","summary":"s","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[{"severity":"high","category":"security","title":"t","body":"b","exploit_scenario":"e","evidence":"this-string-is-not-in-the-diff-xyz","file":"code.js","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}],"next_steps":["n"]}';
+  const r = runCli(["--providers", "claude", "--json", "--scope", "working-tree", "--allow-secrets"], {
+    mocks: { claude: UNGROUNDED }
+  });
+  assert.match(r.stderr, /quoted evidence was not found/i, "ungrounded warning must reach stderr under --json");
+  // stdout stays pure JSON.
+  assert.doesNotThrow(() => JSON.parse(r.stdout));
+});
+
 test("CLI #6: all-API selection on a non-inlinable diff exits 1 (nothing usable)", () => {
   const r = runCli(
     ["--providers", "gemini", "--scope", "working-tree", "--allow-secrets", "--max-bytes", "1"],
