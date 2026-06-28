@@ -5,3 +5,5 @@ blog/
 *.tmp
 .env
 .env.*
+.adlc/*
+!.adlc/tickets.json
