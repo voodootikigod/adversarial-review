@@ -57,7 +57,7 @@ ${colors.bold("Loop mode (--loop):")}
   --loop                Review → fix → repeat until no gating findings remain.
                         Only works with --scope working-tree (not branch/auto-branch).
   --loop-max <n>        Max fix iterations (default 3). Runs N fixes + final review.
-  --loop-fixer <cmd>    Override fixer CLI (default: auto-detect codex→claude→gemini).
+  --loop-fixer <cmd>    Override fixer CLI (default: auto-detect codex→claude→agy).
   --loop-fixer-scope    sc2 (default): only finding-cited files. unrestricted: all repo files.
   --loop-fixer-file-cap Max files listed in unrestricted mode (default 100).
   --loop-unsafe         Required on macOS (no write sandbox). On Linux: skip probe error.
@@ -67,7 +67,7 @@ ${colors.bold("Loop mode (--loop):")}
 
 ${colors.bold("LLM selection (when not --prompt-only):")}
   Auto-detected in order: ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY,
-  then a local CLI agent (claude, codex, gemini). Override with --provider.
+  then a local CLI agent (claude, codex, agy). Override with --provider.
 
 ${colors.bold("Environment Variables:")}
   ANTHROPIC_API_KEY     Use the Anthropic API.

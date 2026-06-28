@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { cleanJsonResponse, configureLLM } from "../src/llm.js";
+import { cleanJsonResponse, configureLLM, cliFallbackArgs } from "../src/llm.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
   const input = '{"verdict": "approve", "summary": "good"}';
@@ -180,6 +180,96 @@ test("configureLLM prioritizes non-Anthropic critic in Claude Code if key is pre
     assert.equal(config.apiKey, "mock-gemini-key");
   } finally {
     process.env = oldEnv;
+  }
+});
+
+test("configureLLM auto-detects agy CLI when only agy is installed and no API keys", () => {
+  const oldEnv = { ...process.env };
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  // Builder is Claude; the critic should be the agy (Gemini-family) CLI.
+  process.env.CLAUDE_CODE = "1";
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adversarial-agy-"));
+  const binName = process.platform === "win32" ? "agy.cmd" : "agy";
+  const binPath = path.join(tempDir, binName);
+  fs.writeFileSync(binPath, "#!/bin/sh\necho mock");
+  if (process.platform !== "win32") {
+    fs.chmodSync(binPath, 0o755);
+  }
+  process.env.PATH = tempDir; // Isolate PATH so only the mock agy is available
+
+  try {
+    const config = configureLLM({});
+    assert.equal(config.provider, "cli");
+    assert.equal(config.cliCmd, "agy");
+  } finally {
+    process.env = oldEnv;
+    try {
+      fs.unlinkSync(binPath);
+      fs.rmdirSync(tempDir);
+    } catch {}
+  }
+});
+
+test("cliFallbackArgs uses -p print mode for agy (Claude-Code-compatible CLI)", () => {
+  // agy mirrors claude: both need -p when the prompt is passed as an argument.
+  assert.deepEqual(cliFallbackArgs("agy", "PROMPT-BODY"), ["-p", "PROMPT-BODY"]);
+  assert.deepEqual(cliFallbackArgs("claude", "PROMPT-BODY"), ["-p", "PROMPT-BODY"]);
+  // Truly-unknown custom CLIs still get the bare prompt argument.
+  assert.deepEqual(cliFallbackArgs("somecli", "PROMPT-BODY"), ["PROMPT-BODY"]);
+});
+
+test("agy CLI review path invokes -p print mode and delivers the prompt via stdin", async () => {
+  const { llmCall } = await import("../src/llm.js");
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-"));
+  const binName = process.platform === "win32" ? "agy.cmd" : "agy";
+  const binPath = path.join(tmpDir, binName);
+  const sentinelSystem = "be adversarial sentinel";
+  const sentinelPrompt = "review this sentinel";
+  const expectedResponse = '{"verdict":"approve","summary":"ok"}';
+
+  // Mock agy binary enforcing the print-mode contract:
+  //   1. `-p` (print/non-interactive) must be present — bare agy would hang.
+  //   2. `-` must be present as the stdin sentinel.
+  //   3. Stdin must carry both the system instruction and the user prompt.
+  // Exits non-zero on any violation so the test fails if the contract breaks.
+  fs.writeFileSync(
+    binPath,
+    `#!/bin/sh
+has_print=false
+read_stdin=false
+for arg in "$@"; do
+  if [ "$arg" = "-p" ] || [ "$arg" = "--print" ]; then has_print=true; fi
+  if [ "$arg" = "-" ]; then read_stdin=true; fi
+done
+if [ "$has_print" = "false" ]; then
+  echo "FAIL: -p/--print not passed (would hang interactively)" >&2; exit 1
+fi
+if [ "$read_stdin" = "false" ]; then
+  echo "FAIL: stdin indicator (-) not passed" >&2; exit 1
+fi
+stdin_content=$(cat)
+echo "$stdin_content" | grep -q "${sentinelSystem}" || { echo "FAIL: system instruction missing from stdin" >&2; exit 1; }
+echo "$stdin_content" | grep -q "${sentinelPrompt}" || { echo "FAIL: prompt content missing from stdin" >&2; exit 1; }
+printf '%s' '${expectedResponse}'
+`
+  );
+  fs.chmodSync(binPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+
+  try {
+    const config = { provider: "cli", cliCmd: "agy", timeoutMs: 10000 };
+    const result = await llmCall(config, sentinelPrompt, sentinelSystem);
+    assert.equal(result, expectedResponse, "should return agy's stdout from print mode");
+  } finally {
+    process.env.PATH = oldPath;
+    try { fs.unlinkSync(binPath); } catch {}
+    try { fs.rmdirSync(tmpDir); } catch {}
   }
 });
 
