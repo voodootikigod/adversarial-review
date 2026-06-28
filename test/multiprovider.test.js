@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { selectProviders, underSatisfiedNotice, resolveProviderToken } from "../src/llm.js";
+import { selectProviders, underSatisfiedNotice, resolveProviderToken, builderFamily } from "../src/llm.js";
 import { runMultiProviderReview } from "../src/review.js";
 
 function approveResult() {
@@ -81,6 +81,22 @@ test("AC8: --providers auto selects >=2 distinct families, excluding the builder
     assert.ok(!fams.has("anthropic"), "must exclude the builder's family (anthropic)");
     assert.equal(sel.underSatisfied, false, "auto with >=2 families is satisfied");
   });
+});
+
+test("builderFamily detects Antigravity (Gemini) from either env var alone", () => {
+  const oldEnv = { ...process.env };
+  for (const key of ["CLAUDECODE", "CLAUDE_CODE", "TERM_PROGRAM", "ANTIGRAVITY_AGENT", "ANTIGRAVITY_CONVERSATION_ID"]) {
+    delete process.env[key];
+  }
+  try {
+    process.env.ANTIGRAVITY_AGENT = "1";
+    assert.equal(builderFamily(), "gemini", "ANTIGRAVITY_AGENT alone → gemini");
+    delete process.env.ANTIGRAVITY_AGENT;
+    process.env.ANTIGRAVITY_CONVERSATION_ID = "abc";
+    assert.equal(builderFamily(), "gemini", "ANTIGRAVITY_CONVERSATION_ID alone → gemini");
+  } finally {
+    process.env = oldEnv;
+  }
 });
 
 test("AC8: --providers auto excludes the builder family in Cursor too", () => {

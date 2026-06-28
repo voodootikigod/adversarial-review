@@ -8,6 +8,7 @@ import {
   buildPrompt,
   runReview,
   runMultiProviderReview,
+  apiProvidersCannotReview,
   mergeProviderResults,
   deriveQuorumVerdict,
   validateResult,
@@ -43,7 +44,7 @@ async function runMultiProvider(args, context, prompt) {
   // providers — preserving the reviewer diversity that is actually reachable
   // (AC7 warn + proceed). Only abort if nothing usable remains.
   let providers = sel.providers;
-  if (!context.includeDiff && !args.allowSummaryReview) {
+  if (apiProvidersCannotReview(context, args)) {
     const kept = [];
     const dropped = [];
     for (const p of providers) {

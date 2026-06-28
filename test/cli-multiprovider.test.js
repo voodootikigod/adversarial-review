@@ -151,6 +151,13 @@ test("CLI #5: grounding warnings reach stderr even with --json", () => {
   assert.doesNotThrow(() => JSON.parse(r.stdout));
 });
 
+test("CLI: no requested provider reachable exits 1 (operational error, not a verdict)", () => {
+  // gemini requested, but no GEMINI_API_KEY and no agy on PATH → nothing reachable.
+  const r = runCli(["--providers", "gemini", "--scope", "working-tree", "--allow-secrets"], { mocks: {} });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /None of the requested providers are reachable/);
+});
+
 test("CLI #6: all-API selection on a non-inlinable diff exits 1 (nothing usable)", () => {
   const r = runCli(
     ["--providers", "gemini", "--scope", "working-tree", "--allow-secrets", "--max-bytes", "1"],

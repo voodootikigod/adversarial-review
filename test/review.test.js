@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateResult, assessFindings, deriveVerdict, mergeProviderResults, deriveQuorumVerdict, renderReport } from "../src/review.js";
+import { validateResult, assessFindings, deriveVerdict, mergeProviderResults, deriveQuorumVerdict, renderReport, apiProvidersCannotReview } from "../src/review.js";
 
 function validFinding(overrides = {}) {
   return {
@@ -192,6 +192,15 @@ test("AC5: mergeProviderResults dedups shared finding + tags corroborators, keep
   assert.deepEqual(gemUnique.corroborated_by, ["gemini"]);
   // Merged result is schema-valid (corroborated_by is an accepted optional field).
   assert.deepEqual(validateResult(merged), []);
+});
+
+test("apiProvidersCannotReview only blocks API providers on a non-inlinable, non-summary diff", () => {
+  // An inlinable diff must NOT trigger the drop/downgrade path (the default case).
+  assert.equal(apiProvidersCannotReview({ includeDiff: true }, { allowSummaryReview: false }), false);
+  // Non-inlinable + no opt-in → API providers cannot review.
+  assert.equal(apiProvidersCannotReview({ includeDiff: false }, { allowSummaryReview: false }), true);
+  // Non-inlinable but the user accepted summary-only → allowed.
+  assert.equal(apiProvidersCannotReview({ includeDiff: false }, { allowSummaryReview: true }), false);
 });
 
 test("#6: representative selection never lets a low-confidence finding mask a gating one", () => {

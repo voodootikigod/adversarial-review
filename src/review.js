@@ -410,6 +410,13 @@ export async function runReview(config, prompt, { passes = 1 } = {}) {
 // `runReview` (so it composes with --passes: each provider samples `passes`
 // times internally). `reviewFn` is injectable for testing. Returns
 // [{ provider, result }] for the cross-provider merge + quorum verdict.
+// True when selected API providers cannot review: the diff was too large to inline
+// AND the user did not opt into summary-only review. (CLI providers can always
+// inspect the repo, so this only constrains API providers.)
+export function apiProvidersCannotReview(context, args) {
+  return !context.includeDiff && !args.allowSummaryReview;
+}
+
 export async function runMultiProviderReview(providers, prompt, { passes = 1 } = {}, reviewFn = runReview) {
   const perProvider = [];
   const failures = [];
