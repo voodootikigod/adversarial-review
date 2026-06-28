@@ -370,6 +370,13 @@ export function deriveQuorumVerdict(perProvider, { failOn = "medium", minConfide
   // requested quorum higher than the reachable provider count would be
   // mathematically unsatisfiable, silently producing a false "approve" (an
   // unreachable provider must never disable the gate — fail safe, not open).
+  //
+  // This is a deliberate tension: capping means a lone reachable provider's flag
+  // still gates (R6 "proceed + exit by result"), rather than being ignored because
+  // the requested quorum can't be met (which would be the dangerous fail-OPEN).
+  // We favour not ignoring a real finding. An opt-in strict mode (honour the raw
+  // quorum and approve when unmet) could be a future flag, but the safe default is
+  // to let the available evidence gate.
   const effectiveQuorum = Math.max(1, Math.min(quorum, perProviderVerdicts.length));
   return {
     verdict: flaggingCount >= effectiveQuorum ? "needs-attention" : "approve",
