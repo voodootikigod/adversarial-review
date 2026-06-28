@@ -1,6 +1,6 @@
 {
   "name": "adversarial-review",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Adversarial, ship/no-ship code review of a git diff or branch — runs against any LLM (API or local CLI agent) and returns structured findings",
   "type": "module",
   "scripts": {
