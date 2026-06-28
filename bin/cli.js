@@ -38,10 +38,6 @@ async function runMultiProvider(args, context, prompt) {
     process.exit(1);
   }
 
-  // R6: warn + proceed when under-satisfied; never silently downgrade the verdict.
-  const notice = underSatisfiedNotice(sel);
-  if (notice) log.warn(notice);
-
   // API providers cannot inspect a non-inlinable diff. Rather than aborting the
   // whole diverse review, DROP those providers (loudly) and proceed with the CLI
   // providers — preserving the reviewer diversity that is actually reachable
@@ -69,22 +65,44 @@ async function runMultiProvider(args, context, prompt) {
   log.info(`Multi-provider review: ${providers.map((p) => `${p.id}[${p.family}]`).join(", ")} (quorum ${args.quorum})`);
 
   const byId = new Map(providers.map((p) => [p.id, p.config]));
-  let perProvider;
+  let perProvider, failures;
   try {
-    perProvider = await runMultiProviderReview(providers, prompt, { passes: args.passes });
-    if (args.verify) {
-      for (const pp of perProvider) {
-        if (pp.result.findings.length) {
-          log.step(`Verification pass (${pp.provider}): refuting ${pp.result.findings.length} finding(s)...`);
-          const verified = await verifyFindings(byId.get(pp.provider), context, pp.result);
-          pp.result = verified.result;
-        }
-      }
-    }
+    ({ perProvider, failures } = await runMultiProviderReview(providers, prompt, { passes: args.passes }));
   } catch (err) {
     log.error(err.message);
     process.exit(1);
   }
+  // Degrade-and-proceed: a single provider's failure must not abort the run.
+  for (const f of failures) {
+    log.warn(`Provider ${f.provider} failed and was skipped: ${f.error}`);
+  }
+  if (!perProvider.length) {
+    log.error("All selected providers failed to produce a review; cannot derive a verdict.");
+    process.exit(1);
+  }
+  if (args.verify) {
+    for (const pp of perProvider) {
+      if (pp.result.findings.length) {
+        log.step(`Verification pass (${pp.provider}): refuting ${pp.result.findings.length} finding(s)...`);
+        try {
+          const verified = await verifyFindings(byId.get(pp.provider), context, pp.result);
+          pp.result = verified.result;
+        } catch (err) {
+          log.warn(`Verification for ${pp.provider} failed; keeping unverified findings: ${err.message}`);
+        }
+      }
+    }
+  }
+
+  // R6 / AC7: emit a loud under-satisfied notice based on the EFFECTIVE provider
+  // set (after reachability, API-drop, and runtime failures) vs the requested
+  // diversity — so reduced diversity is never hidden, whatever caused it.
+  const effectiveNotice = underSatisfiedNotice({
+    underSatisfied: perProvider.length < sel.requestedCount,
+    reachableCount: perProvider.length,
+    requestedCount: sel.requestedCount
+  });
+  if (effectiveNotice) log.warn(effectiveNotice);
 
   // Ground each provider's findings, then derive the quorum verdict from the
   // per-provider grounded confidences.
@@ -121,11 +139,13 @@ async function runMultiProvider(args, context, prompt) {
   const mergedAssessments = assessFindings(merged, context, {
     apiMode: providers.some((p) => p.config.provider !== "cli")
   });
-  // Log warnings to stderr (as the single-provider path does) so they are visible
-  // even with --json, where the rendered report is not printed.
+  // Log grounding warnings to stderr (as the single-provider path does) so they
+  // are visible even with --json. The quorum verdict already gated on each
+  // provider's OWN assessment, so this merged note is informational — do not
+  // claim it changed the gate (that would contradict the per-provider gating).
   mergedAssessments.forEach((a, i) => {
     for (const note of a.notes) {
-      log.warn(`Finding "${merged.findings[i].title}": ${note} — confidence halved for gating.`);
+      log.warn(`Finding "${merged.findings[i].title}": ${note} (grounding note — verify before relying on it).`);
     }
   });
 

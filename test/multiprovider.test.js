@@ -47,12 +47,29 @@ test("AC4: runMultiProviderReview invokes each provider once with the same promp
     { id: "gpt", family: "openai", config: { id: "gpt", provider: "cli", cliCmd: "codex" } },
     { id: "gemini", family: "gemini", config: { id: "gemini", provider: "cli", cliCmd: "agy" } }
   ];
-  const per = await runMultiProviderReview(providers, "THE PROMPT", { passes: 1 }, stubReview);
+  const { perProvider, failures } = await runMultiProviderReview(providers, "THE PROMPT", { passes: 1 }, stubReview);
 
   assert.equal(calls.length, 2, "each provider invoked exactly once");
   assert.deepEqual(calls.map((c) => c.id).sort(), ["gemini", "gpt"]);
   assert.deepEqual(calls.map((c) => c.prompt), ["THE PROMPT", "THE PROMPT"], "same prompt to each");
-  assert.deepEqual(per.map((p) => p.provider).sort(), ["gemini", "gpt"]);
+  assert.deepEqual(perProvider.map((p) => p.provider).sort(), ["gemini", "gpt"]);
+  assert.equal(failures.length, 0);
+});
+
+test("#1: a single provider failure is recorded and the rest proceed (degrade-and-proceed)", async () => {
+  const stubReview = async (config) => {
+    if (config.id === "gpt") throw new Error("transient 500");
+    return approveResult();
+  };
+  const providers = [
+    { id: "gpt", family: "openai", config: { id: "gpt", provider: "cli", cliCmd: "codex" } },
+    { id: "gemini", family: "gemini", config: { id: "gemini", provider: "cli", cliCmd: "agy" } }
+  ];
+  const { perProvider, failures } = await runMultiProviderReview(providers, "P", { passes: 1 }, stubReview);
+  assert.deepEqual(perProvider.map((p) => p.provider), ["gemini"], "surviving provider proceeds");
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].provider, "gpt");
+  assert.match(failures[0].error, /transient 500/);
 });
 
 test("AC8: --providers auto selects >=2 distinct families, excluding the builder's family", () => {

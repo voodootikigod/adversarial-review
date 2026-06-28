@@ -392,12 +392,19 @@ export async function runReview(config, prompt, { passes = 1 } = {}) {
 // [{ provider, result }] for the cross-provider merge + quorum verdict.
 export async function runMultiProviderReview(providers, prompt, { passes = 1 } = {}, reviewFn = runReview) {
   const perProvider = [];
+  const failures = [];
   for (const p of providers) {
     log.step(`Provider ${p.id}...`);
-    const result = await reviewFn(p.config, prompt, { passes });
-    perProvider.push({ provider: p.id, result });
+    // Tolerate a single provider failing (transient API error, bad config): record
+    // it and proceed with the rest, rather than aborting the whole diverse review.
+    try {
+      const result = await reviewFn(p.config, prompt, { passes });
+      perProvider.push({ provider: p.id, result });
+    } catch (err) {
+      failures.push({ provider: p.id, error: err?.message || String(err) });
+    }
   }
-  return perProvider;
+  return { perProvider, failures };
 }
 
 const VERIFY_SCHEMA = {
