@@ -97,10 +97,14 @@ async function runMultiProvider(args, context, prompt) {
   // R6 / AC7: emit a loud under-satisfied notice based on the EFFECTIVE provider
   // set (after reachability, API-drop, and runtime failures) vs the requested
   // diversity — so reduced diversity is never hidden, whatever caused it.
+  // auto's contract is ">=2 distinct families"; explicit mode wants every
+  // requested family. Use the matching denominator so a satisfied auto run (2
+  // families) doesn't emit a spurious notice.
+  const target = sel.auto ? 2 : sel.requestedCount;
   const effectiveNotice = underSatisfiedNotice({
-    underSatisfied: perProvider.length < sel.requestedCount,
+    underSatisfied: perProvider.length < target,
     reachableCount: perProvider.length,
-    requestedCount: sel.requestedCount
+    requestedCount: target
   });
   if (effectiveNotice) log.warn(effectiveNotice);
 

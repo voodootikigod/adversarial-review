@@ -434,6 +434,12 @@ const TOKEN_FAMILY = {
   gemini: "gemini", agy: "gemini"
 };
 
+// Tokens that are the NAME of a local CLI binary. Naming one is an explicit request
+// for that on-host CLI, so it resolves CLI-only and is NEVER silently upgraded to
+// the family's API (which would send the diff off-host despite the user's intent).
+// Their family label is still used for diversity grouping.
+const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy"]);
+
 // Ordered concrete candidates per family: prefer the API (key present) over the
 // local CLI, mirroring the single-provider auto-detection bias.
 const FAMILY_CANDIDATES = {
@@ -466,6 +472,11 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
     family,
     config: { ...configureLLM({ ...args, provider, providers: undefined, apiKey }), id }
   });
+
+  // Explicit local-CLI token: resolve to that CLI only, never the family API.
+  if (CLI_ONLY_TOKENS.has(id)) {
+    return isCmdInstalled(id) ? build(id) : { id, family, config: null };
+  }
 
   if (family) {
     for (const cand of FAMILY_CANDIDATES[family]) {

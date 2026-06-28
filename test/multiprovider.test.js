@@ -79,6 +79,7 @@ test("AC8: --providers auto selects >=2 distinct families, excluding the builder
     const fams = new Set(sel.providers.map((p) => p.family));
     assert.ok(fams.size >= 2, `expected >=2 distinct families, got ${[...fams]}`);
     assert.ok(!fams.has("anthropic"), "must exclude the builder's family (anthropic)");
+    assert.equal(sel.underSatisfied, false, "auto with >=2 families is satisfied");
   });
 });
 
@@ -115,6 +116,24 @@ test("explicit --providers resolves family tokens to concrete providers (API key
     assert.equal(sel.providers[0].family, "gemini");
     assert.equal(sel.providers[0].config.provider, "gemini", "API key present → API provider, not CLI");
     assert.equal(sel.underSatisfied, false);
+  });
+});
+
+test("#1(r6): a CLI-name token (codex) resolves to the local CLI, never the family API", () => {
+  // OPENAI_API_KEY is set, but naming the local `codex` binary must NOT exfiltrate
+  // the diff to the OpenAI API — it resolves to the on-host CLI.
+  withMockBins(["codex"], { OPENAI_API_KEY: "sk-present" }, () => {
+    const sel = selectProviders({ providers: ["codex"] });
+    assert.equal(sel.providers.length, 1);
+    assert.equal(sel.providers[0].config.provider, "cli", "codex must resolve to the local CLI");
+    assert.equal(sel.providers[0].config.cliCmd, "codex");
+  });
+});
+
+test("#1(r6): a CLI-name token is unreachable (not API) when its binary is absent", () => {
+  withMockBins([], { OPENAI_API_KEY: "sk-present" }, () => {
+    const sel = selectProviders({ providers: ["codex"] });
+    assert.equal(sel.providers.length, 0, "no codex binary → unreachable, must not fall back to OpenAI API");
   });
 });
 
