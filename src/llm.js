@@ -449,13 +449,14 @@ export function builderFamily() {
 // Resolve a single --providers token to a concrete, REACHABLE provider config.
 // Returns { id, family, config } with config=null when nothing in the family is
 // reachable (no API key and no installed CLI).
-export function resolveProviderToken(token, args = {}) {
+export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = false } = {}) {
   const id = String(token).toLowerCase();
   const family = TOKEN_FAMILY[id] || null;
-  // Each family resolves with its OWN credentials. A generic --api-key / LLM_API_KEY
-  // is NOT proof that a given family's API is reachable (an OpenAI key cannot auth
-  // Gemini), so it must never force API mode or skip a working CLI fallback. We pass
-  // the matched family key explicitly and suppress the generic override.
+  // Each family resolves with its OWN credentials. A *generic* LLM_API_KEY is NOT
+  // proof that a given family's API is reachable (an OpenAI key cannot auth Gemini),
+  // so it never forces API mode. An *explicit* --api-key (args.apiKey) IS honored —
+  // but only when a single family is requested (allowApiKeyFallback), so it can't be
+  // blindly applied across families. Family-specific env keys always win.
   const build = (provider, apiKey = null) => ({
     id,
     family,
@@ -466,7 +467,8 @@ export function resolveProviderToken(token, args = {}) {
     for (const cand of FAMILY_CANDIDATES[family]) {
       if (cand.kind === "api") {
         const matched = cand.envKeys.find((e) => process.env[e]);
-        if (matched) return build(cand.provider, process.env[matched]);
+        const key = matched ? process.env[matched] : (allowApiKeyFallback && args.apiKey ? args.apiKey : null);
+        if (key) return build(cand.provider, key);
       }
       if (cand.kind === "cli" && isCmdInstalled(cand.cliCmd)) {
         return build(cand.cliCmd);
@@ -499,7 +501,9 @@ export function selectProviders(args = {}) {
   const familyKey = (t) => TOKEN_FAMILY[String(t).toLowerCase()] || String(t).toLowerCase();
   const requestedFamilies = new Set(tokens.map(familyKey));
 
-  const resolved = tokens.map((t) => resolveProviderToken(t, args));
+  // An explicit --api-key is unambiguous only when a single family is requested.
+  const allowApiKeyFallback = requestedFamilies.size === 1;
+  const resolved = tokens.map((t) => resolveProviderToken(t, args, { allowApiKeyFallback }));
   const seen = new Set();
   const providers = [];
   for (const r of resolved) {

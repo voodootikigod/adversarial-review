@@ -119,6 +119,25 @@ test("#3/#5: a family with neither its own key nor a CLI is unreachable despite 
   });
 });
 
+test("explicit --api-key is honored for a single requested family (single-provider parity)", () => {
+  // No env key, no CLI, but an explicit --api-key for the one requested family.
+  withMockBins([], {}, () => {
+    const sel = selectProviders({ providers: ["openai"], apiKey: "sk-explicit" });
+    assert.equal(sel.providers.length, 1);
+    assert.equal(sel.providers[0].config.provider, "openai", "explicit --api-key selects the API");
+    assert.equal(sel.providers[0].config.apiKey, "sk-explicit");
+  });
+});
+
+test("explicit --api-key is NOT applied across multiple requested families", () => {
+  // Two families, one --api-key: it must not be blindly used for both.
+  withMockBins([], {}, () => {
+    const sel = selectProviders({ providers: ["openai", "gemini"], apiKey: "sk-explicit" });
+    assert.equal(sel.providers.length, 0, "ambiguous --api-key must not fake reachability for either family");
+    assert.equal(sel.underSatisfied, true);
+  });
+});
+
 test("#7: synonym tokens for one family are deduped (no quorum inflation)", () => {
   withMockBins(["codex"], {}, () => {
     const sel = selectProviders({ providers: ["gpt", "openai"] });

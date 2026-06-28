@@ -283,7 +283,10 @@ function titleSimilar(a, b) {
   let inter = 0;
   for (const t of A) if (B.has(t)) inter++;
   const union = A.size + B.size - inter;
-  return inter / union >= 0.5;
+  // High bar (0.7): only near-identical titles collapse, so two genuinely
+  // distinct bugs at the same location with merely overlapping wording stay
+  // separate. Losing a real finding is worse than a duplicate.
+  return inter / union >= 0.7;
 }
 
 function sameFindingAcrossProviders(a, b) {

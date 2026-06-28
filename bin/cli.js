@@ -10,6 +10,7 @@ import {
   runMultiProviderReview,
   mergeProviderResults,
   deriveQuorumVerdict,
+  validateResult,
   verifyFindings,
   assessFindings,
   deriveVerdict,
@@ -92,6 +93,13 @@ async function runMultiProvider(args, context, prompt) {
     pp.assessments = assessFindings(pp.result, context, { apiMode: cfg.provider !== "cli" });
   }
   const merged = mergeProviderResults(perProvider);
+  // Parity with the --passes merge path: never emit a cross-provider result that
+  // doesn't satisfy the schema (a CI --json consumer must be able to trust it).
+  const mergeErrors = validateResult(merged);
+  if (mergeErrors.length) {
+    log.error("Merged multi-provider result failed schema validation:\n  - " + mergeErrors.join("\n  - "));
+    process.exit(1);
+  }
   const derived = deriveQuorumVerdict(perProvider, {
     failOn: args.failOn,
     minConfidence: args.minConfidence,
