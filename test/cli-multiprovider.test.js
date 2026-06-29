@@ -208,6 +208,26 @@ test("ledger: records the MERGED findings (shared corroborated once + each uniqu
   }
 });
 
+test("ledger: default single-provider path records grounded gating findings only", () => {
+  // No --providers → the single-provider path (auto-detects the mock claude). The
+  // finding is ungrounded (evidence absent from the diff) so its grounded
+  // confidence falls below the floor → it must NOT gate and must NOT be recorded.
+  // Pins that real `assessments` reach the default-path ledger write (kills the
+  // `recordFindings(args, result, null)` survivor).
+  const UNGROUNDED = '{"verdict":"needs-attention","summary":"s","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[{"severity":"high","category":"security","title":"Ungrounded high","body":"b","exploit_scenario":"e","evidence":"this-evidence-is-absent-from-the-diff-zzz","file":"code.js","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}],"next_steps":["n"]}';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-default-"));
+  const ledger = path.join(dir, "f.jsonl");
+  try {
+    const r = runCli(["--findings-ledger", ledger, "--scope", "working-tree", "--allow-secrets"], {
+      mocks: { claude: UNGROUNDED }
+    });
+    assert.equal(r.status, 0, "ungrounded finding is below the grounded floor → approve/exit 0");
+    assert.equal(fs.existsSync(ledger), false, "ungrounded finding must not be recorded (ledger set == gate set)");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("ledger AC4: --findings-ledger appends gating findings as JSONL across runs", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-"));
   const ledger = path.join(dir, "findings.jsonl");
