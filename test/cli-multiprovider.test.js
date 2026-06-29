@@ -181,6 +181,27 @@ test("ledger AC3: without --findings-ledger, no .adlc/ is created and no ledger 
   assert.doesNotMatch(r.stderr, /findings ledger/i, "no ledger warning when the flag is absent");
 });
 
+test("ledger: multi-provider does NOT record an ungrounded corroborated finding (negative grounding)", () => {
+  // Both providers report the SAME finding whose evidence is absent from the diff.
+  // It merges (corroborated) but is ungrounded → mergedAssessments halve its
+  // confidence below the floor → it must NOT be recorded. Pins that the MERGED
+  // grounding assessments reach the multi-provider ledger write (kills
+  // recordFindings(args, merged, null)).
+  const UNGROUNDED = '{"verdict":"needs-attention","summary":"s","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[{"severity":"high","category":"security","title":"Ungrounded shared","body":"b","exploit_scenario":"e","evidence":"this-evidence-is-absent-from-the-diff-zzz","file":"code.js","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}],"next_steps":["n"]}';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-mp-neg-"));
+  const ledger = path.join(dir, "f.jsonl");
+  try {
+    const r = runCli(
+      ["--providers", "claude,gemini", "--scope", "working-tree", "--allow-secrets", "--findings-ledger", ledger],
+      { mocks: { claude: UNGROUNDED, agy: UNGROUNDED } }
+    );
+    assert.equal(r.status, 0, "both providers' finding is ungrounded → neither gates → approve");
+    assert.equal(fs.existsSync(ledger), false, "ungrounded merged finding must not be recorded (mergedAssessments reach the ledger)");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("ledger: records the MERGED findings (shared corroborated once + each unique), R2", () => {
   // claude: shared + onlyA ; agy: shared + onlyB. Merged = 3 distinct gating
   // findings → 3 ledger lines. This distinguishes "merged" from BOTH "per-provider
