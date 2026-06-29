@@ -1,51 +1,84 @@
 name: Publish to npm
 
+# Publish is triggered ONLY by pushing a v* tag. `workflow_dispatch` and the
+# `release` event are intentionally NOT used: a manual dispatch runs the workflow
+# file from the selected ref, so a contributor could dispatch a branch whose
+# publish.yml drops the environment gate and publishes ungated. Tag creation is
+# restricted to admins by the `release tags` ruleset (docs/github-rulesets/), so
+# the only code that can trigger a publish is an admin-controlled tagged commit.
 on:
   push:
     tags:
       - 'v*'
-  release:
-    types: [published]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (e.g. 1.2.0, without v prefix)"
-        required: true
-        type: string
 
 permissions:
   contents: read
-  id-token: write
+  id-token: write   # required for npm provenance + OIDC trusted publishing
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Gate the publish behind a protected environment with required reviewers and
+    # a v* deployment-tag policy (provisioned by docs/github-rulesets/apply.sh).
+    # The npm trusted-publisher config (npmjs.com > package > Settings > Trusted
+    # Publisher) must name this same environment, so an OIDC token is only minted
+    # for a run that passed the environment's approval + ref-allowlist gate.
+    environment: npm-publish
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0   # full history so the ancestry check below can run
+
+      - name: Verify tag is merged into main
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          # Refuse to publish a tag that points at a commit not reachable from
+          # main — i.e. code that never passed the protected-main PR/CI gates.
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::Tag commit $SHA is not an ancestor of origin/main — refusing to publish unmerged code."
+            exit 1
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: 18
+          node-version: 20
           registry-url: https://registry.npmjs.org
 
-      - name: Set version
+      - name: Upgrade npm for OIDC trusted publishing
+        # Node 20 ships npm 10.x, which cannot use OIDC trusted publishing.
+        # npm >= 11.5.1 is required to mint a registry token from the GitHub
+        # id-token (the `id-token: write` permission above). Without this the
+        # publish falls through to needing NODE_AUTH_TOKEN and fails ENEEDAUTH.
+        run: npm install -g npm@latest
+
+      - name: Resolve version
+        id: ver
         env:
-          INPUT_VERSION: ${{ inputs.version }}
-          TAG_NAME: ${{ github.event.release.tag_name }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ -n "$INPUT_VERSION" ]; then
-            VERSION="$INPUT_VERSION"
-          elif [ -n "$TAG_NAME" ]; then
-            VERSION="${TAG_NAME#v}"
-          else
-            VERSION="${REF_NAME#v}"
-          fi
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          # Only ever runs on a v* tag push (see trigger above).
+          echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync package.json version to the tag
+        run: npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Test
+        run: npm test
 
       - name: Publish
-        run: npm publish --provenance --access public
+        run: npm publish --access public
         env:
+          # Bootstrap fallback: until the npm trusted publisher is configured and
+          # verified, NPM_TOKEN (an ENVIRONMENT secret on `npm-publish`, NOT a repo
+          # secret) authenticates the publish. Once OIDC trusted publishing works,
+          # DELETE the secret — this var becomes empty and npm mints a short-lived
+          # token from the GitHub id-token instead, with no long-lived credential.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
