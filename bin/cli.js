@@ -4,6 +4,7 @@ import { parseArgs, log, HELP_TEXT } from "../src/utils.js";
 import { collectReviewContext } from "../src/git-context.js";
 import { configureLLM, selectProviders, underSatisfiedNotice, cliFallbackForFamily } from "../src/llm.js";
 import { scanForSecrets } from "../src/secrets.js";
+import { toLedgerEntries, appendLedger } from "../src/findings-ledger.js";
 import {
   buildPrompt,
   runReview,
@@ -174,12 +175,32 @@ async function runMultiProvider(args, context, prompt) {
     }
   });
 
+  // Record the MERGED gating findings once (a corroborated finding is one entry),
+  // using the merged grounding assessments. Ledger write failure is non-fatal.
+  recordFindings(args, merged, mergedAssessments);
+
   if (args.json) {
     process.stdout.write(JSON.stringify(merged, null, 2) + "\n");
   } else {
     console.log(renderReport(merged, context, mergedAssessments, derived));
   }
   process.exit(derived.verdict === "needs-attention" ? 2 : 0);
+}
+
+// Append gating findings to the ADLC findings ledger when --findings-ledger is
+// set. Never fatal: the verdict/exit code is the product, the ledger is a side
+// effect, so a write error only warns.
+function recordFindings(args, result, assessments) {
+  if (!args.findingsLedger) return;
+  try {
+    const entries = toLedgerEntries(result, assessments, {
+      failOn: args.failOn,
+      minConfidence: args.minConfidence
+    });
+    appendLedger(args.findingsLedger, entries);
+  } catch (err) {
+    log.warn(`Could not write findings ledger "${args.findingsLedger}": ${err.message}`);
+  }
 }
 
 async function main() {
@@ -325,6 +346,8 @@ async function main() {
   if (derived.verdict !== result.verdict) {
     log.warn(`Model verdict was "${result.verdict}"; the gate derived "${derived.verdict}" from the findings (--fail-on ${args.failOn}, --min-confidence ${args.minConfidence}).`);
   }
+
+  recordFindings(args, result, assessments);
 
   // 5. Emit output. --json stays schema-pure (the validated model result,
   // untouched); grounding and derivation details go to stderr.

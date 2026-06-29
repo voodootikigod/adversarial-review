@@ -90,12 +90,17 @@ export function assessFindings(result, context, { apiMode = true } = {}) {
 // Deterministic gate: the exit code is derived from the findings themselves,
 // not from the model's self-reported verdict. The model's verdict stays in the
 // report as advisory; any disagreement is surfaced.
+// The single gating predicate: a finding gates iff its severity is at/above the
+// threshold AND its grounding-adjusted confidence clears the floor. Shared by
+// deriveVerdict and the findings ledger so the recorded set can never drift from
+// what actually gated the exit code.
+export function isGatingFinding(finding, assessment, { failOn = "medium", minConfidence = 0.5 } = {}) {
+  const conf = assessment?.effectiveConfidence ?? finding.confidence;
+  return SEVERITY_RANK[finding.severity] >= SEVERITY_RANK[failOn] && conf >= minConfidence;
+}
+
 export function deriveVerdict(result, assessments, { failOn = "medium", minConfidence = 0.5 } = {}) {
-  const threshold = SEVERITY_RANK[failOn];
-  const gating = result.findings.filter((f, i) => {
-    const conf = assessments?.[i]?.effectiveConfidence ?? f.confidence;
-    return SEVERITY_RANK[f.severity] >= threshold && conf >= minConfidence;
-  });
+  const gating = result.findings.filter((f, i) => isGatingFinding(f, assessments?.[i], { failOn, minConfidence }));
   return {
     verdict: gating.length ? "needs-attention" : "approve",
     gatingCount: gating.length

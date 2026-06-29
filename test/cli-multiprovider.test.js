@@ -22,7 +22,7 @@ const FLAG = '{"verdict":"needs-attention","summary":"bad","coverage":{"files_ex
 // Run bin/cli.js against a throwaway git repo that has a real uncommitted change,
 // with PATH limited to a mock dir + node + system git (EXCLUDES ~/.local/bin, so
 // claude/agy are reachable only via the mocks we plant). Returns {status,stdout,stderr}.
-function runCli(args, { mocks = {}, env = {} } = {}) {
+function runCli(args, { mocks = {}, env = {}, afterRun } = {}) {
   const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cli-mocks-"));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cli-repo-"));
   try {
@@ -48,7 +48,9 @@ function runCli(args, { mocks = {}, env = {} } = {}) {
       encoding: "utf8",
       env: { HOME: process.env.HOME, PATH, ...env }
     });
-    return { status: r.status, stdout: r.stdout || "", stderr: r.stderr || "" };
+    const out = { status: r.status, stdout: r.stdout || "", stderr: r.stderr || "" };
+    if (afterRun) afterRun(repoDir, out);
+    return out;
   } finally {
     try { fs.rmSync(mocksDir, { recursive: true, force: true }); } catch {}
     try { fs.rmSync(repoDir, { recursive: true, force: true }); } catch {}
@@ -165,4 +167,52 @@ test("CLI #6: all-API selection on a non-inlinable diff exits 1 (nothing usable)
   );
   assert.equal(r.status, 1, r.stderr);
   assert.match(r.stderr, /No usable providers/);
+});
+
+// ─── findings-ledger integration (T3) ───────────────────────────────────────
+
+test("ledger AC3: without --findings-ledger, no .adlc/ or ledger file is created", () => {
+  let adlcExists = true;
+  runCli(["--providers", "claude", "--scope", "working-tree", "--allow-secrets"], {
+    mocks: { claude: FLAG },
+    afterRun: (repoDir) => { adlcExists = fs.existsSync(path.join(repoDir, ".adlc")); }
+  });
+  assert.equal(adlcExists, false, "no flag → must not create .adlc/");
+});
+
+test("ledger AC4: --findings-ledger appends gating findings as JSONL across runs", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-"));
+  const ledger = path.join(dir, "findings.jsonl");
+  try {
+    const a = ["--providers", "claude", "--scope", "working-tree", "--allow-secrets", "--findings-ledger", ledger];
+    runCli(a, { mocks: { claude: FLAG } });
+    runCli(a, { mocks: { claude: FLAG } });
+    const lines = fs.readFileSync(ledger, "utf8").trim().split("\n");
+    assert.equal(lines.length, 2, "two runs append (not truncate) → 2 entries");
+    for (const line of lines) {
+      const e = JSON.parse(line);
+      assert.equal(e.tool, "adversarial-review");
+      assert.equal(e.severity, "high"); // FLAG's gating finding
+      assert.deepEqual(Object.keys(e).sort(), ["category", "desc", "file", "line", "severity", "tool", "ts"]);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ledger AC6: an unwritable ledger path warns but does not fail the review", () => {
+  // Make the parent a FILE so mkdir of the ledger's dir fails (ENOTDIR).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-"));
+  const blocker = path.join(dir, "blocker");
+  fs.writeFileSync(blocker, "x");
+  try {
+    const r = runCli(
+      ["--providers", "claude", "--scope", "working-tree", "--allow-secrets", "--findings-ledger", path.join(blocker, "sub", "f.jsonl")],
+      { mocks: { claude: FLAG } }
+    );
+    assert.equal(r.status, 2, "review still exits on its verdict, not 1");
+    assert.match(r.stderr, /Could not write findings ledger/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
