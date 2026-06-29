@@ -44,8 +44,33 @@
         "test/secrets.test.js",
         "test/skill-assets.test.js"
       ],
-      "edges": [],
+      "edges": [
+        {
+          "to": "T3"
+        }
+      ],
       "duration": 3,
+      "category": "feature"
+    },
+    {
+      "id": "T3",
+      "title": "Append gating review findings to the ADLC findings ledger (--findings-ledger)",
+      "body": "Wire adversarial-review's findings into the ADLC findings ledger so P7 distill\n(lesson-foundry) can auto-cluster them. Today the review CLI's findings never reach\n.adlc/findings.jsonl, so /adlc-distill sees `(no clusters to refine)` even after a\nreview surfaces real, repeated issues. Close the loop between the two systems.\n\nRESOLVED DECISIONS (P0):\n- D1 Trigger = explicit flag. Add `--findings-ledger [path]` (default path\n  `.adlc/findings.jsonl` when the flag is given without a value). The tool is a\n  standalone npm package used in non-ADLC repos, so it MUST NOT write to .adlc/\n  unless the flag is passed. No flag => no ledger write (current behavior).\n- D2 Scope = gating findings only. Append only findings that met the deterministic\n  gate (severity >= --fail-on AND grounded effectiveConfidence >= --min-confidence),\n  i.e. the same set deriveVerdict counts as gating. Ungrounded/below-threshold\n  speculation is NOT recorded (keep the ledger high-signal).\n\nLEDGER FORMAT (canonical, matches @adlc/model-ratchet and @adlc/lesson-foundry):\none JSON object per line (JSONL), append-only. Fields per entry:\n  { ts, tool, file, line, category, severity, desc, verdict }\n  - ts: ISO-8601 timestamp (new Date().toISOString()).\n  - tool: the string \"adversarial-review\".\n  - file: finding.file.\n  - line: finding.line_start (0 for file-level).\n  - category: finding.category (already in the ledger's vocabulary space).\n  - severity: finding.severity.\n  - desc: finding.title (lesson-foundry clusters on `desc` via token Jaccard; the\n    concise title clusters better than the full body).\n  - verdict: omit, or set to a non-'killed' value. lesson-foundry SKIPS entries\n    whose verdict === 'killed'; our recorded findings are live, so never write\n    'killed'. (Recommended: omit the field.)\n\nCONCRETE CHANGES:\n1. src/utils.js parseArgs: add `--findings-ledger [path]` (optional value; when\n   present without a value, default to `.adlc/findings.jsonl`; when absent, null).\n   Both space and = forms. Document in HELP_TEXT.\n2. src/review.js (or a small new module src/findings-ledger.js): add a pure\n   `toLedgerEntries(result, assessments, { failOn, minConfidence, ts })` that\n   returns the JSONL entry objects for the GATING findings only (reuse the exact\n   gating predicate from deriveVerdict: SEVERITY_RANK[f.severity] >= failOn AND\n   effectiveConfidence >= minConfidence). Keep it pure/testable; do NO file IO here.\n3. bin/cli.js: after deriveVerdict (single-provider) AND after the multi-provider\n   quorum path, if args.findingsLedger is set, append the gating entries as JSONL\n   lines to that path. Create parent dirs if needed; append (never truncate);\n   failure to write must WARN, not crash the review (the verdict/exit code is the\n   product, the ledger is a side effect).\n   - Multi-provider: record the MERGED gating findings once (not per provider), so\n     a corroborated finding is one ledger entry; use mergedAssessments for grounding.\n4. Do NOT create `.adlc/` when the flag is absent.\n\nACCEPTANCE CRITERIA (concrete verification):\n- AC1 flag parsing: `--findings-ledger` with no value => args.findingsLedger ===\n  \".adlc/findings.jsonl\"; `--findings-ledger path/to.jsonl` => that path; absent =>\n  null. Test: node --test test/utils.test.js.\n- AC2 gating-only entries: toLedgerEntries over a result with one gating + one\n  below-threshold finding returns exactly ONE entry, for the gating finding, with\n  fields {ts,tool:'adversarial-review',file,line,category,severity,desc}. Test:\n  node --test test/findings-ledger.test.js (or review.test.js).\n- AC3 no-flag no-write: running the CLI without --findings-ledger creates/touches\n  no `.adlc/` and no ledger file. Test: node --test test/cli-*.test.js in a temp\n  repo, assert the file does not exist after a run.\n- AC4 append JSONL: running the CLI twice with --findings-ledger <tmp> appends\n  (does not truncate); each line parses as JSON and conforms to the field set;\n  every recorded entry is a gating finding. Test: CLI integration in a temp repo.\n- AC5 ledger round-trips through lesson-foundry: a written ledger with >= 2\n  same-category/similar-desc gating findings is consumable by\n  `adlc lesson-foundry --ledger findings --min 2` without 'malformed line' skips.\n  Verify: write a fixture ledger via the new path and run lesson-foundry against\n  the .adlc dir; assert it does not report skipped/malformed lines.\n- AC6 write failure is non-fatal: if the ledger path is unwritable, the review\n  still prints its verdict and exits with the verdict code (warn only). Test:\n  point --findings-ledger at an unwritable path; assert exit reflects the verdict\n  (0/2), not 1, and a warning was emitted.\n- AC7 full suite green: npm test exits 0.\n\nOUT OF SCOPE: auto-detecting/creating .adlc/ without the flag; recording\nnon-gating findings; changing the ledger schema consumed by lesson-foundry;\nrecording rejection-mining data (that comes from gh PR rejections, not this tool).\n\nMutation-proven: each AC test fails when its logic is reverted (P5 hollow-test).\n--- P1 INTERROGATION RESOLUTIONS (authoritative spec: .adlc/specs/T3.md) ---\nR1 single shared gating predicate exported from src/review.js, used by BOTH\n   deriveVerdict and toLedgerEntries (ledger set can never drift from the gate).\nR2 multi-provider records the MERGED findings once, index-aligned with\n   mergedAssessments (a corroborated finding is one entry, not one per provider).\nR3 atomic per-line append: build all JSONL lines in one buffer, single\n   appendFileSync, each line newline-terminated (no half-written lines).\nR4 append-only, no cross-run dedup in v1 (repetition is signal); dedup is a\n   documented future enhancement.\nAdded AC8 (ledger set == gate set predicate parity). See spec for ACs 1-8.",
+      "scope": [
+        "src/utils.js",
+        "src/review.js",
+        "src/findings-ledger.js",
+        "bin/cli.js",
+        "test/utils.test.js",
+        "test/findings-ledger.test.js",
+        "test/cli-multiprovider.test.js"
+      ],
+      "rails": [
+        "src/secrets.js",
+        "test/skill-assets.test.js"
+      ],
+      "edges": [],
+      "duration": 2,
       "category": "feature"
     }
   ]
