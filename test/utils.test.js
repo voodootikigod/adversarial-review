@@ -168,4 +168,8 @@ test("parseArgs --findings-ledger: optional value with default path", () => {
   // a following flag is NOT consumed as the value
   assert.equal(parseArgs(["node", "cli", "--findings-ledger", "--json"]).findingsLedger, ".adlc/findings.jsonl");
   assert.equal(parseArgs(["node", "cli", "--findings-ledger", "--json"]).json, true);
+  // after consuming an explicit value, the NEXT flag is still parsed (no index skip)
+  const a = parseArgs(["node", "cli", "--findings-ledger", "p.jsonl", "--json"]);
+  assert.equal(a.findingsLedger, "p.jsonl");
+  assert.equal(a.json, true, "the flag after an explicit ledger value must still be parsed");
 });

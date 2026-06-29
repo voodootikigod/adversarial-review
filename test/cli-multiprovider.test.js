@@ -171,13 +171,41 @@ test("CLI #6: all-API selection on a non-inlinable diff exits 1 (nothing usable)
 
 // ─── findings-ledger integration (T3) ───────────────────────────────────────
 
-test("ledger AC3: without --findings-ledger, no .adlc/ or ledger file is created", () => {
+test("ledger AC3: without --findings-ledger, no .adlc/ is created and no ledger warning", () => {
   let adlcExists = true;
-  runCli(["--providers", "claude", "--scope", "working-tree", "--allow-secrets"], {
+  const r = runCli(["--providers", "claude", "--scope", "working-tree", "--allow-secrets"], {
     mocks: { claude: FLAG },
     afterRun: (repoDir) => { adlcExists = fs.existsSync(path.join(repoDir, ".adlc")); }
   });
   assert.equal(adlcExists, false, "no flag → must not create .adlc/");
+  assert.doesNotMatch(r.stderr, /findings ledger/i, "no ledger warning when the flag is absent");
+});
+
+test("ledger: records the MERGED findings (shared corroborated once + each unique), R2", () => {
+  // claude: shared + onlyA ; agy: shared + onlyB. Merged = 3 distinct gating
+  // findings → 3 ledger lines. This distinguishes "merged" from BOTH "per-provider
+  // loop" (would give 4) and "first provider only" (would give 2).
+  const f = (file, title) =>
+    `{"severity":"high","category":"security","title":"${title}","body":"b","exploit_scenario":"e","evidence":"","file":"${file}","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}`;
+  const res = (findings) =>
+    `{"verdict":"needs-attention","summary":"s","coverage":{"files_examined":[],"files_skipped":[]},"findings":[${findings}],"next_steps":["n"]}`;
+  const claudeOut = res([f("shared.js", "Shared issue"), f("a.js", "Only in A")].join(","));
+  const agyOut = res([f("shared.js", "Shared issue"), f("b.js", "Only in B")].join(","));
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-merge-"));
+  const ledger = path.join(dir, "f.jsonl");
+  try {
+    runCli(
+      ["--providers", "claude,gemini", "--scope", "working-tree", "--allow-secrets", "--findings-ledger", ledger],
+      { mocks: { claude: claudeOut, agy: agyOut } }
+    );
+    const lines = fs.readFileSync(ledger, "utf8").trim().split("\n").filter(Boolean);
+    assert.equal(lines.length, 3, "shared corroborated finding counts once; both uniques recorded");
+    const descs = lines.map((l) => JSON.parse(l).desc).sort();
+    assert.deepEqual(descs, ["Only in A", "Only in B", "Shared issue"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("ledger AC4: --findings-ledger appends gating findings as JSONL across runs", () => {
