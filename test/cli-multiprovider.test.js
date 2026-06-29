@@ -228,6 +228,30 @@ test("ledger: default single-provider path records grounded gating findings only
   }
 });
 
+test("ledger: default single-provider path WRITES a grounded gating finding (positive)", () => {
+  // No --providers → single-provider path. The finding's evidence is present in the
+  // temp repo's diff, so it stays grounded above the floor and gates. Asserts the
+  // ledger IS written on the default path (kills deletion of the single-provider
+  // recordFindings call — the negative-only H1 test cannot).
+  const GROUNDED = '{"verdict":"needs-attention","summary":"s","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[{"severity":"high","category":"security","title":"Grounded high","body":"b","exploit_scenario":"e","evidence":"export const x = 2","file":"code.js","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}],"next_steps":["n"]}';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-default-pos-"));
+  const ledger = path.join(dir, "f.jsonl");
+  try {
+    const r = runCli(["--findings-ledger", ledger, "--scope", "working-tree", "--allow-secrets"], {
+      mocks: { claude: GROUNDED }
+    });
+    assert.equal(r.status, 2, "grounded high finding gates → needs-attention");
+    assert.equal(fs.existsSync(ledger), true, "grounded gating finding IS recorded on the default path");
+    const lines = fs.readFileSync(ledger, "utf8").trim().split("\n").filter(Boolean);
+    assert.equal(lines.length, 1);
+    const e = JSON.parse(lines[0]);
+    assert.equal(e.tool, "adversarial-review");
+    assert.equal(e.desc, "Grounded high");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("ledger AC4: --findings-ledger appends gating findings as JSONL across runs", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-"));
   const ledger = path.join(dir, "findings.jsonl");
