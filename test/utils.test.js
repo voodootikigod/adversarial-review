@@ -153,3 +153,23 @@ test("parseArgs rejects --model combined with --providers", () => {
   const args = parseArgs(["node", "cli", "--providers", "gpt,gemini", "--model", "gpt-4o"]);
   assert.ok(args.errors.some((e) => /--model.*--providers|--providers.*--model/.test(e)));
 });
+
+test("parseArgs --findings-ledger: optional value with default path", () => {
+  // no value → default ledger path
+  assert.equal(parseArgs(["node", "cli", "--findings-ledger"]).findingsLedger, ".adlc/findings.jsonl");
+  // explicit value (space form)
+  assert.equal(parseArgs(["node", "cli", "--findings-ledger", "out/f.jsonl"]).findingsLedger, "out/f.jsonl");
+  // explicit value (= form)
+  assert.equal(parseArgs(["node", "cli", "--findings-ledger=out/f.jsonl"]).findingsLedger, "out/f.jsonl");
+  // empty = form → default
+  assert.equal(parseArgs(["node", "cli", "--findings-ledger="]).findingsLedger, ".adlc/findings.jsonl");
+  // absent → null
+  assert.equal(parseArgs(["node", "cli"]).findingsLedger, null);
+  // a following flag is NOT consumed as the value
+  assert.equal(parseArgs(["node", "cli", "--findings-ledger", "--json"]).findingsLedger, ".adlc/findings.jsonl");
+  assert.equal(parseArgs(["node", "cli", "--findings-ledger", "--json"]).json, true);
+  // after consuming an explicit value, the NEXT flag is still parsed (no index skip)
+  const a = parseArgs(["node", "cli", "--findings-ledger", "p.jsonl", "--json"]);
+  assert.equal(a.findingsLedger, "p.jsonl");
+  assert.equal(a.json, true, "the flag after an explicit ledger value must still be parsed");
+});

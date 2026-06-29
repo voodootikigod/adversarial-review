@@ -50,6 +50,10 @@ ${colors.bold("Options:")}
                         --passes. Cannot be combined with --provider.
   --quorum <n>          Multi-provider verdict gates as needs-attention when >= n
                         providers each flag a material finding (default 1).
+  --findings-ledger [path]
+                        Append gating findings as JSONL to the ADLC findings
+                        ledger (default path .adlc/findings.jsonl) for P7 distill.
+                        Off unless the flag is given.
   --allow-secrets       Send the payload even if the secret scan finds likely
                         credentials in the diff (off by default).
   --timeout <seconds>   Per-request API timeout (default 120).
@@ -111,6 +115,7 @@ export function parseArgs(argv) {
     passes: 1,
     providers: null,
     quorum: 1,
+    findingsLedger: null,
     allowSecrets: false,
     timeout: 120,
     provider: null,
@@ -253,6 +258,18 @@ export function parseArgs(argv) {
       i = result.nextIndex;
     } else if (arg.startsWith("--quorum=")) {
       args.quorum = parsePositiveInteger("--quorum", readEqualsValue("--quorum", arg)) ?? args.quorum;
+    } else if (arg === "--findings-ledger") {
+      // Optional value: consume the next token as the path only if it isn't another
+      // flag; otherwise fall back to the default ledger path.
+      const next = argv[i + 1];
+      if (next && !next.startsWith("-")) {
+        args.findingsLedger = next;
+        i += 1;
+      } else {
+        args.findingsLedger = ".adlc/findings.jsonl";
+      }
+    } else if (arg.startsWith("--findings-ledger=")) {
+      args.findingsLedger = arg.slice("--findings-ledger=".length) || ".adlc/findings.jsonl";
     } else if (arg === "--timeout") {
       const result = readValue("--timeout", i);
       args.timeout = parsePositiveInteger("--timeout", result.value);
