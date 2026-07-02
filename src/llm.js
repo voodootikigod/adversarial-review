@@ -144,7 +144,7 @@ function callCodexCli(fullPrompt, schema) {
   try {
     // wx flag: exclusive create — fails if the file already exists (defense in depth
     // inside the already-private directory).
-    if (schemaFile) fs.writeFileSync(schemaFile, JSON.stringify(schema), { mode: 0o600, flag: "wx" });
+    if (schemaFile) fs.writeFileSync(schemaFile, JSON.stringify(sanitizeSchemaForProvider(schema)), { mode: 0o600, flag: "wx" });
 
     const baseArgs = [
       "exec",

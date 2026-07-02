@@ -7,3 +7,4 @@ blog/
 .env.*
 .adlc/*
 !.adlc/tickets.json
+.worktrees/
