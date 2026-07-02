@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { cleanJsonResponse, configureLLM, cliFallbackArgs } from "../src/llm.js";
+import { loadSchema } from "../src/review.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
   const input = '{"verdict": "approve", "summary": "good"}';
@@ -344,6 +345,87 @@ printf '%s' '${expectedResponse}' > "$output_file"
   try {
     const config = { provider: "cli", cliCmd: "codex", timeoutMs: 10000 };
     const result = await llmCall(config, sentinelPrompt, sentinelSystem);
+    assert.equal(result, expectedResponse, "should return the content written to --output-last-message");
+  } finally {
+    process.env.PATH = oldPath;
+    try { fs.unlinkSync(binPath); } catch {}
+    try { fs.rmdirSync(tmpDir); } catch {}
+  }
+});
+
+test("codex CLI path sanitizes the schema written to --output-schema (matches the OpenAI call site's options: no optional property outside required, no constraint keywords)", async () => {
+  const { llmCall } = await import("../src/llm.js");
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-schema-test-"));
+  const binPath = path.join(tmpDir, "codex");
+  const sentinelSystem = "be adversarial sentinel";
+  const sentinelPrompt = "review this sentinel";
+  const expectedResponse = '{"verdict":"approve","summary":"sanitized ok"}';
+
+  // Mock codex binary written in Node (not sh) because the check requires real
+  // JSON structural comparison: every key in properties.findings.items.properties
+  // must also appear in properties.findings.items.required. A shell/grep
+  // string-match substitute would be a hollow check that stays green even if the
+  // sanitize call regresses (P1 parallax resolution R1 for ticket T4).
+  //
+  // Also asserts constraint keywords (minLength/minimum/maximum) are stripped,
+  // not just that corroborated_by is gone: corroborated_by is unconditionally
+  // dropped by ALWAYS_DROP regardless of the `keepConstraints` option, so a
+  // wrong-but-plausible fix that reaches for the Anthropic call site's
+  // `{ keepConstraints: true }` (instead of the OpenAI-mirroring default) would
+  // still pass a properties/required-only check. This closes that blind spot
+  // (found during P5 prosecution of ticket T4).
+  fs.writeFileSync(
+    binPath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+const args = process.argv.slice(2);
+let outputFile = null;
+let schemaFile = null;
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "--output-last-message") outputFile = args[i + 1];
+  if (args[i] === "--output-schema") schemaFile = args[i + 1];
+}
+process.stdin.resume();
+process.stdin.on("end", () => {
+  if (!schemaFile) {
+    console.error("FAIL: --output-schema not passed");
+    process.exit(1);
+  }
+  const written = JSON.parse(fs.readFileSync(schemaFile, "utf8"));
+  const findingProps = written.properties.findings.items.properties;
+  const findingRequired = written.properties.findings.items.required || [];
+  const missing = Object.keys(findingProps).filter((k) => !findingRequired.includes(k));
+  if (missing.length) {
+    console.error("FAIL: schema written to disk has properties not in required: " + missing.join(", "));
+    process.exit(1);
+  }
+  const constrained = Object.entries(findingProps).filter(
+    ([, v]) => "minLength" in v || "minimum" in v || "maximum" in v
+  );
+  if (constrained.length) {
+    console.error(
+      "FAIL: schema written to disk still has constraint keywords (expected the OpenAI-mirroring " +
+        "default sanitize options, not keepConstraints:true): " + constrained.map(([k]) => k).join(", ")
+    );
+    process.exit(1);
+  }
+  fs.writeFileSync(outputFile, '${expectedResponse}');
+});
+`
+  );
+  fs.chmodSync(binPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+
+  try {
+    const config = { provider: "cli", cliCmd: "codex", timeoutMs: 10000 };
+    // Real repo schema.json: findings.items has corroborated_by in properties
+    // but not in required (merge-time-only annotation). This is the actual
+    // shape that triggered the OpenAI strict json_schema 400 via codex.
+    const schema = loadSchema();
+    const result = await llmCall(config, sentinelPrompt, sentinelSystem, schema);
     assert.equal(result, expectedResponse, "should return the content written to --output-last-message");
   } finally {
     process.env.PATH = oldPath;
