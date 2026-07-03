@@ -78,6 +78,12 @@ ${colors.bold("Loop mode (--loop):")}
                         Bypass secret scan on the fix prompt. Verifies same provider
                         for known fixers; warns and proceeds for custom --loop-fixer.
 
+  With --json, the loop emits NDJSON events; the terminal line is a single
+  loop_summary event { providers, iterations, verdict, exitReason,
+  survivingCount, acceptedCount } — the consolidated record for a P6
+  'adlc gate-manifest record adversarial-review --evidence ...' entry. Example:
+    adversarial-review --loop --json ... | jq -c 'select(.type=="loop_summary")'
+
 ${colors.bold("LLM selection (when not --prompt-only):")}
   Auto-detected in order: ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY,
   then a local CLI agent (claude, codex, agy). Override with --provider.

@@ -113,6 +113,27 @@ function emitEvent(jsonMode, event) {
   if (jsonMode) process.stdout.write(JSON.stringify(event) + "\n");
 }
 
+// Consolidated terminal record (GitHub #11): one NDJSON line carrying exactly the
+// fields a P6 `adlc gate-manifest record adversarial-review --evidence '...'` entry
+// wants, so a consumer reads ONE line instead of correlating loop_end +
+// review_result. `verdict` is DERIVED from exitReason — a loop that exits without
+// reaching a clean review still has surviving gating findings, so only "clean" is
+// an approve. `acceptedCount` is always 0: per ADLC toolkit.md, `accepted` =
+// "findings acknowledged with documented justification", a human P6 decision the
+// automated loop cannot make; it is emitted as 0 to keep the evidence string
+// complete/copy-pastable, and the human overrides it when recording.
+export function buildLoopSummary({ providers, iterations, exitReason, survivingCount }) {
+  return {
+    type: "loop_summary",
+    providers,
+    iterations,
+    verdict: exitReason === "clean" ? "approve" : "needs-attention",
+    exitReason,
+    survivingCount,
+    acceptedCount: 0
+  };
+}
+
 // ─── Recovery command ─────────────────────────────────────────────────────────
 
 function buildRecoveryCmd(stashName) {
@@ -535,6 +556,13 @@ export async function runLoop(cwd, args) {
     }
   }
 
+  // Provider labels for the consolidated loop_summary (GitHub #11): the multi
+  // set's ids, or the single reviewer's concrete identity (cli command name for
+  // local agents, provider name for APIs).
+  const providerLabels = providerSet
+    ? providerSet.providers.map((p) => p.id)
+    : [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
+
   // Validate --loop-unsafe-allow-fix-secrets provider match for known fixers.
   if (args.loopUnsafeAllowFixSecrets) {
     if (providerSet) {
@@ -646,6 +674,7 @@ export async function runLoop(cwd, args) {
     if (context.isEmpty && fixCount === 0) {
       emitEvent(args.json, { type: "review_result", result: null, iteration: 1 });
       emitEvent(args.json, { type: "loop_end", exitReason: "clean", iterations: 0, stashRef: null });
+      emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: 0, exitReason: "clean", survivingCount: 0 }));
       log.success("clean on first review — nothing to review in the working tree.");
       process.exit(0);
     }
@@ -761,6 +790,7 @@ export async function runLoop(cwd, args) {
         log.success("clean on first review — no fix iterations ran.");
       }
       emitEvent(args.json, { type: "loop_end", exitReason: "clean", iterations: fixCount, stashRef: null });
+      emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason: "clean", survivingCount: 0 }));
       process.exit(0);
     }
 
@@ -779,6 +809,7 @@ export async function runLoop(cwd, args) {
         iterations: fixCount,
         stashRef
       });
+      emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason: "no-progress", survivingCount: gatings.length }));
       if (stashRef) log.warn(buildRecoveryCmd(stashName));
       process.exit(2);
     }
@@ -793,6 +824,7 @@ export async function runLoop(cwd, args) {
         iterations: fixCount,
         stashRef
       });
+      emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason: "ceiling", survivingCount: gatings.length }));
       if (stashRef) log.warn(buildRecoveryCmd(stashName));
       process.exit(2);
     }
@@ -911,6 +943,7 @@ export async function runLoop(cwd, args) {
         stashRef: hasPartial ? null : stashRef,
         fixerStderr: fixerResult.stderr
       });
+      emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason, survivingCount: gatings.length }));
       process.exit(2);
     }
 
@@ -919,6 +952,7 @@ export async function runLoop(cwd, args) {
       log.warn("Fixer made no changes to the working tree.");
       emitEvent(args.json, { type: "review_result", result: lastResult, iteration: fixCount + 1 });
       emitEvent(args.json, { type: "loop_end", exitReason: "no-diff", iterations: fixCount, stashRef });
+      emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason: "no-diff", survivingCount: gatings.length }));
       if (stashRef) log.warn(buildRecoveryCmd(stashName));
       process.exit(2);
     }
