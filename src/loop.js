@@ -6,6 +6,7 @@ import {
   buildPrompt,
   runReview,
   runMultiProviderReview,
+  resolveReachableProviders,
   mergeProviderResults,
   deriveQuorumVerdict,
   verifyFindings,
@@ -665,9 +666,24 @@ export async function runLoop(cwd, args) {
     const prompt = buildPrompt(context, args.focus);
     let result, gatings;
     if (providerSet) {
+      // API providers cannot inspect a diff too large to inline; each round's
+      // context can differ (fixes may shrink or grow the working-tree diff), so
+      // this is re-resolved every round exactly like the non-loop --providers
+      // path (gh-9 P5#1 — this loop previously skipped the check entirely and
+      // fanned out to whichever providers were selected at loop start, regardless
+      // of round size).
+      const { providers: roundProviders } = resolveReachableProviders(providerSet.providers, context, args);
+      if (!roundProviders.length) {
+        log.error(
+          "No usable providers: the diff is too large to inline and every selected provider is API-only.\n" +
+            "Use a local CLI provider, raise --max-files/--max-bytes, narrow the scope, or pass --allow-summary-review."
+        );
+        if (stashRef) log.warn(buildRecoveryCmd(stashName));
+        process.exit(1);
+      }
       let round;
       try {
-        round = await runProviderRound(providerSet.providers, context, prompt, args);
+        round = await runProviderRound(roundProviders, context, prompt, args);
       } catch (err) {
         log.error(`Review failed: ${err.message}`);
         if (stashRef) log.warn(buildRecoveryCmd(stashName));

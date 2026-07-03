@@ -3,7 +3,7 @@ import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { colors, log } from "./utils.js";
-import { llmCall, cleanJsonResponse } from "./llm.js";
+import { llmCall, cleanJsonResponse, cliFallbackForFamily } from "./llm.js";
 import { validateAgainstSchema } from "./schema-validate.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -323,26 +323,40 @@ function sameFindingAcrossProviders(a, b) {
 export function mergeProviderResults(perProvider, { failOn = "medium", minConfidence = 0.5 } = {}) {
   const results = perProvider.map((p) => p.result);
   const flagged = results.find((r) => r.verdict === "needs-attention");
-  // A finding "gates" under the active thresholds. The representative is chosen so
-  // a low-confidence (likely hallucinated) finding can never mask a well-grounded
-  // one: prefer a gating finding, then higher severity, then higher confidence.
-  const gates = (f) => SEVERITY_RANK[f.severity] >= SEVERITY_RANK[failOn] && f.confidence >= minConfidence;
+  // The representative is chosen so a low-confidence (likely hallucinated) finding
+  // can never mask a well-grounded one: prefer a gating finding, then higher
+  // severity, then higher confidence. "Gates" and "confidence" here mean the
+  // GROUNDING-ADJUSTED effectiveConfidence from each provider's own assessFindings
+  // pass (perProvider[i].assessments, set by the caller before merging), via the
+  // same isGatingFinding predicate the quorum verdict and the fixer's gating list
+  // use — falling back to raw confidence only when a caller has no assessments
+  // (gh-9 P5#2: raw self-reported confidence let an ungrounded/hallucinated
+  // finding from one provider outrank a genuinely grounded one from another,
+  // so the chosen representative's re-assessed confidence could fall below the
+  // gate floor even though the quorum verdict — computed per-provider on each
+  // provider's OWN grounded confidence — correctly said needs-attention. That
+  // mismatch let getGatingFindings filter the merged finding out entirely,
+  // silently clearing the fixer's gating list and exiting the loop clean).
+  const effConf = (f, assessments, idx) => assessments?.[idx]?.effectiveConfidence ?? f.confidence;
   const groups = [];
-  for (const { provider, result } of perProvider) {
-    for (const f of result.findings) {
+  for (const { provider, result, assessments } of perProvider) {
+    result.findings.forEach((f, idx) => {
+      const conf = effConf(f, assessments, idx);
       const g = groups.find((grp) => sameFindingAcrossProviders(grp.rep, f));
       if (!g) {
-        groups.push({ rep: { ...f }, providers: new Set([provider]) });
+        groups.push({ rep: { ...f }, repConf: conf, providers: new Set([provider]) });
       } else {
         g.providers.add(provider);
+        const fGates = isGatingFinding(f, { effectiveConfidence: conf }, { failOn, minConfidence });
+        const repGates = isGatingFinding(g.rep, { effectiveConfidence: g.repConf }, { failOn, minConfidence });
         const better =
-          (gates(f) && !gates(g.rep)) ||
-          (gates(f) === gates(g.rep) &&
+          (fGates && !repGates) ||
+          (fGates === repGates &&
             (SEVERITY_RANK[f.severity] > SEVERITY_RANK[g.rep.severity] ||
-              (f.severity === g.rep.severity && f.confidence > g.rep.confidence)));
-        if (better) g.rep = { ...f };
+              (f.severity === g.rep.severity && conf > g.repConf)));
+        if (better) { g.rep = { ...f }; g.repConf = conf; }
       }
-    }
+    });
   }
   return {
     verdict: flagged ? "needs-attention" : "approve",
@@ -420,6 +434,43 @@ export async function runReview(config, prompt, { passes = 1 } = {}) {
 // inspect the repo, so this only constrains API providers.)
 export function apiProvidersCannotReview(context, args) {
   return !context.includeDiff && !args.allowSummaryReview;
+}
+
+// Given a selected provider set and the collected review context, drop or
+// downgrade API providers that cannot inspect a non-inlinable diff (loudly),
+// preserving whatever reviewer diversity remains reachable. This is the single
+// source of truth for that guard: the non-loop multi-provider path (bin/cli.js)
+// and the --loop multi-provider path (loop.js) both call it, so the guard can
+// never exist in one and silently drift out of the other (gh-9 P5#1 — the loop
+// path shipped without it and would call an API-only provider directly on an
+// oversized diff, which either returns a confident approve from a summary-only
+// view or, for a provider misconfigured/unreachable at the network layer, fails
+// the round entirely instead of degrading to a reachable local CLI).
+export function resolveReachableProviders(providers, context, args) {
+  if (!apiProvidersCannotReview(context, args)) {
+    return { providers, dropped: [] };
+  }
+  const kept = [];
+  const dropped = [];
+  for (const p of providers) {
+    if (p.config.provider === "cli") { kept.push(p); continue; }
+    // The API can't inspect a non-inlinable diff — downgrade to the family's
+    // local CLI (which can) before giving up on the family entirely.
+    const fallback = cliFallbackForFamily(p.family, args);
+    if (fallback) {
+      log.warn(`Provider ${p.id} (API) cannot inspect a non-inlinable diff; using local ${fallback.id} instead.`);
+      kept.push(fallback);
+    } else {
+      dropped.push(p.id);
+    }
+  }
+  if (dropped.length) {
+    log.warn(
+      `Dropping ${dropped.length} API provider(s) with no local CLI fallback: ${dropped.join(", ")}. ` +
+        `Raise --max-files/--max-bytes or pass --allow-summary-review to include them.`
+    );
+  }
+  return { providers: kept, dropped };
 }
 
 export async function runMultiProviderReview(providers, prompt, { passes = 1 } = {}, reviewFn = runReview) {

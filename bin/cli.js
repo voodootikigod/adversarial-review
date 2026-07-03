@@ -2,14 +2,14 @@
 
 import { parseArgs, log, HELP_TEXT } from "../src/utils.js";
 import { collectReviewContext } from "../src/git-context.js";
-import { configureLLM, selectProviders, underSatisfiedNotice, cliFallbackForFamily } from "../src/llm.js";
+import { configureLLM, selectProviders, underSatisfiedNotice } from "../src/llm.js";
 import { scanForSecrets } from "../src/secrets.js";
 import { toLedgerEntries, appendLedger } from "../src/findings-ledger.js";
 import {
   buildPrompt,
   runReview,
   runMultiProviderReview,
-  apiProvidersCannotReview,
+  resolveReachableProviders,
   mergeProviderResults,
   deriveQuorumVerdict,
   validateResult,
@@ -43,31 +43,10 @@ async function runMultiProvider(args, context, prompt) {
   // API providers cannot inspect a non-inlinable diff. Rather than aborting the
   // whole diverse review, DROP those providers (loudly) and proceed with the CLI
   // providers — preserving the reviewer diversity that is actually reachable
-  // (AC7 warn + proceed). Only abort if nothing usable remains.
-  let providers = sel.providers;
-  if (apiProvidersCannotReview(context, args)) {
-    const kept = [];
-    const dropped = [];
-    for (const p of providers) {
-      if (p.config.provider === "cli") { kept.push(p); continue; }
-      // The API can't inspect a non-inlinable diff — downgrade to the family's
-      // local CLI (which can) before giving up on the family entirely.
-      const fallback = cliFallbackForFamily(p.family, args);
-      if (fallback) {
-        log.warn(`Provider ${p.id} (API) cannot inspect a non-inlinable diff; using local ${fallback.id} instead.`);
-        kept.push(fallback);
-      } else {
-        dropped.push(p.id);
-      }
-    }
-    if (dropped.length) {
-      log.warn(
-        `Dropping ${dropped.length} API provider(s) with no local CLI fallback: ${dropped.join(", ")}. ` +
-          `Raise --max-files/--max-bytes or pass --allow-summary-review to include them.`
-      );
-    }
-    providers = kept;
-  }
+  // (AC7 warn + proceed). Only abort if nothing usable remains. Shared with the
+  // --loop multi-provider path (loop.js) so the guard cannot exist in one and not
+  // the other (gh-9 P5#1).
+  const { providers } = resolveReachableProviders(sel.providers, context, args);
   if (!providers.length) {
     log.error(
       "No usable providers: the diff is too large to inline and every selected provider is API-only.\n" +

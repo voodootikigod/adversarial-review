@@ -221,6 +221,38 @@ test("#6: representative selection never lets a low-confidence finding mask a ga
   }
 });
 
+test("gh-9 P5#2: representative selection uses grounding-adjusted confidence, not raw self-reported confidence", () => {
+  // Provider A: real, grounded finding — moderate raw confidence, but its evidence
+  // is genuinely present in the diff, so assessFindings would NOT halve it.
+  // Provider B: same underlying defect, but the evidence is hallucinated/unrelated
+  // to the change — high raw confidence, but assessFindings would halve it well
+  // below the gate floor. mergeProviderResults must not let B's inflated raw
+  // confidence win the representative slot when B's GROUNDED confidence is lower
+  // than A's — that would let the merged report's gating decision diverge from
+  // the quorum verdict (each provider was individually judged on its own grounded
+  // confidence), silently dropping a real, quorum-flagged finding from the fixer's
+  // gating list.
+  const loc = { category: "correctness", file: "src/x.js", line_start: 5, line_end: 8, title: "Unvalidated redirect target" };
+  const grounded = validFinding({ ...loc, severity: "high", confidence: 0.6 });
+  const hallucinated = validFinding({ ...loc, severity: "high", confidence: 0.8 });
+  const resultA = validResult({ findings: [grounded] });
+  const resultB = validResult({ findings: [hallucinated] });
+
+  for (const order of [
+    [{ provider: "codex", result: resultA, assessments: [{ notes: [], effectiveConfidence: 0.6 }] },
+     { provider: "gemini", result: resultB, assessments: [{ notes: ["quoted evidence was not found in the provided context"], effectiveConfidence: 0.4 }] }],
+    [{ provider: "gemini", result: resultB, assessments: [{ notes: ["quoted evidence was not found in the provided context"], effectiveConfidence: 0.4 }] },
+     { provider: "codex", result: resultA, assessments: [{ notes: [], effectiveConfidence: 0.6 }] }]
+  ]) {
+    const merged = mergeProviderResults(order, { failOn: "medium", minConfidence: 0.5 });
+    assert.equal(merged.findings.length, 1);
+    // The representative must be the grounded finding (raw confidence 0.6), not
+    // the hallucinated one (raw confidence 0.8) despite its higher raw score.
+    assert.equal(merged.findings[0].confidence, 0.6, "representative must be the grounded finding, not the higher-raw-confidence hallucinated one");
+    assert.deepEqual([...merged.findings[0].corroborated_by].sort(), ["codex", "gemini"]);
+  }
+});
+
 test("AC11: distinct root causes at the same (file,category,range) are preserved, not collapsed", () => {
   const loc = { category: "security", file: "src/auth.js", line_start: 20, line_end: 25 };
   const gptResult = validResult({
