@@ -3,6 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import net from "node:net";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -48,7 +49,7 @@ const MARKER_FIXER = `#!/bin/sh\ncat >/dev/null\nprintf '// FIXED_MARKER\\n' >> 
 
 // Run bin/cli.js in --loop mode against a throwaway repo with a real uncommitted
 // change. `mocks` maps a CLI name to its script body. Returns {status,stdout,stderr}.
-function runLoopCli(args, { mocks = {} } = {}) {
+function runLoopCli(args, { mocks = {}, env = {}, fileContents } = {}) {
   const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-loop-mocks-"));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-loop-repo-"));
   try {
@@ -65,13 +66,13 @@ function runLoopCli(args, { mocks = {} } = {}) {
     fs.writeFileSync(path.join(repoDir, "code.js"), "export const x = 1;\n");
     git(["add", "."]);
     git(["commit", "-qm", "init"]);
-    fs.writeFileSync(path.join(repoDir, "code.js"), "export const x = 2; // changed\n");
+    fs.writeFileSync(path.join(repoDir, "code.js"), fileContents || "export const x = 2; // changed\n");
 
     const PATH = [mocksDir, nodeBinDir, "/usr/bin", "/bin"].join(path.delimiter);
     const r = spawnSync(process.execPath, [cli, ...args], {
       cwd: repoDir,
       encoding: "utf8",
-      env: { HOME: process.env.HOME, PATH }
+      env: { HOME: process.env.HOME, PATH, ...env }
     });
     return { status: r.status, stdout: r.stdout || "", stderr: r.stderr || "" };
   } finally {
@@ -142,4 +143,48 @@ test("AC3: an unreachable provider triggers a loud under-satisfaction notice", (
   assert.match(r.stderr, /Under-satisfied/, "a loud under-satisfaction notice must reach stderr");
   assert.match(r.stderr, /1 of 2/, "the notice names how many of the requested providers contributed");
   assert.equal(r.status, 0, "proceeds with the reachable provider's approve verdict → exit 0");
+});
+
+// ── gh-9 P5#1: an API-configured provider must be downgraded to its local CLI
+//    fallback (or dropped) when the round's diff cannot be inlined — mirroring
+//    bin/cli.js's non-loop apiProvidersCannotReview guard, which --loop never
+//    applied. Reproduced without any real network call: an "anthropic"-family
+//    provider is made reachable via a fake ANTHROPIC_API_KEY, but --api-base
+//    points at a closed local port, so a genuine (unfixed) attempt to call it
+//    directly fails fast (connection error) — proving the guard did not fire. A
+//    claude mock (the anthropic family's CLI fallback) sits on PATH as the
+//    expected downgrade target. ─────────────────────────────────────────────────
+
+function getClosedPort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address();
+      srv.close((err) => (err ? reject(err) : resolve(port)));
+    });
+    srv.on("error", reject);
+  });
+}
+
+test("gh-9 P5#1: --loop downgrades an API provider to its local CLI fallback on a non-inlinable diff", async () => {
+  const closedPort = await getClosedPort();
+  // A diff that exceeds --max-bytes so context.includeDiff is false (summary-only).
+  const bigFile = "export const x = 1;\n" + "// padding\n".repeat(200);
+  const r = runLoopCli(
+    ["--providers", "anthropic", "--max-bytes", "10", ...LOOP],
+    {
+      mocks: { claude: staticMock(APPROVE), myfixer: NOOP_FIXER },
+      env: { ANTHROPIC_API_KEY: "test-key-not-real", ANTHROPIC_API_BASE: `http://127.0.0.1:${closedPort}` },
+      fileContents: bigFile
+    }
+  );
+  assert.match(
+    r.stderr,
+    /cannot inspect a non-inlinable diff; using local claude instead/,
+    `expected a downgrade warning; got:\n${r.stderr}`
+  );
+  assert.equal(r.status, 0, `expected the downgraded claude mock's approve to clear the loop; got:\n${r.stderr}`);
+  // If the guard did not fire, the run would instead attempt the real (bogus)
+  // API base and fail with a connection error — assert that never happened.
+  assert.doesNotMatch(r.stderr, /ECONNREFUSED|fetch failed/, "must never attempt the API directly on a non-inlinable diff");
 });
