@@ -87,3 +87,47 @@ test("makeGit: a non-transient git failure (bad subcommand) is NOT retried and r
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("makeGit: a bad cwd (ENOENT, permanent misconfiguration) fails fast and is NOT retried", () => {
+  // Spawn-level errors are only retried for a known-transient errno allowlist
+  // (EAGAIN/ENOMEM/EMFILE/ENFILE/EBUSY); ENOENT from a nonexistent cwd or a
+  // missing git binary is a permanent break and must fail on the first attempt,
+  // not silently retry for the full ~27s production budget.
+  const git = makeGit("/no/such/directory/at/all-xyz123-adv-test");
+  const start = Date.now();
+  const r = git(["status"]);
+  const elapsed = Date.now() - start;
+  assert.notEqual(r.status, 0);
+  assert.equal(r.error && r.error.code, "ENOENT");
+  assert.ok(elapsed < 500, `a permanent misconfiguration should fail fast, took ${elapsed}ms`);
+});
+
+test("makeGit: retries exactly maxAttempts times, not more (kills an off-by-one boundary regression)", () => {
+  // A fake `git` on PATH counts real invocations and always reports a
+  // retryable failure, so this directly measures the loop's stop condition
+  // rather than inferring it from elapsed time — a `attempt > maxAttempts`
+  // regression (one extra attempt) would fail this assertion.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-git-retry-count-"));
+  const fakeGitDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-fake-git-"));
+  const counterPath = path.join(dir, "count.txt");
+  const fakeGitPath = path.join(fakeGitDir, "git");
+  fs.writeFileSync(
+    fakeGitPath,
+    `#!/bin/sh\nprintf 'x' >> ${JSON.stringify(counterPath)}\nprintf 'fatal: Unable to create lock\\n' >&2\nexit 128\n`
+  );
+  fs.chmodSync(fakeGitPath, 0o755);
+
+  const originalPath = process.env.PATH;
+  process.env.PATH = [fakeGitDir, originalPath].join(path.delimiter);
+  try {
+    const git = makeGit(dir, { maxAttempts: 4, baseDelayMs: 5, maxDelayMs: 20 });
+    const r = git(["status"]);
+    assert.notEqual(r.status, 0);
+    const invocations = fs.readFileSync(counterPath, "utf8").length;
+    assert.equal(invocations, 4, `expected exactly maxAttempts (4) invocations, got ${invocations}`);
+  } finally {
+    process.env.PATH = originalPath;
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(fakeGitDir, { recursive: true, force: true });
+  }
+});

@@ -11,6 +11,11 @@ import { spawnSync } from "node:child_process";
 // wraps spawnSync("git", ...) so a short, backed-off retry absorbs those
 // instead of failing the test outright.
 const RETRYABLE_STDERR = /\.lock['"]?|unable to create|resource temporarily unavailable|device or resource busy/i;
+// Spawn-level failure codes (git never ran at all) that are plausibly transient
+// under CPU/process-table pressure. A permanent misconfiguration (e.g. ENOENT
+// from a bad cwd or missing git binary) is deliberately NOT in this set — it
+// should fail on the first attempt, not silently retry for ~27s.
+const RETRYABLE_SPAWN_ERRNO = new Set(["EAGAIN", "ENOMEM", "EMFILE", "ENFILE", "EBUSY"]);
 const MAX_ATTEMPTS = 15;
 const BASE_DELAY_MS = 50;
 const MAX_DELAY_MS = 3000;
@@ -22,10 +27,10 @@ function sleepSync(ms) {
 
 function isTransient(result) {
   if (result.status === 0) return false;
-  // The child process itself failed to spawn (or was killed) rather than git
-  // running and exiting non-zero — no stderr to inspect, but under CPU
-  // starvation this is exactly the kind of transient condition a retry clears.
-  if (result.error || result.status === null) return true;
+  if (result.error) return RETRYABLE_SPAWN_ERRNO.has(result.error.code);
+  // The process started but was killed (e.g. by a signal under memory
+  // pressure) rather than git running and exiting non-zero.
+  if (result.status === null) return true;
   return RETRYABLE_STDERR.test(result.stderr || "");
 }
 
