@@ -481,21 +481,16 @@ export async function runProviderRound(providers, context, prompt, args, reviewF
 // ─── Main loop ────────────────────────────────────────────────────────────────
 
 export async function runLoop(cwd, args) {
-  // Scope block: --loop only supports working-tree
-  if (args.scope === "branch") {
-    log.error(
-      "--loop is incompatible with --scope branch.\n" +
-      "The fixer writes to the working tree but branch scope reviews committed content.\n" +
-      "Use --scope working-tree (or omit --scope) instead."
-    );
-    process.exit(1);
+  // Branch scope (or --base) drives a pre-merge convergence loop that commits
+  // fixes onto the FEATURE branch — a distinct mechanism (commit/reset vs
+  // stash/pop) handled by runBranchLoop. The working-tree path below is unchanged.
+  // An EXPLICIT --scope working-tree wins over --base (which is then ignored,
+  // warned) so the user's explicit scope is never silently overridden.
+  if (args.scope === "branch" || (args.base && args.scope !== "working-tree")) {
+    return runBranchLoop(cwd, args);
   }
-  if (args.base) {
-    log.error(
-      "--loop is incompatible with --base <ref>.\n" +
-      "Use --scope working-tree to review working tree changes."
-    );
-    process.exit(1);
+  if (args.base && args.scope === "working-tree") {
+    log.warn("--base is ignored with --scope working-tree in --loop mode; reviewing the working tree.");
   }
 
   // Detect fixer
@@ -958,6 +953,388 @@ export async function runLoop(cwd, args) {
     }
 
     // Advance to next iteration
+    fixCount++;
+    priorGatingSets.push(gatings);
+  }
+}
+
+// ─── Branch-scope loop (pre-merge convergence, commit-mode fixer) ───────────────
+
+// Resolve the branch base to a commit sha, mirroring collectReviewContext's
+// resolution (explicit ref → upstream → origin/HEAD → main/develop/master). The sha
+// is pinned once so the review target can't shift mid-loop; it is only ever read.
+export function resolveBranchBaseSha(cwd, base) {
+  let ref = base;
+  if (!ref) {
+    ref = gitRun(cwd, ["rev-parse", "--abbrev-ref", "HEAD@{upstream}"], { allowFail: true });
+    if (!ref) {
+      const remoteHead = gitRun(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD"], { allowFail: true });
+      if (remoteHead) ref = remoteHead.split("/").pop();
+    }
+    if (!ref) {
+      for (const candidate of ["main", "develop", "master"]) {
+        if (gitRun(cwd, ["show-ref", "--verify", `refs/heads/${candidate}`], { allowFail: true })) {
+          ref = candidate;
+          break;
+        }
+      }
+    }
+    if (!ref) ref = "main";
+  }
+  const sha = gitRun(cwd, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { allowFail: true });
+  if (!sha) throw new Error(`Invalid base ref for branch loop: ${ref}`);
+  return sha;
+}
+
+// Review <branch> vs <base>, commit each accepted fix onto the FEATURE branch, and
+// re-review until clean. The base ref (e.g. main) is READ-ONLY — resolved to a sha
+// and only ever diffed; every write (commit / reset --hard / clean) targets the
+// feature branch's HEAD. Rollback is commit-based: reset to the pre-fix commit on a
+// failed fix, and leave successful fix commits in place (the human unwinds with the
+// printed whole-loop recovery). Shares every review/gating/fixer helper with the
+// working-tree loop; only the checkpoint mechanism differs. (T7 / GitHub #12.)
+export async function runBranchLoop(cwd, args) {
+  // 1. Clean-tree precondition — the safety keystone. With a clean start, any file
+  // that appears mid-loop is fixer-created, so `git add -A` / `reset --hard` /
+  // `clean -fd` can never touch the user's pre-existing uncommitted work.
+  const startDirty = gitRun(cwd, ["status", "--porcelain"], { allowFail: true });
+  if (startDirty) {
+    log.error(
+      "--loop with branch scope requires a clean working tree.\n" +
+      "Branch mode commits fixes onto the branch and resets on failure; uncommitted\n" +
+      "changes would be at risk. Commit or stash them first."
+    );
+    process.exit(1);
+  }
+
+  // 2. Require a real branch (never a detached HEAD — there is nothing to advance).
+  const branch = gitRun(cwd, ["rev-parse", "--abbrev-ref", "HEAD"], { allowFail: true });
+  if (!branch || branch === "HEAD") {
+    log.error("--loop with branch scope requires a checked-out branch (HEAD is detached).");
+    process.exit(1);
+  }
+  let originalHead;
+  try {
+    originalHead = gitRun(cwd, ["rev-parse", "HEAD"]);
+  } catch (err) {
+    log.error(err.message);
+    process.exit(1);
+  }
+  const recoveryLine = `git reset --hard ${originalHead}`;
+
+  // Pin the base to a sha at loop start so a moving ref (e.g. someone pushing to
+  // main mid-loop) can't silently shift the review target between rounds. The base
+  // is only ever read/diffed against this sha — never written.
+  let pinnedBase;
+  try {
+    pinnedBase = resolveBranchBaseSha(cwd, args.base);
+  } catch (err) {
+    log.error(err.message);
+    process.exit(1);
+  }
+
+  // 3. Detect fixer + OS write constraint (identical to the working-tree loop).
+  let fixerCmd, constraint;
+  try {
+    fixerCmd = detectFixer(args);
+  } catch (err) {
+    log.error(err.message);
+    process.exit(1);
+  }
+  try {
+    constraint = probeOsConstraint(args);
+  } catch (err) {
+    log.error(err.message);
+    process.exit(1);
+  }
+
+  // 4. Configure reviewer(s) — single provider or a diverse --providers set.
+  let reviewConfig = null;
+  let providerSet = null;
+  if (args.providers) {
+    let sel;
+    try {
+      sel = selectProviders(args);
+    } catch (err) {
+      log.error(err.message);
+      process.exit(1);
+    }
+    if (!sel.providers.length) {
+      log.error(
+        "None of the requested providers are reachable (no API key and no installed CLI).\n" +
+          "Set an API key, install a local CLI agent (claude/codex/agy), or use --provider."
+      );
+      process.exit(1);
+    }
+    providerSet = sel;
+    const notice = underSatisfiedNotice(sel);
+    if (notice) log.warn(notice);
+    log.info(`Multi-provider branch loop: ${sel.providers.map((p) => `${p.id}[${p.family}]`).join(", ")} (quorum ${args.quorum})`);
+  } else {
+    try {
+      reviewConfig = configureLLM(args);
+    } catch (err) {
+      log.error(err.message);
+      process.exit(1);
+    }
+  }
+
+  // Same cross-provider secret-bypass guard as the working-tree loop.
+  if (args.loopUnsafeAllowFixSecrets) {
+    if (providerSet) {
+      log.error(
+        "--loop-unsafe-allow-fix-secrets is not supported with --providers: merged findings can " +
+          "originate from a provider other than the fixer. Drop the flag to run with redaction."
+      );
+      process.exit(1);
+    }
+    const fixerProvider = FIXER_PROVIDER_MAP[fixerCmd];
+    if (!fixerProvider) {
+      log.warn("--loop-unsafe-allow-fix-secrets: cannot verify provider match for custom fixer — bypassing at your own risk.");
+    } else {
+      const reviewerProvider = reviewConfig.provider === "cli" ? null : reviewConfig.provider;
+      if (reviewerProvider && fixerProvider !== reviewerProvider) {
+        log.error(
+          `--loop-unsafe-allow-fix-secrets: fixer provider (${fixerProvider}) differs from ` +
+            `reviewer provider (${reviewerProvider}). Refusing to bypass secret scan across providers.`
+        );
+        process.exit(1);
+      }
+    }
+  }
+
+  const providerLabels = providerSet
+    ? providerSet.providers.map((p) => p.id)
+    : [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
+
+  const loopMax = args.loopMax ?? 3;
+  const fixerTimeoutMs = (args.timeout ?? 120) * 2 * 1000;
+
+  // Loud warning (not a refusal) when the branch is pushed: reset/commit will
+  // diverge local from its remote and need a force-push to reconcile.
+  const upstream = gitRun(cwd, ["rev-parse", "--abbrev-ref", "HEAD@{upstream}"], { allowFail: true });
+  if (upstream) {
+    log.warn(
+      `Branch '${branch}' tracks '${upstream}'. Fix commits (and any reset) will diverge your local ` +
+        "branch from its remote — a force-push would be needed to reconcile."
+    );
+  }
+
+  log.info(`Branch loop: branch=${branch}, base=${args.base || "(auto)"}, fixer=${fixerCmd}, sandbox=${constraint.mode}, max-iterations=${loopMax}`);
+  log.step(`Whole-loop recovery (undo every fix commit): ${recoveryLine}`);
+
+  emitEvent(args.json, { type: "loop_start", scope: "branch", branch, fixerCmd, constraintMode: constraint.mode, loopMax, originalHead });
+
+  let fixCount = 0;
+  const priorGatingSets = [];
+  let lastResult = null;
+
+  // Terminal exit: emit loop_end + the consolidated loop_summary, then exit.
+  const finish = (exitReason, exitCode, survivingCount) => {
+    emitEvent(args.json, { type: "loop_end", exitReason, iterations: fixCount, originalHead });
+    emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason, survivingCount }));
+    process.exit(exitCode);
+  };
+
+  // SIGINT: kill the fixer and print recovery — NEVER auto-reset on interrupt.
+  let currentFixerChild = null;
+  process.on("SIGINT", () => {
+    process.stderr.write("\n");
+    log.warn("Interrupted.");
+    if (currentFixerChild) {
+      try { process.kill(-currentFixerChild.pid, "SIGKILL"); } catch {}
+    }
+    log.warn(`Fix commits (if any) remain on '${branch}'. To undo all of them: ${recoveryLine}`);
+    process.exit(1);
+  });
+
+  while (true) {
+    const reviewLabel = fixCount === 0 ? "Initial review" : `Post-fix review (after ${fixCount} fix commit${fixCount > 1 ? "s" : ""})`;
+    if (!args.json) console.error(`\n${colors.bold(`─── ${reviewLabel} ───`)}`);
+
+    let context;
+    try {
+      context = collectReviewContext(cwd, {
+        scope: "branch",
+        base: pinnedBase,
+        maxFiles: args.maxFiles,
+        maxBytes: args.maxBytes,
+        contextLines: args.contextLines,
+        includeFiles: args.includeFiles
+      });
+    } catch (err) {
+      log.error(`Context collection failed: ${err.message}`);
+      log.warn(`Recovery: ${recoveryLine}`);
+      process.exit(1);
+    }
+
+    if (context.isEmpty && fixCount === 0) {
+      emitEvent(args.json, { type: "review_result", result: null, iteration: 1 });
+      log.success("clean on first review — the branch has no changes vs base.");
+      finish("clean", 0, 0);
+    }
+
+    const secretHits = scanForSecrets(context.content);
+    if (secretHits.length && !args.allowSecrets) {
+      log.error("Review payload appears to contain secrets. Pass --allow-secrets to override.");
+      log.warn(`Recovery: ${recoveryLine}`);
+      process.exit(1);
+    }
+
+    const prompt = buildPrompt(context, args.focus);
+    let result, gatings;
+    if (providerSet) {
+      const { providers: roundProviders } = resolveReachableProviders(providerSet.providers, context, args);
+      if (!roundProviders.length) {
+        log.error(
+          "No usable providers: the diff is too large to inline and every selected provider is API-only.\n" +
+            "Use a local CLI provider, raise --max-files/--max-bytes, narrow the scope, or pass --allow-summary-review."
+        );
+        log.warn(`Recovery: ${recoveryLine}`);
+        process.exit(1);
+      }
+      let round;
+      try {
+        round = await runProviderRound(roundProviders, context, prompt, args);
+      } catch (err) {
+        log.error(`Review failed: ${err.message}`);
+        log.warn(`Recovery: ${recoveryLine}`);
+        process.exit(1);
+      }
+      result = round.result;
+      lastResult = result;
+      emitEvent(args.json, { type: "review", iteration: fixCount + 1, findingCount: result.findings.length });
+      round.assessments.forEach((a, i) => {
+        for (const note of a.notes) {
+          log.warn(`Finding "${result.findings[i].title}": ${note} (grounding note — verify before relying on it).`);
+        }
+      });
+      log.info(
+        `Quorum verdict: ${round.derived.flaggingCount}/${round.perProvider.length} provider(s) flagged ` +
+          `(effective quorum ${round.derived.effectiveQuorum} of requested ${round.derived.quorum}) → ${round.derived.verdict}`
+      );
+      if (!args.json) console.log(renderReport(result, context, round.assessments, round.derived));
+      gatings = round.derived.verdict === "needs-attention" ? getGatingFindings(result, round.assessments, args) : [];
+    } else {
+      try {
+        result = await runReview(reviewConfig, prompt, { passes: args.passes });
+      } catch (err) {
+        log.error(`Review failed: ${err.message}`);
+        log.warn(`Recovery: ${recoveryLine}`);
+        process.exit(1);
+      }
+      if (args.verify && result.findings.length) {
+        log.step(`Verification pass: refuting ${result.findings.length} finding(s)...`);
+        try {
+          const verified = await verifyFindings(reviewConfig, context, result);
+          result = verified.result;
+          if (verified.dropped) log.info(`Verification dropped ${verified.dropped} finding(s).`);
+        } catch (err) {
+          log.warn(`Verification pass failed: ${err.message} — using unverified findings.`);
+        }
+      }
+      lastResult = result;
+      emitEvent(args.json, { type: "review", iteration: fixCount + 1, findingCount: result.findings.length });
+      const assessments = assessFindings(result, context, { apiMode: reviewConfig.provider !== "cli" });
+      assessments.forEach((a, i) => {
+        for (const note of a.notes) {
+          log.warn(`Finding "${result.findings[i].title}": ${note} — confidence halved for gating.`);
+        }
+      });
+      const derived = deriveVerdict(result, assessments, { failOn: args.failOn, minConfidence: args.minConfidence });
+      if (!args.json) console.log(renderReport(result, context, assessments, derived));
+      gatings = getGatingFindings(result, assessments, args);
+    }
+
+    // Clean → success; the fix commits stay on the branch.
+    if (gatings.length === 0) {
+      emitEvent(args.json, { type: "review_result", result, iteration: fixCount + 1 });
+      if (fixCount === 0) log.success("clean on first review — no fix iterations ran.");
+      else log.success(`Converged after ${fixCount} fix commit(s) — the branch is clean vs base.`);
+      finish("clean", 0, 0);
+    }
+
+    // No-progress → leave the fix commits, print the whole-loop recovery.
+    const matchedIdx = priorGatingSets.findIndex((prior) => gatingSetsEqual(gatings, prior));
+    if (matchedIdx !== -1) {
+      emitEvent(args.json, { type: "review_result", result, iteration: fixCount + 1 });
+      log.error(`No progress — gating findings unchanged from iteration ${matchedIdx + 1}.`);
+      log.warn(`Fix commit(s) left on '${branch}'. To undo all of them: ${recoveryLine}`);
+      finish("no-progress", 2, gatings.length);
+    }
+
+    // Ceiling → leave the fix commits, print recovery.
+    if (fixCount >= loopMax) {
+      emitEvent(args.json, { type: "review_result", result, iteration: fixCount + 1 });
+      log.error(`Loop ceiling reached (${loopMax} fix iterations). Unresolved gating findings remain.`);
+      log.warn(`Fix commit(s) left on '${branch}'. To undo all of them: ${recoveryLine}`);
+      finish("ceiling", 2, gatings.length);
+    }
+
+    // ── Fix step ──────────────────────────────────────────────────────────────
+    const beforeFixHead = gitRun(cwd, ["rev-parse", "HEAD"]);
+    const fixGatings = args.loopUnsafeAllowFixSecrets ? gatings : redactSecretsInFindings(gatings);
+    const fixFiles = getFixFiles(cwd, gatings, args);
+    const fixPrompt = buildFixPrompt(fixGatings, fixFiles);
+
+    log.step(`Fix ${fixCount + 1}/${loopMax}: running ${fixerCmd}...`);
+    if (fixFiles.length) log.substep(`Files targeted: ${fixFiles.join(", ")}`);
+
+    const { promise: fixerPromise, child: fixerChild } = spawnFixer(fixerCmd, fixPrompt, cwd, constraint, fixerTimeoutMs);
+    currentFixerChild = fixerChild;
+    const fixerResult = await fixerPromise;
+    currentFixerChild = null;
+
+    const dirtyAfter = gitRun(cwd, ["status", "--porcelain"], { allowFail: true });
+    emitEvent(args.json, { type: "fix", iteration: fixCount + 1, fixerCmd, filesTargeted: fixFiles });
+
+    // Fixer error/timeout → discard THIS round's partial work: reset to the pre-fix
+    // commit + clean fixer-created untracked files. Prior fix commits survive.
+    if (fixerResult.error || fixerResult.timedOut) {
+      if (dirtyAfter) {
+        log.warn("Fixer failed — discarding its partial changes (git reset --hard + git clean -fd)...");
+        try {
+          gitRun(cwd, ["reset", "--hard", beforeFixHead]);
+          gitRun(cwd, ["clean", "-fd"]);
+        } catch (err) {
+          log.error(`Rollback failed: ${err.message}. Manual recovery: ${recoveryLine}`);
+        }
+      }
+      if (fixerResult.timedOut) log.error(`Fixer timed out after ${fixerTimeoutMs / 1000}s.`);
+      else log.error(`Fixer exited with code ${fixerResult.code}.`);
+      if (fixerResult.stderr) log.error(`Fixer stderr:\n${fixerResult.stderr.trimEnd()}`);
+      emitEvent(args.json, { type: "review_result", result: lastResult, iteration: fixCount + 1 });
+      log.warn(`Earlier fix commit(s) (if any) left on '${branch}'. To undo all: ${recoveryLine}`);
+      finish(fixerResult.timedOut ? "fixer-timeout" : "fixer-error", 2, gatings.length);
+    }
+
+    // No-diff → the fixer changed nothing; nothing to commit.
+    if (!dirtyAfter) {
+      log.warn("Fixer made no changes to the working tree.");
+      emitEvent(args.json, { type: "review_result", result: lastResult, iteration: fixCount + 1 });
+      log.warn(`To undo all loop commits: ${recoveryLine}`);
+      finish("no-diff", 2, gatings.length);
+    }
+
+    // Commit the fix onto the FEATURE branch (never the base).
+    try {
+      gitRun(cwd, ["add", "-A"]);
+      // --no-gpg-sign: the loop makes many disposable per-round commits the user
+      // squash-merges; signing configs that need a passphrase/touch would hang or
+      // fail this non-interactive commit (independently flagged in P5 review).
+      gitRun(cwd, ["commit", "--no-gpg-sign", "-m", `fix: resolve adversarial-review findings (round ${fixCount + 1})`]);
+    } catch (err) {
+      log.error(`Failed to commit the fix: ${err.message}`);
+      try {
+        gitRun(cwd, ["reset", "--hard", beforeFixHead]);
+        gitRun(cwd, ["clean", "-fd"]);
+      } catch {}
+      process.exit(1);
+    }
+    const newHead = gitRun(cwd, ["rev-parse", "HEAD"]);
+    log.step(`Committed fix ${fixCount + 1}: ${newHead.slice(0, 7)}`);
+    emitEvent(args.json, { type: "fix_committed", iteration: fixCount + 1, commit: newHead, beforeFixHead });
+
     fixCount++;
     priorGatingSets.push(gatings);
   }

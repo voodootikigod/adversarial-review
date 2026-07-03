@@ -328,6 +328,37 @@ copy-pastable straight into an [ADLC](https://github.com/voodootikigod/adlc) P6
 adversarial-review --loop --json ... | jq -c 'select(.type=="loop_summary")'
 ```
 
+### Branch mode: pre-merge convergence (`--loop --scope branch`)
+
+By default `--loop` reviews and fixes the **working tree**. With `--scope branch`
+(or `--base <ref>`) it drives a **pre-merge convergence loop**: review the feature
+branch against its base, **commit each accepted fix onto the branch**, and
+re-review until clean — the loop ADR-0007's 18-round Cursor case study had to run
+by hand.
+
+```bash
+# Converge the current branch against main, committing fixes as it goes
+npx adversarial-review --loop --base main --loop-unsafe
+```
+
+**Git safety — this only ever touches your feature branch:**
+
+- The **base ref (e.g. `main`) is read-only** — resolved to a sha at loop start and
+  only ever diffed. Every write (`commit`, `reset --hard`, `clean`) targets the
+  feature branch's `HEAD`; the base is never a write target under any path.
+- A **clean working tree is required** at start: that guarantee is what makes the
+  loop's `git add -A` / `reset --hard` / `clean -fd` safe — any file appearing
+  mid-loop is fixer-created, so discarding it can never touch your own work.
+- **Rollback:** a failed/partial fix is `reset --hard` to the pre-fix commit; a
+  `no-progress`/`ceiling` exit **leaves** the fix commits and prints a
+  `git reset --hard <original-HEAD>` command to undo them all. **SIGINT never
+  auto-resets** — it prints the recovery command and exits.
+- Fix commits use `--no-gpg-sign` (disposable per-round commits you'll squash-merge;
+  a signing prompt would otherwise hang the non-interactive loop).
+- A **pushed** branch is warned (a reset will diverge it from its remote — a
+  force-push would be needed) but not refused. A **detached HEAD** is refused, and
+  an explicit `--scope working-tree` always wins over `--base`.
+
 ## Recording findings for later distillation (`--findings-ledger`)
 
 `--findings-ledger [path]` appends each **gating** finding as a JSONL line to an

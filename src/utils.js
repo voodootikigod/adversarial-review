@@ -72,7 +72,11 @@ ${colors.bold("Options:")}
 
 ${colors.bold("Loop mode (--loop):")}
   --loop                Review → fix → repeat until no gating findings remain.
-                        Only works with --scope working-tree (not branch/auto-branch).
+                        Working-tree scope edits the working tree; branch scope
+                        (--scope branch / --base <ref>) reviews the branch vs its
+                        base and commits each fix onto the FEATURE branch (base is
+                        never written; rollback is git reset --hard on the branch).
+                        Requires a clean working tree in branch mode.
                         Composes with --providers: each round is reviewed by every
                         requested provider and gated by the quorum verdict.
   --loop-max <n>        Max fix iterations (default 3). Runs N fixes + final review.
