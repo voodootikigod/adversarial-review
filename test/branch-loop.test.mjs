@@ -6,6 +6,7 @@ import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolveBranchBaseSha } from "../src/loop.js";
+import { makeGit } from "./helpers/git-retry.mjs";
 
 // T7 / GitHub #12 — branch-scope --loop. Reviews <branch> vs <base>, commits fixes
 // onto the FEATURE branch, resets --hard on a failed fix. The load-bearing safety
@@ -51,7 +52,7 @@ const ERR_FIXER = `#!/bin/sh\ncat >/dev/null\nprintf '\\n// partial\\n' >> code.
 
 function makeRepo(defaultBranch) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-bl-unit-"));
-  const git = (a) => spawnSync("git", a, { cwd: dir, encoding: "utf8" });
+  const git = makeGit(dir);
   git(["init", "-q", "-b", defaultBranch]);
   git(["config", "user.email", "t@example.com"]);
   git(["config", "user.name", "Test"]);
@@ -99,7 +100,7 @@ test("resolveBranchBaseSha: with no base, auto-resolves to develop when main is 
 function runBranchLoopCli(args, { mocks = {}, dirty = false, fixer = "myfixer", detach = false } = {}) {
   const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-bl-mocks-"));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-bl-repo-"));
-  const git = (a) => spawnSync("git", a, { cwd: repoDir, encoding: "utf8" });
+  const git = makeGit(repoDir);
   try {
     for (const [name, body] of Object.entries(mocks)) {
       const binName = process.platform === "win32" ? `${name}.cmd` : name;
