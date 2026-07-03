@@ -173,3 +173,35 @@ test("parseArgs --findings-ledger: optional value with default path", () => {
   assert.equal(a.findingsLedger, "p.jsonl");
   assert.equal(a.json, true, "the flag after an explicit ledger value must still be parsed");
 });
+
+// ── T6 / #10: --input artifact review mode ────────────────────────────────────
+
+test("parseArgs --input accumulates repeatable + comma-separated files", () => {
+  const a = parseArgs(["node", "cli", "--input", "a.md", "--input", "b.md,c.md"]);
+  assert.deepEqual(a.input, ["a.md", "b.md", "c.md"]);
+  assert.deepEqual(a.errors, []);
+});
+
+test("parseArgs --input= form and empty value handling", () => {
+  const a = parseArgs(["node", "cli", "--input=spec.md"]);
+  assert.deepEqual(a.input, ["spec.md"]);
+  const b = parseArgs(["node", "cli", "--input="]);
+  assert.ok(b.errors.some((e) => /--input/.test(e)), "empty --input= errors");
+});
+
+test("parseArgs rejects --input combined with a diff target or --loop", () => {
+  const base = parseArgs(["node", "cli", "--input", "s.md", "--base", "main"]);
+  assert.ok(base.errors.some((e) => /--input/.test(e)), "--input + --base errors");
+  const branch = parseArgs(["node", "cli", "--input", "s.md", "--scope", "branch"]);
+  assert.ok(branch.errors.some((e) => /--input/.test(e)), "--input + --scope branch errors");
+  const wt = parseArgs(["node", "cli", "--input", "s.md", "--scope", "working-tree"]);
+  assert.ok(wt.errors.some((e) => /--input/.test(e)), "--input + --scope working-tree errors");
+  const loop = parseArgs(["node", "cli", "--input", "s.md", "--loop"]);
+  assert.ok(loop.errors.some((e) => /--input/.test(e)), "--input + --loop errors");
+});
+
+test("parseArgs --input alone (scope defaults to auto) does not error", () => {
+  const a = parseArgs(["node", "cli", "--input", "spec.md"]);
+  assert.deepEqual(a.errors, []);
+  assert.equal(a.scope, "auto");
+});

@@ -2,11 +2,13 @@
 
 import { parseArgs, log, HELP_TEXT } from "../src/utils.js";
 import { collectReviewContext } from "../src/git-context.js";
+import { collectArtifactContext } from "../src/artifact-context.js";
 import { configureLLM, selectProviders, underSatisfiedNotice } from "../src/llm.js";
 import { scanForSecrets } from "../src/secrets.js";
 import { toLedgerEntries, appendLedger } from "../src/findings-ledger.js";
 import {
   buildPrompt,
+  buildArtifactPrompt,
   runReview,
   runMultiProviderReview,
   resolveReachableProviders,
@@ -210,25 +212,31 @@ async function main() {
     log.warn("--base is ignored when --scope working-tree is set; reviewing the working tree.");
   }
 
-  // 1. Collect git context. Collection failures exit 1 — a gate must never
-  // approve because it silently failed to gather the change.
+  // 1. Collect the review context. --input reviews artifact files (specs,
+  // tickets, rail-sets); otherwise collect the git diff/branch. Collection
+  // failures exit 1 — a gate must never approve because it silently failed to
+  // gather the target.
   let context;
   try {
-    context = collectReviewContext(process.cwd(), {
-      scope: args.scope,
-      base: args.base,
-      maxFiles: args.maxFiles,
-      maxBytes: args.maxBytes,
-      contextLines: args.contextLines,
-      includeFiles: args.includeFiles
-    });
+    context = args.input
+      ? collectArtifactContext(process.cwd(), args.input, { maxBytes: args.maxBytes })
+      : collectReviewContext(process.cwd(), {
+          scope: args.scope,
+          base: args.base,
+          maxFiles: args.maxFiles,
+          maxBytes: args.maxBytes,
+          contextLines: args.contextLines,
+          includeFiles: args.includeFiles
+        });
   } catch (err) {
     log.error(err.message);
     process.exit(1);
   }
 
-  // 2. Build the prompt.
-  const prompt = buildPrompt(context, args.focus);
+  // 2. Build the prompt — artifact charter for --input, diff charter otherwise.
+  const prompt = args.input
+    ? buildArtifactPrompt(context, args.focus)
+    : buildPrompt(context, args.focus);
 
   if (context.isEmpty) {
     // --prompt-only prints the template even on an empty scope so callers can

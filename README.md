@@ -23,9 +23,10 @@ drops straight into CI and pre-push hooks — and it **fails closed**: a git col
 failure exits `1`, never a silent approve.
 
 Beyond a single pass it can fan the same review out across **multiple independent provider
-families** and gate on a quorum ([`--providers`](#multi-provider-review---providers)), and
-run an autonomous **review → fix → re-review** convergence loop
-([`--loop`](#loop-mode---loop)).
+families** and gate on a quorum ([`--providers`](#multi-provider-review---providers)), run an
+autonomous **review → fix → re-review** convergence loop ([`--loop`](#loop-mode---loop)), and
+review **artifacts** — specs, tickets, rail-sets — instead of a diff
+([`--input`](#reviewing-artifacts-not-diffs---input)).
 
 > The review prompt (`prompt-template.md`) and output schema (`schema.json`) are derived
 > from the OpenAI Codex `adversarial-review` skill (Copyright 2026 OpenAI). They have been
@@ -145,6 +146,9 @@ Next steps
 # Review target & output
 --base <ref>           Review the current branch against <ref> (merge-base...HEAD).
 --scope <mode>         auto (default) | working-tree | branch.
+--input <file(s)>      Review artifact files (specs, tickets, rail-sets) instead of
+                       a git diff. Repeatable + comma-separated. Cannot combine with
+                       --base, --scope working-tree|branch, or --loop. See below.
 --prompt-only          Print the assembled prompt to stdout and exit (no LLM call).
 --json                 Print the raw JSON result instead of a rendered report.
 
@@ -332,6 +336,40 @@ adversarial-review --loop --json ... | jq -c 'select(.type=="loop_summary")'
 permanent, deterministic defenses. A ledger write failure only warns — the verdict and
 exit code are the product, the ledger is a side effect.
 
+## Reviewing artifacts, not diffs (`--input`)
+
+Adversarial review isn't only for code. `--input <file(s)>` reviews arbitrary
+**artifacts** — a spec, a ticket, a design doc, a declared set of rails/invariants
+— with the same schema, grounding, `--verify`, `--providers`/`--quorum`,
+`--passes`, `--findings-ledger`, `--json`, and `--prompt-only` machinery. Only the
+review target and the charter change: instead of "find the strongest reasons this
+diff shouldn't ship", the model hunts for ambiguity, missing or untestable
+acceptance criteria, unhandled failure modes, unaddressed trust-boundary/security
+concerns, internal contradictions, and unenforceable invariants.
+
+```bash
+# Review a spec before anyone writes code
+npx adversarial-review --input docs/spec.md
+
+# Review a ticket + its rail-set together, with two provider families
+npx adversarial-review --input ticket.md,rails.md --providers claude,gpt
+
+# Emit the artifact-review prompt to feed a model yourself (no LLM call)
+npx adversarial-review --input spec.md --prompt-only
+```
+
+This makes design/spec review (and rail-set adequacy review) a first-class,
+schema-validated, recordable gate rather than an informal one-shot prompt.
+
+- **Fail-closed.** `--input` reviews exactly the files you name — there is no
+  summary fallback and no silent skip. A missing, binary, or oversized file, or an
+  artifact with no reviewable text, is an **error (exit 1)**, never a review that
+  "approves" having read nothing.
+- **Per-file size cap.** In this mode `--max-bytes` is the **per-file** cap (raise
+  it to review a larger single artifact); there is no aggregate budget.
+- **Mutually exclusive** with the git-diff targets (`--base`, `--scope
+  working-tree|branch`) and with `--loop` (an artifact has no working tree to fix).
+
 ## How it decides what to send
 
 - **Small change** (≤ `--max-files` files **and** ≤ `--max-bytes` diff bytes): the **full
@@ -372,6 +410,7 @@ review payload as leaving your machine.
 |--------------------------|----------------------------------------------------------------|
 | `bin/cli.js`             | CLI entry point: secret gate, grounding, deterministic verdict. |
 | `src/git-context.js`     | Collects git status + diffs (fail-closed), inline/summary rule. |
+| `src/artifact-context.js`| Collects `--input` artifact files (fail-closed) for artifact review. |
 | `src/review.js`          | Prompt build, run/verify/multi-pass, multi-provider merge, quorum verdict, rendering. |
 | `src/loop.js`            | `--loop` orchestration: fixer spawn, stash checkpoints, NDJSON events. |
 | `src/llm.js`             | Provider config + structured-output call wrapper (API and CLI). |
@@ -379,7 +418,8 @@ review payload as leaving your machine.
 | `src/secrets.js`         | Outbound payload secret scan.                                  |
 | `src/findings-ledger.js` | Appends gating findings to the ADLC findings ledger (`--findings-ledger`). |
 | `src/utils.js`           | Arg parsing, logging, help text.                               |
-| `prompt-template.md`     | The review prompt (4 placeholders).                            |
+| `prompt-template.md`     | The diff-review prompt (4 placeholders).                       |
+| `prompt-template-artifact.md` | The `--input` artifact-review prompt (same placeholders/schema). |
 | `schema.json`            | JSON Schema the model output must conform to.                  |
 
 `prompt-template.md` and `schema.json` are plain assets — edit them to tune the review or
