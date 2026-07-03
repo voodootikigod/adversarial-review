@@ -19,9 +19,9 @@ export function loadSchema() {
   return JSON.parse(loadAsset("schema.json"));
 }
 
-// Fill the template placeholders with the collected context.
-export function buildPrompt(context, focus) {
-  const template = loadAsset("prompt-template.md");
+// Fill a review template's {{PLACEHOLDER}} slots from the collected context.
+function fillTemplate(templateName, context, focus) {
+  const template = loadAsset(templateName);
   const vars = {
     TARGET_LABEL: context.label,
     USER_FOCUS: focus && focus.trim() ? focus.trim() : "No extra focus provided.",
@@ -31,6 +31,17 @@ export function buildPrompt(context, focus) {
   return template.replace(/\{\{(\w+)\}\}/g, (match, key) =>
     key in vars ? vars[key] : match
   );
+}
+
+// Fill the diff-review template with the collected git context.
+export function buildPrompt(context, focus) {
+  return fillTemplate("prompt-template.md", context, focus);
+}
+
+// Fill the artifact-review template (specs/tickets/rail-sets) — same placeholders
+// and output schema as buildPrompt, but an artifact-appropriate charter (T6/#10).
+export function buildArtifactPrompt(context, focus) {
+  return fillTemplate("prompt-template-artifact.md", context, focus);
 }
 
 // Validate against schema.json (the single source of truth for the output

@@ -30,6 +30,12 @@ ${colors.bold("Examples:")}
 ${colors.bold("Options:")}
   --base <ref>          Review the current branch against <ref> (merge-base...HEAD).
   --scope <mode>        auto (default) | working-tree | branch.
+  --input <file(s)>     Review artifact files (specs, tickets, rail-sets) instead of
+                        a git diff — same schema/grounding/--verify/--providers.
+                        Repeatable and comma-separated. Cannot combine with --base,
+                        --scope working-tree|branch, or --loop. Each file must be
+                        text within --max-bytes (a per-file cap in this mode);
+                        missing/binary/oversize inputs error (never a silent skip).
   --prompt-only         Print the assembled prompt to stdout and exit (no LLM call).
   --json                Print the raw JSON result instead of a rendered report.
   --max-files <n>       Inline-diff cutoff by changed-file count (default 50).
@@ -109,6 +115,7 @@ export function parseArgs(argv) {
   const args = {
     base: null,
     scope: "auto",
+    input: null,
     promptOnly: false,
     json: false,
     maxFiles: 50,
@@ -172,6 +179,17 @@ export function parseArgs(argv) {
       return null;
     }
     return list;
+  }
+
+  // --input is repeatable and comma-splittable; entries accumulate into an array.
+  function addInputFiles(option, value) {
+    if (value === null) return;
+    const list = value.split(",").map((s) => s.trim()).filter(Boolean);
+    if (list.length === 0) {
+      args.errors.push(`${option} requires a file path.`);
+      return;
+    }
+    args.input = [...(args.input || []), ...list];
   }
 
   function parseNonNegativeInteger(option, value) {
@@ -296,6 +314,12 @@ export function parseArgs(argv) {
       i = result.nextIndex;
     } else if (arg.startsWith("--scope=")) {
       args.scope = readEqualsValue("--scope", arg);
+    } else if (arg === "--input") {
+      const result = readValue("--input", i);
+      addInputFiles("--input", result.value);
+      i = result.nextIndex;
+    } else if (arg.startsWith("--input=")) {
+      addInputFiles("--input", readEqualsValue("--input", arg));
     } else if (arg === "--max-files") {
       const result = readValue("--max-files", i);
       args.maxFiles = parseNonNegativeInteger("--max-files", result.value);
@@ -389,6 +413,20 @@ export function parseArgs(argv) {
 
   if (args.providers && args.provider) {
     args.errors.push("--providers cannot be combined with --provider; use one or the other.");
+  }
+  // --input is a distinct review target (an artifact, not a git diff); it is
+  // mutually exclusive with the git-diff target selectors. --scope auto (the
+  // default) is fine — only an explicit diff scope conflicts.
+  if (args.input) {
+    if (args.base) {
+      args.errors.push("--input cannot be combined with --base; --input reviews an artifact, not a git range.");
+    }
+    if (args.scope === "working-tree" || args.scope === "branch") {
+      args.errors.push(`--input cannot be combined with --scope ${args.scope}; --input reviews an artifact, not a git diff.`);
+    }
+    if (args.loop) {
+      args.errors.push("--input cannot be combined with --loop; loop mode fixes working-tree changes, and an artifact has no working tree to fix.");
+    }
   }
   if (args.providers && args.model) {
     args.errors.push("--model cannot be combined with --providers; model names are provider-specific and would be applied to every family. Each provider uses its own default model.");
