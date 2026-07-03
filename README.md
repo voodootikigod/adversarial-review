@@ -22,6 +22,11 @@ each finding against the actual change set, and prints a report. The exit code i
 drops straight into CI and pre-push hooks — and it **fails closed**: a git collection
 failure exits `1`, never a silent approve.
 
+Beyond a single pass it can fan the same review out across **multiple independent provider
+families** and gate on a quorum ([`--providers`](#multi-provider-review---providers)), and
+run an autonomous **review → fix → re-review** convergence loop
+([`--loop`](#loop-mode---loop)).
+
 > The review prompt (`prompt-template.md`) and output schema (`schema.json`) are derived
 > from the OpenAI Codex `adversarial-review` skill (Copyright 2026 OpenAI). They have been
 > generalized, extended, and stripped of the Codex-specific runtime so the tool works with
@@ -87,6 +92,13 @@ npx adversarial-review --prompt-only > prompt.txt
 
 # Machine-readable output for CI
 npx adversarial-review --base main --json
+
+# Diverse review: fan the same prompt out to two distinct provider families and
+# gate on a quorum (diversity, not count — see "Multi-provider review")
+npx adversarial-review --providers claude,gpt --quorum 1
+
+# Autonomous convergence: review → fix → re-review until clean (working tree)
+npx adversarial-review --loop --loop-unsafe
 ```
 
 ### Example output
@@ -130,28 +142,59 @@ Next steps
 ### Options
 
 ```
+# Review target & output
 --base <ref>           Review the current branch against <ref> (merge-base...HEAD).
 --scope <mode>         auto (default) | working-tree | branch.
 --prompt-only          Print the assembled prompt to stdout and exit (no LLM call).
 --json                 Print the raw JSON result instead of a rendered report.
+
+# What gets sent
 --max-files <n>        Inline-diff cutoff by changed-file count (default 50).
 --max-bytes <n>        Inline-diff cutoff by diff size in bytes (default 262144).
 --context-lines <n>    Diff context lines passed to git diff -U<n> (default 10).
 --include-files        Also inline full post-change file contents (budgeted).
 --allow-summary-review Allow API providers to review summary-only large diffs.
+--allow-secrets        Send the payload even if the secret scan finds likely
+                       credentials in the diff (off by default).
+
+# Gate
 --fail-on <severity>   Gate threshold: critical | high | medium (default) | low.
 --min-confidence <x>   Findings below this confidence don't gate (default 0.5).
 --fail-on-empty        Exit 1 (instead of 0) when there is nothing to review.
+
+# Recall / precision
 --verify               Refute-pass: drop findings that can't be defended.
 --passes <n>           Run the review n times and merge findings (default 1).
---allow-secrets        Send the payload even if the secret scan finds likely
-                       credentials in the diff (off by default).
---timeout <seconds>    Per-request API timeout (default 120).
+--providers <list>     Multi-provider mode: fan the same review out to each family
+                       token (e.g. gpt,gemini,claude) and merge with cross-provider
+                       corroboration. "auto" picks >=2 distinct families. Diversity,
+                       not count — distinct from --passes. Cannot combine with --provider.
+--quorum <n>           needs-attention when >= n providers each flag a material
+                       finding (default 1).
+
+# Provider
 --provider <name>      anthropic | openai | gemini | cursor | <local-cli-cmd>.
 --model <name>         Force the model name.
 --api-base <url>       Override the active provider's API base URL.
 --api-key <key>        Override the active provider's API key.
 --headers <json>       Inject custom JSON headers into the LLM request.
+--timeout <seconds>    Per-request API timeout (default 120).
+
+# Reporting
+--findings-ledger [path]
+                       Append gating findings as JSONL to the ADLC findings ledger
+                       (default .adlc/findings.jsonl) for P7 distillation.
+
+# Loop mode (review → fix → repeat; see "Loop mode" below)
+--loop                 Iterate review → fix → re-review until no gating findings
+                       remain. Working-tree scope only. Composes with --providers.
+--loop-max <n>         Max fix iterations (default 3): N fixes + a final review.
+--loop-fixer <cmd>     Override the fixer CLI (default: auto-detect codex→claude→agy).
+--loop-fixer-scope     sc2 (default): only finding-cited files. unrestricted: all files.
+--loop-fixer-file-cap  Max files listed in unrestricted mode (default 100).
+--loop-unsafe          Required on macOS (no write sandbox); on Linux skips the probe.
+--loop-unsafe-allow-fix-secrets
+                       Bypass the secret scan on the fix prompt (same-provider checked).
 ```
 
 ### Exit codes
@@ -206,6 +249,89 @@ deliberately, not accidentally.
 No key and no CLI agent? Use `--prompt-only` to emit the prompt and feed it to a model
 yourself.
 
+## Multi-provider review (`--providers`)
+
+`--passes` samples **one** model N times; `--providers` fans the **same** review out to
+several **independent** providers and merges the results. The value is **diversity, not
+count** — a second model from a different family catches failure modes the first is blind
+to.
+
+```bash
+# Two distinct families, quorum 1 (any one provider's material finding gates)
+npx adversarial-review --providers claude,gpt
+
+# Let the tool pick >=2 distinct families for you (never the builder's own family)
+npx adversarial-review --providers auto --quorum 2
+```
+
+- **Family tokens** (`gpt`, `claude`, `gemini`, `openai`, `anthropic`, …) each resolve to
+  the best reachable provider — the API when its key is present, otherwise the local CLI.
+- **Merge + corroboration.** Findings are merged by `(file, category, overlapping lines)`;
+  a finding raised by more than one provider is kept as one entry tagged with
+  `corroborated_by`. Distinct findings at the same location are **preserved**, never
+  collapsed.
+- **Quorum verdict.** The result is `needs-attention` when the number of providers that
+  each raised a gating finding is ≥ `--quorum` (default `1`); `approve` only when that
+  count is `0`.
+- **No silent downgrade.** If fewer providers are reachable than requested, the run emits a
+  loud under-satisfaction notice and proceeds with what is available.
+- `--providers` cannot be combined with `--provider` (or `--model`).
+
+## Loop mode (`--loop`)
+
+`--loop` runs an autonomous **review → fix → re-review** cycle until no gating finding
+remains (or a stop condition is hit). Each round reviews the working tree, hands the gating
+findings to a **fixer CLI** that edits the files, then re-reviews. It composes with
+`--providers` (each round is gated by the quorum verdict).
+
+```bash
+# Iterate until clean, capped at 3 fix rounds
+npx adversarial-review --loop --loop-unsafe --loop-max 3
+```
+
+- **Working-tree scope only.** The fixer writes to the working tree, so `--loop` is
+  incompatible with `--scope branch` / `--base`. (Branch-scoped convergence is not yet
+  supported.)
+- **Fixer.** Auto-detected in order `codex → claude → agy`; override with `--loop-fixer`.
+- **Write sandbox.** macOS has no enforced sandbox, so `--loop-unsafe` is required to
+  acknowledge the fixer has unrestricted write access; on Linux the loop uses a
+  mount-namespace sandbox (`unshare`) when available, and otherwise requires `--loop-unsafe`.
+- **Checkpoints.** The working tree is stashed before each fix; on a fixer error or
+  timeout the checkpoint is restored, and the recovery command is always printed.
+- **Stop conditions** (exit `2`): `no-progress` (the gating set repeats), `ceiling`
+  (`--loop-max` reached), `no-diff` (the fixer changed nothing), or `fixer-error` /
+  `fixer-timeout`. A `clean` exit is `0`.
+
+### Machine-readable loop output (`--json`)
+
+With `--json`, the loop emits NDJSON events (`loop_start`, `review`, `review_result`,
+`stash_created`, `fix`, `loop_end`). The **terminal line** is a single consolidated
+`loop_summary` event carrying everything a run's evidence record needs:
+
+```json
+{ "type": "loop_summary", "providers": ["claude", "gpt"], "iterations": 2,
+  "verdict": "needs-attention", "exitReason": "ceiling",
+  "survivingCount": 3, "acceptedCount": 0 }
+```
+
+`verdict` is derived from `exitReason` (`clean` ⇒ `approve`); `survivingCount` is the
+gating findings still unresolved at exit; `acceptedCount` is always `0` (accepting a
+finding "with documented justification" is a human decision the loop leaves to you). It is
+copy-pastable straight into an [ADLC](https://github.com/voodootikigod/adlc) P6
+`gate-manifest` evidence entry:
+
+```bash
+adversarial-review --loop --json ... | jq -c 'select(.type=="loop_summary")'
+```
+
+## Recording findings for later distillation (`--findings-ledger`)
+
+`--findings-ledger [path]` appends each **gating** finding as a JSONL line to an
+[ADLC](https://github.com/voodootikigod/adlc) findings ledger (default
+`.adlc/findings.jsonl`), so repeated review findings can later be distilled (P7) into
+permanent, deterministic defenses. A ledger write failure only warns — the verdict and
+exit code are the product, the ledger is a side effect.
+
 ## How it decides what to send
 
 - **Small change** (≤ `--max-files` files **and** ≤ `--max-bytes` diff bytes): the **full
@@ -246,10 +372,12 @@ review payload as leaving your machine.
 |--------------------------|----------------------------------------------------------------|
 | `bin/cli.js`             | CLI entry point: secret gate, grounding, deterministic verdict. |
 | `src/git-context.js`     | Collects git status + diffs (fail-closed), inline/summary rule. |
-| `src/review.js`          | Prompt build, run/verify/multi-pass, validation, rendering.    |
+| `src/review.js`          | Prompt build, run/verify/multi-pass, multi-provider merge, quorum verdict, rendering. |
+| `src/loop.js`            | `--loop` orchestration: fixer spawn, stash checkpoints, NDJSON events. |
 | `src/llm.js`             | Provider config + structured-output call wrapper (API and CLI). |
 | `src/schema-validate.js` | Minimal JSON Schema walker + provider schema sanitizer.        |
 | `src/secrets.js`         | Outbound payload secret scan.                                  |
+| `src/findings-ledger.js` | Appends gating findings to the ADLC findings ledger (`--findings-ledger`). |
 | `src/utils.js`           | Arg parsing, logging, help text.                               |
 | `prompt-template.md`     | The review prompt (4 placeholders).                            |
 | `schema.json`            | JSON Schema the model output must conform to.                  |
