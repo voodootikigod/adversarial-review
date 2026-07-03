@@ -67,6 +67,8 @@ ${colors.bold("Options:")}
 ${colors.bold("Loop mode (--loop):")}
   --loop                Review → fix → repeat until no gating findings remain.
                         Only works with --scope working-tree (not branch/auto-branch).
+                        Composes with --providers: each round is reviewed by every
+                        requested provider and gated by the quorum verdict.
   --loop-max <n>        Max fix iterations (default 3). Runs N fixes + final review.
   --loop-fixer <cmd>    Override fixer CLI (default: auto-detect codex→claude→agy).
   --loop-fixer-scope    sc2 (default): only finding-cited files. unrestricted: all repo files.

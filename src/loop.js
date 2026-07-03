@@ -5,13 +5,16 @@ import { collectReviewContext } from "./git-context.js";
 import {
   buildPrompt,
   runReview,
+  runMultiProviderReview,
+  mergeProviderResults,
+  deriveQuorumVerdict,
   verifyFindings,
   assessFindings,
   deriveVerdict,
   renderReport,
   SEVERITY_RANK
 } from "./review.js";
-import { configureLLM, isCmdInstalled } from "./llm.js";
+import { configureLLM, isCmdInstalled, selectProviders, underSatisfiedNotice } from "./llm.js";
 
 // ─── Git helpers ──────────────────────────────────────────────────────────────
 
@@ -389,6 +392,70 @@ function diffedFiles(before, after) {
     .filter(Boolean);
 }
 
+// ─── Multi-provider review round (--loop --providers) ──────────────────────────
+
+// Run one review round across every reachable provider, then merge and derive a
+// quorum-aware verdict — the loop-mode counterpart of bin/cli.js's runMultiProvider.
+// Reuses the same review.js primitives (runMultiProviderReview, mergeProviderResults,
+// deriveQuorumVerdict) so the loop and non-loop gates share one quorum semantics.
+// Returns { result, assessments, derived, perProvider }. Throws when no provider
+// produced a review, so the caller aborts rather than approving on silence.
+export async function runProviderRound(providers, context, prompt, args, reviewFn = runReview) {
+  const { perProvider, failures } = await runMultiProviderReview(
+    providers, prompt, { passes: args.passes }, reviewFn
+  );
+  for (const f of failures) {
+    log.warn(`Provider ${f.provider} failed and was skipped: ${f.error}`);
+  }
+  if (!perProvider.length) {
+    throw new Error("All selected providers failed to produce a review; cannot derive a verdict.");
+  }
+
+  const byId = new Map(providers.map((p) => [p.id, p.config]));
+
+  if (args.verify) {
+    for (const pp of perProvider) {
+      if (pp.result.findings.length) {
+        log.step(`Verification pass (${pp.provider}): refuting ${pp.result.findings.length} finding(s)...`);
+        try {
+          const verified = await verifyFindings(byId.get(pp.provider), context, pp.result);
+          pp.result = verified.result;
+        } catch (err) {
+          log.warn(`Verification for ${pp.provider} failed; keeping unverified findings: ${err.message}`);
+        }
+      }
+    }
+  }
+
+  for (const pp of perProvider) {
+    const cfg = byId.get(pp.provider);
+    pp.assessments = assessFindings(pp.result, context, { apiMode: cfg.provider !== "cli" });
+  }
+
+  const merged = mergeProviderResults(perProvider, {
+    failOn: args.failOn,
+    minConfidence: args.minConfidence
+  });
+  const mergedAssessments = assessFindings(merged, context, {
+    apiMode: perProvider.some((pp) => byId.get(pp.provider).provider !== "cli")
+  });
+  const derived = deriveQuorumVerdict(perProvider, {
+    failOn: args.failOn,
+    minConfidence: args.minConfidence,
+    quorum: args.quorum
+  });
+  // The exit gate is the quorum verdict; keep the merged report's verdict/summary
+  // in lockstep so a single provider's prose can never contradict the derived gate.
+  merged.verdict = derived.verdict;
+  merged.summary =
+    derived.verdict === "needs-attention"
+      ? `${derived.flaggingCount} of ${perProvider.length} provider(s) raised gating findings ` +
+        `(effective quorum ${derived.effectiveQuorum}). See findings below.`
+      : `No provider's findings met the gate across ${perProvider.length} provider(s); approving.`;
+
+  return { result: merged, assessments: mergedAssessments, derived, perProvider };
+}
+
 // ─── Main loop ────────────────────────────────────────────────────────────────
 
 export async function runLoop(cwd, args) {
@@ -427,17 +494,60 @@ export async function runLoop(cwd, args) {
     process.exit(1);
   }
 
-  // Configure reviewer LLM
-  let reviewConfig;
-  try {
-    reviewConfig = configureLLM(args);
-  } catch (err) {
-    log.error(err.message);
-    process.exit(1);
+  // Configure reviewer(s). Multi-provider (--providers) resolves a diverse set;
+  // single-provider resolves one config. In --providers mode we do NOT also run
+  // the single-provider auto-detect (it can fail — e.g. no default provider — even
+  // when the requested set is reachable, which would abort a valid multi-provider
+  // loop).
+  let reviewConfig = null;
+  let providerSet = null;
+  if (args.providers) {
+    let sel;
+    try {
+      sel = selectProviders(args);
+    } catch (err) {
+      log.error(err.message);
+      process.exit(1);
+    }
+    if (!sel.providers.length) {
+      log.error(
+        "None of the requested providers are reachable (no API key and no installed CLI).\n" +
+          "Set an API key, install a local CLI agent (claude/codex/agy), or use --provider for single-provider review."
+      );
+      process.exit(1);
+    }
+    providerSet = sel;
+    // AC3 / "no silent downgrade": if fewer families are reachable than requested,
+    // say so loudly and proceed with what is available — never masquerade a reduced
+    // set as the full diversity that was asked for.
+    const notice = underSatisfiedNotice(sel);
+    if (notice) log.warn(notice);
+    log.info(
+      `Multi-provider loop: ${sel.providers.map((p) => `${p.id}[${p.family}]`).join(", ")} (quorum ${args.quorum})`
+    );
+  } else {
+    try {
+      reviewConfig = configureLLM(args);
+    } catch (err) {
+      log.error(err.message);
+      process.exit(1);
+    }
   }
 
-  // Validate --loop-unsafe-allow-fix-secrets provider match for known fixers
+  // Validate --loop-unsafe-allow-fix-secrets provider match for known fixers.
   if (args.loopUnsafeAllowFixSecrets) {
+    if (providerSet) {
+      // The fix prompt carries the MERGED findings from every reviewer; bypassing
+      // redaction could send one provider's finding text to a fixer from a different
+      // provider. Rather than reason about which families overlap, refuse the bypass
+      // in multi-provider mode (redaction still runs — the loop is not blocked).
+      log.error(
+        "--loop-unsafe-allow-fix-secrets is not supported with --providers: merged findings can " +
+          "originate from a provider other than the fixer. Drop the flag to run with redaction, " +
+          "or use single-provider --loop."
+      );
+      process.exit(1);
+    }
     const fixerProvider = FIXER_PROVIDER_MAP[fixerCmd];
     if (!fixerProvider) {
       log.warn(
@@ -549,47 +659,82 @@ export async function runLoop(cwd, args) {
       process.exit(1);
     }
 
-    // Run review
+    // Run review: single-provider, or a multi-provider fan-out + quorum when
+    // --providers is set. Both paths produce `result` (the report/ledger payload)
+    // and `gatings` (the findings the fixer must resolve this round).
     const prompt = buildPrompt(context, args.focus);
-    let result;
-    try {
-      result = await runReview(reviewConfig, prompt, { passes: args.passes });
-    } catch (err) {
-      log.error(`Review failed: ${err.message}`);
-      if (stashRef) log.warn(buildRecoveryCmd(stashName));
-      process.exit(1);
-    }
-
-    // Verification pass
-    if (args.verify && result.findings.length) {
-      log.step(`Verification pass: refuting ${result.findings.length} finding(s)...`);
+    let result, gatings;
+    if (providerSet) {
+      let round;
       try {
-        const verified = await verifyFindings(reviewConfig, context, result);
-        result = verified.result;
-        if (verified.dropped) log.info(`Verification dropped ${verified.dropped} finding(s).`);
+        round = await runProviderRound(providerSet.providers, context, prompt, args);
       } catch (err) {
-        log.warn(`Verification pass failed: ${err.message} — using unverified findings.`);
+        log.error(`Review failed: ${err.message}`);
+        if (stashRef) log.warn(buildRecoveryCmd(stashName));
+        process.exit(1);
       }
+      result = round.result;
+      lastResult = result;
+      emitEvent(args.json, { type: "review", iteration: fixCount + 1, findingCount: result.findings.length });
+
+      // Grounding notes go to stderr so they surface under --json too.
+      round.assessments.forEach((a, i) => {
+        for (const note of a.notes) {
+          log.warn(`Finding "${result.findings[i].title}": ${note} (grounding note — verify before relying on it).`);
+        }
+      });
+      log.info(
+        `Quorum verdict: ${round.derived.flaggingCount}/${round.perProvider.length} provider(s) flagged ` +
+          `(effective quorum ${round.derived.effectiveQuorum} of requested ${round.derived.quorum}) → ${round.derived.verdict}`
+      );
+      if (!args.json) console.log(renderReport(result, context, round.assessments, round.derived));
+
+      // The quorum verdict is the gate. Only when it gates do we hand findings to
+      // the fixer; when quorum is not met (approve) the round is clean even if a
+      // lone provider flagged — matching non-loop --providers quorum semantics.
+      gatings = round.derived.verdict === "needs-attention"
+        ? getGatingFindings(result, round.assessments, args)
+        : [];
+    } else {
+      try {
+        result = await runReview(reviewConfig, prompt, { passes: args.passes });
+      } catch (err) {
+        log.error(`Review failed: ${err.message}`);
+        if (stashRef) log.warn(buildRecoveryCmd(stashName));
+        process.exit(1);
+      }
+
+      // Verification pass
+      if (args.verify && result.findings.length) {
+        log.step(`Verification pass: refuting ${result.findings.length} finding(s)...`);
+        try {
+          const verified = await verifyFindings(reviewConfig, context, result);
+          result = verified.result;
+          if (verified.dropped) log.info(`Verification dropped ${verified.dropped} finding(s).`);
+        } catch (err) {
+          log.warn(`Verification pass failed: ${err.message} — using unverified findings.`);
+        }
+      }
+
+      lastResult = result;
+      emitEvent(args.json, { type: "review", iteration: fixCount + 1, findingCount: result.findings.length });
+
+      const assessments = assessFindings(result, context, { apiMode: reviewConfig.provider !== "cli" });
+      assessments.forEach((a, i) => {
+        for (const note of a.notes) {
+          log.warn(`Finding "${result.findings[i].title}": ${note} — confidence halved for gating.`);
+        }
+      });
+
+      const derived = deriveVerdict(result, assessments, {
+        failOn: args.failOn,
+        minConfidence: args.minConfidence
+      });
+
+      if (!args.json) console.log(renderReport(result, context, assessments, derived));
+
+      gatings = getGatingFindings(result, assessments, args);
     }
-
-    lastResult = result;
-    emitEvent(args.json, { type: "review", iteration: fixCount + 1, findingCount: result.findings.length });
-
-    const assessments = assessFindings(result, context, { apiMode: reviewConfig.provider !== "cli" });
-    assessments.forEach((a, i) => {
-      for (const note of a.notes) {
-        log.warn(`Finding "${result.findings[i].title}": ${note} — confidence halved for gating.`);
-      }
-    });
-
-    const derived = deriveVerdict(result, assessments, {
-      failOn: args.failOn,
-      minConfidence: args.minConfidence
-    });
-
-    if (!args.json) console.log(renderReport(result, context, assessments, derived));
-
-    const gatings = getGatingFindings(result, assessments, args);
 
     // ── Condition 1: Clean ──────────────────────────────────────────────────
     if (gatings.length === 0) {
