@@ -6,6 +6,7 @@ import os from "node:os";
 import net from "node:net";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { makeGit } from "./helpers/git-retry.mjs";
 
 // End-to-end rails for the --loop + --providers capability (T-ar9).
 //
@@ -75,7 +76,7 @@ function runLoopCli(args, { mocks = {}, env = {}, fileContents } = {}) {
         fs.chmodSync(p, 0o755);
       }
     }
-    const git = (a) => spawnSync("git", a, { cwd: repoDir, encoding: "utf8" });
+    const git = makeGit(repoDir);
     git(["init", "-q"]);
     git(["config", "user.email", "t@example.com"]);
     git(["config", "user.name", "Test"]);

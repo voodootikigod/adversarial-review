@@ -6,6 +6,7 @@ import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { buildLoopSummary } from "../src/loop.js";
+import { makeGit } from "./helpers/git-retry.mjs";
 
 // T5 / GitHub #11 — a consolidated `loop_summary` NDJSON event emitted as the
 // terminal line at every --loop exit, so a P6 gate-manifest consumer reads ONE
@@ -90,7 +91,7 @@ function runLoopCli(args, { mocks = {}, dirty = true } = {}) {
       fs.writeFileSync(p, body);
       if (process.platform !== "win32") fs.chmodSync(p, 0o755);
     }
-    const git = (a) => spawnSync("git", a, { cwd: repoDir, encoding: "utf8" });
+    const git = makeGit(repoDir);
     git(["init", "-q"]);
     git(["config", "user.email", "t@example.com"]);
     git(["config", "user.name", "Test"]);
