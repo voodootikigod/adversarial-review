@@ -28,24 +28,33 @@ const FLAG = '{"verdict":"needs-attention","summary":"bad","coverage":{"files_ex
 
 // A reviewer mock body: static JSON, or "smart" — FLAG unless the piped prompt
 // already contains FIXED_MARKER (used to prove the loop converges across rounds).
+// Written as a small Node script (not a shell script) so the SAME body runs
+// unmodified on POSIX (executed directly via its #!/usr/bin/env node shebang,
+// chmod +x) and on Windows (via a matching .cmd wrapper that delegates to
+// `node`, since cmd.exe cannot parse shebangs or bash syntax at all) — a raw
+// bash body previously got written verbatim into a `.cmd` file on Windows,
+// which cmd.exe cannot execute (gh-9 P5#3).
 function staticMock(body) {
-  return `#!/bin/sh\ncat >/dev/null\ncat <<'JSON'\n${body}\nJSON\n`;
+  return `#!/usr/bin/env node\nprocess.stdin.resume();\nprocess.stdin.on('end', () => { process.stdout.write(${JSON.stringify(body + "\n")}); });\n`;
 }
 function smartMock() {
   return (
-    `#!/bin/sh\n` +
-    `INPUT=$(cat)\n` +
-    `if printf '%s' "$INPUT" | grep -q 'FIXED_MARKER'; then\n` +
-    `cat <<'JSON'\n${APPROVE}\nJSON\n` +
-    `else\n` +
-    `cat <<'JSON'\n${FLAG}\nJSON\n` +
-    `fi\n`
+    `#!/usr/bin/env node\n` +
+    `let input = '';\n` +
+    `process.stdin.on('data', (d) => { input += d; });\n` +
+    `process.stdin.on('end', () => {\n` +
+    `  process.stdout.write(input.includes('FIXED_MARKER') ? ${JSON.stringify(APPROVE + "\n")} : ${JSON.stringify(FLAG + "\n")});\n` +
+    `});\n`
   );
 }
 // Fixer mocks: a no-op that changes nothing, and one that resolves the finding by
 // writing a marker into the reviewed file so the next round's diff carries it.
-const NOOP_FIXER = `#!/bin/sh\ncat >/dev/null\nexit 0\n`;
-const MARKER_FIXER = `#!/bin/sh\ncat >/dev/null\nprintf '// FIXED_MARKER\\n' >> code.js\nexit 0\n`;
+const NOOP_FIXER = `#!/usr/bin/env node\nprocess.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n`;
+const MARKER_FIXER =
+  `#!/usr/bin/env node\n` +
+  `const fs = require('fs');\n` +
+  `process.stdin.resume();\n` +
+  `process.stdin.on('end', () => { fs.appendFileSync('code.js', '// FIXED_MARKER\\n'); process.exit(0); });\n`;
 
 // Run bin/cli.js in --loop mode against a throwaway repo with a real uncommitted
 // change. `mocks` maps a CLI name to its script body. Returns {status,stdout,stderr}.
@@ -54,10 +63,17 @@ function runLoopCli(args, { mocks = {}, env = {}, fileContents } = {}) {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-loop-repo-"));
   try {
     for (const [name, body] of Object.entries(mocks)) {
-      const binName = process.platform === "win32" ? `${name}.cmd` : name;
-      const p = path.join(mocksDir, binName);
-      fs.writeFileSync(p, body);
-      if (process.platform !== "win32") fs.chmodSync(p, 0o755);
+      if (process.platform === "win32") {
+        // cmd.exe ignores shebangs and PATHEXT resolution needs a real .cmd:
+        // write the Node logic as a sibling .js file and a tiny .cmd wrapper
+        // that delegates to it, forwarding argv and inheriting stdio.
+        fs.writeFileSync(path.join(mocksDir, `${name}.js`), body);
+        fs.writeFileSync(path.join(mocksDir, `${name}.cmd`), `@echo off\r\nnode "%~dp0${name}.js" %*\r\n`);
+      } else {
+        const p = path.join(mocksDir, name);
+        fs.writeFileSync(p, body);
+        fs.chmodSync(p, 0o755);
+      }
     }
     const git = (a) => spawnSync("git", a, { cwd: repoDir, encoding: "utf8" });
     git(["init", "-q"]);
