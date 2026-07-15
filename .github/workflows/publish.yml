@@ -43,17 +43,32 @@ jobs:
           fi
 
       - name: Setup Node.js
+        # node 24 (active LTS) ships npm 11.16.0, which clears the npm >= 11.5.1
+        # needed to mint a registry token from the GitHub id-token (the
+        # `id-token: write` permission above) for OIDC trusted publishing.
+        # Below that, publish falls through to NODE_AUTH_TOKEN and fails ENEEDAUTH.
+        #
+        # Keep this on a node whose BUNDLED npm clears 11.5.1 (node 22 ships
+        # 10.9.8 and does not). That removes any need to `npm install -g npm`
+        # here — an unpinned global install in a credentialed publish job.
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
 
-      - name: Upgrade npm for OIDC trusted publishing
-        # Node 20 ships npm 10.x, which cannot use OIDC trusted publishing.
-        # npm >= 11.5.1 is required to mint a registry token from the GitHub
-        # id-token (the `id-token: write` permission above). Without this the
-        # publish falls through to needing NODE_AUTH_TOKEN and fails ENEEDAUTH.
-        run: npm install -g npm@latest
+      - name: Verify npm is new enough for OIDC trusted publishing
+        # Fail loudly and early if the bundled npm ever regresses below the OIDC
+        # floor, rather than silently falling back to NODE_AUTH_TOKEN.
+        env:
+          NPM_OIDC_FLOOR: 11.5.1
+        run: |
+          actual="$(npm --version)"
+          lowest="$(printf '%s\n%s\n' "$NPM_OIDC_FLOOR" "$actual" | sort -V | head -n1)"
+          if [ "$lowest" != "$NPM_OIDC_FLOOR" ]; then
+            echo "::error::npm $actual is below the $NPM_OIDC_FLOOR floor for OIDC trusted publishing"
+            exit 1
+          fi
+          echo "npm $actual satisfies the >= $NPM_OIDC_FLOOR OIDC floor"
 
       - name: Resolve version
         id: ver
