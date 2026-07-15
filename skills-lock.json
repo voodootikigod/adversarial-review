@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "adversarial-review": {
+      "source": "voodootikigod/adversarial-review",
+      "sourceType": "github",
+      "skillPath": "skills/adversarial-review/SKILL.md",
+      "computedHash": "9e306e1d200a493589e0ded8811bd0f1e79173ab976183d81232328c2da8d17b"
+    }
+  }
+}
