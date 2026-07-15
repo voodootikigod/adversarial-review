@@ -14,7 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [18, 20, 22]
+        # 24 is the version publish.yml builds and tests on before releasing;
+        # 18/20 stay because package.json declares engines.node >= 18.
+        node-version: [18, 20, 22, 24]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
