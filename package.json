@@ -1,11 +1,11 @@
 {
   "name": "adversarial-review",
   "version": "2.6.0",
-  "description": "Adversarial, ship/no-ship code review of a git diff or branch — runs against any LLM (API or local CLI agent) and returns structured findings",
+  "description": "Adversarial, ship/no-ship code review of a git diff or branch \u2014 runs against any LLM (API or local CLI agent) and returns structured findings",
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "sync-skill": "node --input-type=module -e \"import{copyFileSync}from'fs';for(const f of['prompt-template.md','schema.json'])copyFileSync(f,'skills/adversarial-review/references/'+f);\"",
+    "sync-skill": "node --input-type=module -e \"import{copyFileSync,mkdirSync,existsSync}from'fs';const files=['prompt-template.md','prompt-template-artifact.md','schema.json'];const dests=['skills/adversarial-review/references','.agents/skills/adversarial-review/references'];for(const d of dests){mkdirSync(d,{recursive:true});for(const f of files)copyFileSync(f,d+'/'+f);}\"",
     "prepublishOnly": "npm run sync-skill && npm test"
   },
   "bin": {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateResult, assessFindings, deriveVerdict, mergeProviderResults, deriveQuorumVerdict, renderReport, apiProvidersCannotReview } from "../src/review.js";
+import { validateResult, assessFindings, deriveVerdict, mergeProviderResults, deriveQuorumVerdict, renderReport, apiProvidersCannotReview, buildVerifyPrompt } from "../src/review.js";
 
 function validFinding(overrides = {}) {
   return {
@@ -330,4 +330,26 @@ test("#8: renderReport surfaces ungrounded warnings when assessments are provide
   const assessments = [{ notes: ["evidence not found in provided context"], effectiveConfidence: 0.45 }];
   const out = renderReport(result, context, assessments, { verdict: "needs-attention" });
   assert.match(out, /ungrounded/);
+});
+
+test("buildVerifyPrompt defaults to keeping findings (refuted=false) unless contradicted", () => {
+  const prompt = buildVerifyPrompt(
+    {
+      severity: "high",
+      category: "correctness",
+      title: "Issue",
+      body: "body",
+      exploit_scenario: "x",
+      evidence: "e",
+      file: "a.js",
+      line_start: 1,
+      line_end: 2,
+      confidence: 0.9,
+      recommendation: "fix"
+    },
+    { content: "repo context" }
+  );
+  assert.match(prompt, /Default to refuted=false/);
+  assert.doesNotMatch(prompt, /Default to refuted=true/);
+  assert.match(prompt, /contradictory evidence/i);
 });

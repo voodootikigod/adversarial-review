@@ -667,6 +667,12 @@ export async function runLoop(cwd, args) {
     }
 
     if (context.isEmpty && fixCount === 0) {
+      if (args.failOnEmpty) {
+        log.error("Nothing to review — the target scope is empty (--fail-on-empty set).");
+        emitEvent(args.json, { type: "loop_end", exitReason: "empty", iterations: 0, stashRef: null });
+        emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: 0, exitReason: "empty", survivingCount: 0 }));
+        process.exit(1);
+      }
       emitEvent(args.json, { type: "review_result", result: null, iteration: 1 });
       emitEvent(args.json, { type: "loop_end", exitReason: "clean", iterations: 0, stashRef: null });
       emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: 0, exitReason: "clean", survivingCount: 0 }));
@@ -1169,6 +1175,10 @@ export async function runBranchLoop(cwd, args) {
     }
 
     if (context.isEmpty && fixCount === 0) {
+      if (args.failOnEmpty) {
+        log.error("Nothing to review — the target scope is empty (--fail-on-empty set).");
+        finish("empty", 1, 0);
+      }
       emitEvent(args.json, { type: "review_result", result: null, iteration: 1 });
       log.success("clean on first review — the branch has no changes vs base.");
       finish("clean", 0, 0);
