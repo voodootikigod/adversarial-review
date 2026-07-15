@@ -511,13 +511,13 @@ const VERIFY_SCHEMA = {
   }
 };
 
-function buildVerifyPrompt(finding, context) {
+export function buildVerifyPrompt(finding, context) {
   return [
     "<role>",
-    "You are re-examining a single code-review finding. Your job is to REFUTE it if you can.",
-    "An adversarial review gate blocks shipping; a false positive wastes an engineer's time.",
-    "Default to refuted=true unless the repository context contains concrete evidence that the",
-    "failure described can actually occur.",
+    "You are re-examining a single code-review finding. Your job is to REFUTE it only when you can.",
+    "An adversarial review gate blocks shipping; dropping a real finding is worse than a false positive.",
+    "Default to refuted=false. Set refuted=true ONLY when the repository context contains concrete",
+    "contradictory evidence that the described failure cannot occur as stated.",
     "</role>",
     "",
     "<finding>",

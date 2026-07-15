@@ -150,7 +150,7 @@ Next steps
                        a git diff. Repeatable + comma-separated. Cannot combine with
                        --base, --scope working-tree|branch, or --loop. See below.
 --prompt-only          Print the assembled prompt to stdout and exit (no LLM call).
---json                 Print the raw JSON result instead of a rendered report.
+--json                 Print JSON (verdict matches the derived exit gate) instead of a rendered report.
 
 # What gets sent
 --max-files <n>        Inline-diff cutoff by changed-file count (default 50).
@@ -158,6 +158,7 @@ Next steps
 --context-lines <n>    Diff context lines passed to git diff -U<n> (default 10).
 --include-files        Also inline full post-change file contents (budgeted).
 --allow-summary-review Allow API providers to review summary-only large diffs.
+--allow-unsandboxed-cli Allow claude/agy review without --permission-mode plan.
 --allow-secrets        Send the payload even if the secret scan finds likely
                        credentials in the diff (off by default).
 
@@ -167,7 +168,7 @@ Next steps
 --fail-on-empty        Exit 1 (instead of 0) when there is nothing to review.
 
 # Recall / precision
---verify               Refute-pass: drop findings that can't be defended.
+--verify               Second pass: drop a finding only with contradictory evidence.
 --passes <n>           Run the review n times and merge findings (default 1).
 --providers <list>     Multi-provider mode: fan the same review out to each family
                        token (e.g. gpt,gemini,claude) and merge with cross-provider
@@ -182,7 +183,7 @@ Next steps
 --api-base <url>       Override the active provider's API base URL.
 --api-key <key>        Override the active provider's API key.
 --headers <json>       Inject custom JSON headers into the LLM request.
---timeout <seconds>    Per-request API timeout (default 120).
+--timeout <seconds>    Per-request API/CLI timeout (default 120).
 
 # Reporting
 --findings-ledger [path]
@@ -456,7 +457,8 @@ review payload as leaving your machine.
 `prompt-template.md` and `schema.json` are plain assets — edit them to tune the review or
 the output contract without touching code. The runtime validates against `schema.json`
 itself, so schema edits really do change the enforced contract. `npm run sync-skill`
-copies both into the bundled skill (`skills/adversarial-review/references/`); a test fails
+copies the review prompts (`prompt-template.md`, `prompt-template-artifact.md`) and
+`schema.json` into both skill trees (`skills/` and `.agents/skills/`); a test fails
 if they drift.
 
 ## Changelog

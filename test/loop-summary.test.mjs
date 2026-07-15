@@ -172,6 +172,19 @@ test("AC2: empty-first-review clean exit → loop_summary iterations 0, approve,
   });
 });
 
+test("empty working tree with --fail-on-empty exits 1 (not silent clean)", () => {
+  const r = runLoopCli(["--json", "--fail-on-empty", ...BASE], {
+    dirty: false,
+    mocks: { claude: staticMock(APPROVE), myfixer: NOOP_FIXER }
+  });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /fail-on-empty|Nothing to review/i);
+  const s = summaryLines(r.stdout);
+  assert.equal(s.length, 1, r.stdout);
+  assert.equal(s[0].exitReason, "empty");
+  assert.equal(s[0].iterations, 0);
+});
+
 // ── AC3: non-clean exits emit a loop_summary with surviving >= 1 ───────────────
 
 test("AC3(a): no-diff exit → loop_summary needs-attention, surviving >= 1", () => {

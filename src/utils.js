@@ -37,7 +37,7 @@ ${colors.bold("Options:")}
                         text within --max-bytes (a per-file cap in this mode);
                         missing/binary/oversize inputs error (never a silent skip).
   --prompt-only         Print the assembled prompt to stdout and exit (no LLM call).
-  --json                Print the raw JSON result instead of a rendered report.
+  --json                Print JSON result (verdict matches the derived exit gate).
   --max-files <n>       Inline-diff cutoff by changed-file count (default 50).
   --max-bytes <n>       Inline-diff cutoff by diff size in bytes (default 262144).
   --context-lines <n>   Diff context lines passed to git diff -U<n> (default 10).
@@ -46,8 +46,9 @@ ${colors.bold("Options:")}
   --fail-on <severity>  Gate threshold: critical | high | medium (default) | low.
   --min-confidence <x>  Findings below this confidence don't gate (default 0.5).
   --fail-on-empty       Exit 1 (instead of 0) when there is nothing to review.
-  --verify              Second adversarial pass that tries to refute each finding;
-                        refuted findings are dropped (1 extra call per finding).
+  --verify              Second pass that tries to refute each finding; a finding is
+                        dropped only when contradictory evidence is present
+                        (default keeps findings — raises precision carefully).
   --passes <n>          Run the review n times and merge findings (default 1).
   --providers <list>    Multi-provider mode: run the review independently against
                         each family token (e.g. gpt,gemini,claude) and merge with
@@ -62,7 +63,10 @@ ${colors.bold("Options:")}
                         Off unless the flag is given.
   --allow-secrets       Send the payload even if the secret scan finds likely
                         credentials in the diff (off by default).
-  --timeout <seconds>   Per-request API timeout (default 120).
+  --timeout <seconds>   Per-request timeout for API and local CLI providers (default 120).
+  --allow-unsandboxed-cli
+                        Allow claude/agy review without --permission-mode plan
+                        (older CLIs). Default review isolation uses plan mode.
   --provider <name>     Force provider: anthropic | openai | gemini | cursor | <local-cli-cmd>.
   --model <name>        Force the model name.
   --api-base <url>      Override the active provider's API base URL.
@@ -136,6 +140,7 @@ export function parseArgs(argv) {
     quorum: 1,
     findingsLedger: null,
     allowSecrets: false,
+    allowUnsandboxedCli: false,
     timeout: 120,
     provider: null,
     model: null,
@@ -252,6 +257,8 @@ export function parseArgs(argv) {
       args.verify = true;
     } else if (arg === "--allow-secrets") {
       args.allowSecrets = true;
+    } else if (arg === "--allow-unsandboxed-cli") {
+      args.allowUnsandboxedCli = true;
     } else if (arg === "--context-lines") {
       const result = readValue("--context-lines", i);
       args.contextLines = parseNonNegativeInteger("--context-lines", result.value);

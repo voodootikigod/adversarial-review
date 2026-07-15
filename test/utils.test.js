@@ -205,3 +205,9 @@ test("parseArgs --input alone (scope defaults to auto) does not error", () => {
   assert.deepEqual(a.errors, []);
   assert.equal(a.scope, "auto");
 });
+
+test("parseArgs accepts --allow-unsandboxed-cli", () => {
+  const args = parseArgs(["node", "cli.js", "--allow-unsandboxed-cli"]);
+  assert.equal(args.allowUnsandboxedCli, true);
+  assert.deepEqual(args.errors, []);
+});

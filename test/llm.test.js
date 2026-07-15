@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { cleanJsonResponse, configureLLM, cliFallbackArgs } from "../src/llm.js";
+import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, parseRetryAfterMs } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
@@ -214,12 +214,26 @@ test("configureLLM auto-detects agy CLI when only agy is installed and no API ke
   }
 });
 
-test("cliFallbackArgs uses -p print mode for agy (Claude-Code-compatible CLI)", () => {
-  // agy mirrors claude: both need -p when the prompt is passed as an argument.
-  assert.deepEqual(cliFallbackArgs("agy", "PROMPT-BODY"), ["-p", "PROMPT-BODY"]);
-  assert.deepEqual(cliFallbackArgs("claude", "PROMPT-BODY"), ["-p", "PROMPT-BODY"]);
-  // Truly-unknown custom CLIs still get the bare prompt argument.
+test("cliReviewArgs / cliFallbackArgs use plan mode + -p for claude and agy", () => {
+  assert.deepEqual(cliReviewArgs("agy"), ["--permission-mode", "plan", "-p", "-"]);
+  assert.deepEqual(cliReviewArgs("claude"), ["--permission-mode", "plan", "-p", "-"]);
+  assert.deepEqual(cliReviewArgs("agy", { allowUnsandboxedCli: true }), ["-p", "-"]);
+  assert.deepEqual(cliFallbackArgs("agy", "PROMPT-BODY"), ["--permission-mode", "plan", "-p", "PROMPT-BODY"]);
+  assert.deepEqual(cliFallbackArgs("claude", "PROMPT-BODY"), ["--permission-mode", "plan", "-p", "PROMPT-BODY"]);
+  assert.deepEqual(
+    cliFallbackArgs("claude", "PROMPT-BODY", { allowUnsandboxedCli: true }),
+    ["-p", "PROMPT-BODY"]
+  );
   assert.deepEqual(cliFallbackArgs("somecli", "PROMPT-BODY"), ["PROMPT-BODY"]);
+});
+
+test("parseRetryAfterMs parses seconds and HTTP-date, capped", () => {
+  assert.equal(parseRetryAfterMs("2"), 2000);
+  assert.equal(parseRetryAfterMs("120"), 60_000); // capped
+  const now = Date.parse("2026-01-01T00:00:00Z");
+  assert.equal(parseRetryAfterMs("Thu, 01 Jan 2026 00:00:05 GMT", { now, capMs: 60_000 }), 5000);
+  assert.equal(parseRetryAfterMs(""), null);
+  assert.equal(parseRetryAfterMs(null), null);
 });
 
 test("agy CLI review path invokes -p print mode and delivers the prompt via stdin", async () => {
@@ -242,15 +256,22 @@ test("agy CLI review path invokes -p print mode and delivers the prompt via stdi
     `#!/bin/sh
 has_print=false
 read_stdin=false
+has_plan=false
+prev=""
 for arg in "$@"; do
   if [ "$arg" = "-p" ] || [ "$arg" = "--print" ]; then has_print=true; fi
   if [ "$arg" = "-" ]; then read_stdin=true; fi
+  if [ "$prev" = "--permission-mode" ] && [ "$arg" = "plan" ]; then has_plan=true; fi
+  prev="$arg"
 done
 if [ "$has_print" = "false" ]; then
   echo "FAIL: -p/--print not passed (would hang interactively)" >&2; exit 1
 fi
 if [ "$read_stdin" = "false" ]; then
   echo "FAIL: stdin indicator (-) not passed" >&2; exit 1
+fi
+if [ "$has_plan" = "false" ]; then
+  echo "FAIL: --permission-mode plan not passed (review isolation required)" >&2; exit 1
 fi
 stdin_content=$(cat)
 echo "$stdin_content" | grep -q "${sentinelSystem}" || { echo "FAIL: system instruction missing from stdin" >&2; exit 1; }
@@ -434,3 +455,103 @@ process.stdin.on("end", () => {
   }
 });
 
+
+
+test("claude CLI review path uses -p, stdin sentinel, and plan mode (same contract as agy)", async () => {
+  const { llmCall } = await import("../src/llm.js");
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-test-"));
+  const binName = process.platform === "win32" ? "claude.cmd" : "claude";
+  const binPath = path.join(tmpDir, binName);
+  const expectedResponse = '{"verdict":"approve","summary":"ok"}';
+
+  fs.writeFileSync(
+    binPath,
+    `#!/bin/sh
+has_print=false
+read_stdin=false
+has_plan=false
+prev=""
+for arg in "$@"; do
+  if [ "$arg" = "-p" ] || [ "$arg" = "--print" ]; then has_print=true; fi
+  if [ "$arg" = "-" ]; then read_stdin=true; fi
+  if [ "$prev" = "--permission-mode" ] && [ "$arg" = "plan" ]; then has_plan=true; fi
+  prev="$arg"
+done
+if [ "$has_print" = "false" ]; then echo "FAIL: -p missing" >&2; exit 1; fi
+if [ "$read_stdin" = "false" ]; then echo "FAIL: - missing" >&2; exit 1; fi
+if [ "$has_plan" = "false" ]; then echo "FAIL: plan mode missing" >&2; exit 1; fi
+cat >/dev/null
+printf '%s' '${expectedResponse}'
+`
+  );
+  fs.chmodSync(binPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+  try {
+    const result = await llmCall(
+      { provider: "cli", cliCmd: "claude", timeoutMs: 10000 },
+      "review me",
+      "system"
+    );
+    assert.equal(result, expectedResponse);
+  } finally {
+    process.env.PATH = oldPath;
+    try { fs.unlinkSync(binPath); } catch {}
+    try { fs.rmdirSync(tmpDir); } catch {}
+  }
+});
+
+test("allowUnsandboxedCli omits --permission-mode plan for claude/agy review", async () => {
+  const { llmCall } = await import("../src/llm.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-unsandbox-"));
+  const binPath = path.join(tmpDir, "claude");
+  fs.writeFileSync(
+    binPath,
+    `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "plan" ]; then echo "FAIL: plan mode present" >&2; exit 1; fi
+done
+cat >/dev/null
+printf '%s' '{"ok":true}'
+`
+  );
+  fs.chmodSync(binPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+  try {
+    const result = await llmCall(
+      { provider: "cli", cliCmd: "claude", timeoutMs: 10000, allowUnsandboxedCli: true },
+      "p",
+      "s"
+    );
+    assert.equal(result, '{"ok":true}');
+  } finally {
+    process.env.PATH = oldPath;
+    try { fs.unlinkSync(binPath); } catch {}
+    try { fs.rmdirSync(tmpDir); } catch {}
+  }
+});
+
+test("CLI provider honors config.timeoutMs (fails faster than the 10m hardcode)", async () => {
+  const { llmCall } = await import("../src/llm.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cli-timeout-"));
+  const binPath = path.join(tmpDir, "slowcli");
+  fs.writeFileSync(binPath, "#!/bin/sh\nsleep 5\necho ok\n");
+  fs.chmodSync(binPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+  const started = Date.now();
+  try {
+    await assert.rejects(
+      () => llmCall({ provider: "cli", cliCmd: "slowcli", timeoutMs: 500 }, "p", "s"),
+      /Failed to execute local CLI agent|ETIMEDOUT|timed out|spawnSync/i
+    );
+    assert.ok(Date.now() - started < 4000, "should time out well under 4s");
+  } finally {
+    process.env.PATH = oldPath;
+    try { fs.unlinkSync(binPath); } catch {}
+    try { fs.rmdirSync(tmpDir); } catch {}
+  }
+});

@@ -110,21 +110,38 @@ export function isCmdInstalled(cmd) {
   });
 }
 
-function execCli(cliCmd, args, input = null) {
+function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000) {
   return execFileSync(cliCmd, args, {
     input,
     encoding: "utf8",
     stdio: ["pipe", "pipe", "pipe"],
     maxBuffer: 10 * 1024 * 1024,
-    timeout: 10 * 60 * 1000,
+    timeout: timeoutMs,
     shell: process.platform === "win32"
   }).trim();
 }
 
-export function cliFallbackArgs(cliCmd, fullPrompt) {
+// Claude-Code-compatible CLIs (claude, agy): always use print mode (-p) with the
+// stdin sentinel (-). For review, also force --permission-mode plan so an untrusted
+// diff cannot prompt-inject writes (mirrors Codex --sandbox read-only). Opt out
+// with --allow-unsandboxed-cli when an older CLI rejects plan mode.
+export function cliReviewArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
+  if (cliCmd !== "claude" && cliCmd !== "agy") return [];
+  const args = [];
+  if (!allowUnsandboxedCli) args.push("--permission-mode", "plan");
+  args.push("-p", "-");
+  return args;
+}
+
+export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = false } = {}) {
   // claude and agy are Claude-Code-compatible: they need -p (print mode) when
   // the prompt is passed as a command-line argument.
-  if (cliCmd === "claude" || cliCmd === "agy") return ["-p", fullPrompt];
+  if (cliCmd === "claude" || cliCmd === "agy") {
+    const args = [];
+    if (!allowUnsandboxedCli) args.push("--permission-mode", "plan");
+    args.push("-p", fullPrompt);
+    return args;
+  }
   return [fullPrompt];
 }
 
@@ -134,7 +151,7 @@ export function cliFallbackArgs(cliCmd, fullPrompt) {
 // so Codex enforces the output shape natively rather than relying on scraping.
 // The prompt is piped via stdin (`-`) to avoid argv size limits on large diffs;
 // the argv path is used as a fallback if stdin is rejected.
-function callCodexCli(fullPrompt, schema) {
+function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
   // Create a private temp directory so path prediction / symlink race attacks
   // against shared /tmp are not possible; the directory is owned by this process.
   const privateDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-review-codex-"));
@@ -164,7 +181,7 @@ function callCodexCli(fullPrompt, schema) {
       // "If not provided as an argument (or if `-` is used), instructions are read from
       // stdin"). We rely on execFileSync's `input` option to wire the full prompt payload
       // to that stdin pipe, so the review content is never truncated by argv size limits.
-      execCli("codex", [...baseArgs, "-"], fullPrompt);
+      execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs);
     } catch (stdinErr) {
       if (Buffer.byteLength(fullPrompt) > MAX_ARGV_PROMPT_BYTES) {
         const stderr = stdinErr.stderr?.toString("utf8").trim() || "";
@@ -178,7 +195,7 @@ function callCodexCli(fullPrompt, schema) {
       // Argv fallback: pass prompt as positional argument
       log.substep("Codex stdin path failed, retrying as argument...");
       try {
-        execCli("codex", [...baseArgs, fullPrompt]);
+        execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs);
       } catch (argvErr) {
         const stderr = argvErr.stderr?.toString("utf8") || stdinErr.stderr?.toString("utf8") || "";
         throw new Error(
@@ -196,7 +213,7 @@ function callCodexCli(fullPrompt, schema) {
 }
 
 // Invoke a local CLI agent (claude, agy, ...) by piping the prompt to stdin.
-function callCliLLM(cliCmd, prompt, systemInstruction, schema = null) {
+function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs = 10 * 60 * 1000, allowUnsandboxedCli = false } = {}) {
   let fullPrompt = "";
   if (systemInstruction) {
     fullPrompt += `System Instructions:\n${systemInstruction}\n\n`;
@@ -206,16 +223,17 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null) {
   log.step(`Invoking local subscription agent via command: "${cliCmd}"...`);
 
   if (cliCmd === "codex") {
-    return callCodexCli(fullPrompt, schema);
+    return callCodexCli(fullPrompt, schema, timeoutMs);
   }
 
-  // agy is a Claude-Code-compatible CLI: it must run in -p (print) mode reading
-  // the prompt from the `-` stdin sentinel. A bare `agy` invocation would launch
-  // interactively and hang until the subprocess timeout.
-  const primaryArgs = cliCmd === "agy" ? ["-p", "-"] : [];
+  // claude and agy are Claude-Code-compatible: always -p print mode with `-` stdin
+  // sentinel. A bare invocation launches interactively and hangs until timeout.
+  // Default also forces --permission-mode plan (read-only review isolation).
+  const primaryArgs = cliReviewArgs(cliCmd, { allowUnsandboxedCli });
+  const fallbackOpts = { allowUnsandboxedCli };
 
   try {
-    return execCli(cliCmd, primaryArgs, fullPrompt);
+    return execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs);
   } catch (err) {
     if (Buffer.byteLength(fullPrompt) > MAX_ARGV_PROMPT_BYTES) {
       const stderr = err.stderr?.toString("utf8").trim() || "";
@@ -228,7 +246,7 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null) {
     }
     try {
       log.substep(`Stdin piping not supported by ${cliCmd}, retrying as argument...`);
-      return execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt));
+      return execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs);
     } catch (err2) {
       const stderr = err2.stderr?.toString("utf8") || err.stderr?.toString("utf8") || "";
       const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
@@ -418,7 +436,9 @@ export function configureLLM(args) {
     log.info(`Using LLM provider: ${provider} (model: ${model})`);
   }
 
-  return { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs };
+  const allowUnsandboxedCli = !!args.allowUnsandboxedCli;
+
+  return { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli };
 }
 
 // ─── Multi-provider selection (--providers) ─────────────────────────────────
@@ -564,10 +584,27 @@ export function underSatisfiedNotice(sel) {
   );
 }
 
-function apiError(provider, status, bodyText) {
+function apiError(provider, status, bodyText, retryAfterMs = null) {
   const err = new Error(`${provider} API error (${status}): ${bodyText}`);
   err.status = status;
+  if (retryAfterMs != null) err.retryAfterMs = retryAfterMs;
   return err;
+}
+
+// Parse Retry-After as seconds or HTTP-date. Cap waits so a hostile header cannot
+// stall the gate indefinitely.
+export function parseRetryAfterMs(headerValue, { now = Date.now(), capMs = 60_000 } = {}) {
+  if (headerValue == null || headerValue === "") return null;
+  const asNum = Number(headerValue);
+  if (Number.isFinite(asNum) && asNum >= 0) return Math.min(asNum * 1000, capMs);
+  const when = Date.parse(headerValue);
+  if (!Number.isNaN(when)) return Math.min(Math.max(0, when - now), capMs);
+  return null;
+}
+
+function retryWaitMs(err, fallbackDelay) {
+  if (typeof err.retryAfterMs === "number" && err.retryAfterMs >= 0) return err.retryAfterMs;
+  return fallbackDelay;
 }
 
 function truncationError(provider) {
@@ -595,10 +632,13 @@ function isRetryable(err) {
 // responseSchema) so well-formed JSON is enforced at the API layer, not by
 // post-hoc text scraping.
 export async function llmCall(config, prompt, systemInstruction = "", schema = null) {
-  const { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs } = config;
+  const { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli } = config;
 
   if (provider === "cli") {
-    return callCliLLM(cliCmd, prompt, systemInstruction, schema);
+    return callCliLLM(cliCmd, prompt, systemInstruction, schema, {
+      timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      allowUnsandboxedCli: !!allowUnsandboxedCli
+    });
   }
 
   let retries = 3;
@@ -642,7 +682,10 @@ export async function llmCall(config, prompt, systemInstruction = "", schema = n
           body: JSON.stringify(body),
           signal: controller.signal
         });
-        if (!res.ok) throw apiError("Gemini", res.status, await res.text());
+        if (!res.ok) {
+          const bodyText = await res.text();
+          throw apiError("Gemini", res.status, bodyText, parseRetryAfterMs(res.headers.get("retry-after")));
+        }
         const data = await res.json();
         const candidate = data.candidates?.[0];
         if (!candidate?.content?.parts) {
@@ -696,7 +739,7 @@ export async function llmCall(config, prompt, systemInstruction = "", schema = n
             if (retries === 0) throw apiError("OpenAI", res.status, text);
             continue;
           }
-          throw apiError(provider === "cursor" ? "Cursor" : "OpenAI", res.status, text);
+          throw apiError(provider === "cursor" ? "Cursor" : "OpenAI", res.status, text, parseRetryAfterMs(res.headers.get("retry-after")));
         }
         const data = await res.json();
         const choice = data.choices?.[0];
@@ -737,7 +780,10 @@ export async function llmCall(config, prompt, systemInstruction = "", schema = n
           body: JSON.stringify(body),
           signal: controller.signal
         });
-        if (!res.ok) throw apiError("Anthropic", res.status, await res.text());
+        if (!res.ok) {
+          const bodyText = await res.text();
+          throw apiError("Anthropic", res.status, bodyText, parseRetryAfterMs(res.headers.get("retry-after")));
+        }
         const data = await res.json();
         if (data.stop_reason === "max_tokens") throw truncationError("Anthropic");
         const toolUse = Array.isArray(data.content) ? data.content.find((b) => b.type === "tool_use") : null;
@@ -760,8 +806,9 @@ export async function llmCall(config, prompt, systemInstruction = "", schema = n
       }
       retries--;
       if (retries === 0) throw new Error(`LLM call failed: ${errorMsg}`);
-      log.warn(`LLM call failed: ${errorMsg}. Retrying in ${delay}ms...`);
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      const wait = retryWaitMs(err, delay);
+      log.warn(`LLM call failed: ${errorMsg}. Retrying in ${wait}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, wait));
       delay *= 2;
     } finally {
       clearTimeout(timeoutId);

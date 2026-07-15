@@ -309,3 +309,18 @@ test("ledger AC6: an unwritable ledger path warns but does not fail the review",
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+const MODEL_APPROVE_BUT_GATES = '{"verdict":"approve","summary":"looks fine","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[{"severity":"high","category":"security","title":"t","body":"b","exploit_scenario":"e","evidence":"","file":"code.js","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}],"next_steps":["n"]}';
+
+test("CLI: single-provider --json verdict matches derived gate (not raw model verdict)", () => {
+  // Model self-reports approve while still emitting a gating finding. Exit code and
+  // JSON.verdict must both be needs-attention (parity with multi-provider mode).
+  const r = runCli(
+    ["--provider", "claude", "--json", "--scope", "working-tree", "--allow-secrets"],
+    { mocks: { claude: MODEL_APPROVE_BUT_GATES } }
+  );
+  assert.equal(r.status, 2, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.verdict, "needs-attention", "JSON verdict must match derived exit gate");
+  assert.match(r.stderr, /Model verdict was "approve"/);
+});

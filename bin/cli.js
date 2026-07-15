@@ -336,8 +336,10 @@ async function main() {
 
   recordFindings(args, result, assessments);
 
-  // 5. Emit output. --json stays schema-pure (the validated model result,
-  // untouched); grounding and derivation details go to stderr.
+  // 5. Emit output. Align JSON verdict with the derived gate (same as multi-provider
+  // mode) so CI consumers that parse review.json.verdict cannot disagree with exit code.
+  // Model disagreement remains on stderr via the warn above.
+  result.verdict = derived.verdict;
   if (args.json) {
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   } else {
