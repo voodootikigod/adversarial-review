@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Breaking changes
+- **`--provider cursor` no longer targets a localhost HTTP proxy** (`http://127.0.0.1:8765`). It now resolves to the official Cursor Agent CLI (`agent` / `cursor-agent`) in plan/read-only mode. Third-party OpenAI-compatible proxies: `--provider openai --api-base <url>`.
+
+### Added
+- **Cursor Agent CLI provider**: `--provider cursor|agent` invokes `agent -p --mode plan --trust` (subscription / `CURSOR_API_KEY`). Auto-detect inside Cursor falls back to `agent` instead of a dead proxy.
+- **Vercel AI Gateway provider**: `--provider vercel|gateway` with `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`), base `https://ai-gateway.vercel.sh/v1`, default model `anthropic/claude-sonnet-4.6`.
+- **One-key multi-family routing**: when only a Gateway credential is set, `--providers auto` / family tokens resolve openai + anthropic + gemini through the Gateway with distinct `provider/model` ids (native vendor keys still win when present).
+
 ## [2.0.0] — 2026-06-18
 
 ### Breaking changes

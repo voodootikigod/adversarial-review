@@ -125,7 +125,37 @@ function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000) {
 // stdin sentinel (-). For review, also force --permission-mode plan so an untrusted
 // diff cannot prompt-inject writes (mirrors Codex --sandbox read-only). Opt out
 // with --allow-unsandboxed-cli when an older CLI rejects plan mode.
-export function cliReviewArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
+export function isCursorAgentCli(cliCmd) {
+  return cliCmd === "agent" || cliCmd === "cursor-agent";
+}
+
+function envNonEmpty(name) {
+  const v = process.env[name];
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s ? s : null;
+}
+
+function gatewayCredential() {
+  return envNonEmpty("AI_GATEWAY_API_KEY") || envNonEmpty("VERCEL_OIDC_TOKEN");
+}
+
+function resolveCursorAgentCmd() {
+  if (isCmdInstalled("agent")) return "agent";
+  if (isCmdInstalled("cursor-agent")) return "cursor-agent";
+  return null;
+}
+
+export function cliReviewArgs(cliCmd, { allowUnsandboxedCli = false, model = null } = {}) {
+  if (isCursorAgentCli(cliCmd)) {
+    // Cursor Agent CLI: -p alone grants write/shell tools — force --mode plan
+    // for review isolation (mirrors claude/agy --permission-mode plan).
+    const args = ["-p", "--trust", "--output-format", "text"];
+    if (!allowUnsandboxedCli) args.push("--mode", "plan");
+    if (model) args.push("--model", model);
+    args.push("-");
+    return args;
+  }
   if (cliCmd !== "claude" && cliCmd !== "agy") return [];
   const args = [];
   if (!allowUnsandboxedCli) args.push("--permission-mode", "plan");
@@ -133,7 +163,14 @@ export function cliReviewArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
   return args;
 }
 
-export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = false } = {}) {
+export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = false, model = null } = {}) {
+  if (isCursorAgentCli(cliCmd)) {
+    const args = ["-p", "--trust", "--output-format", "text"];
+    if (!allowUnsandboxedCli) args.push("--mode", "plan");
+    if (model) args.push("--model", model);
+    args.push(fullPrompt);
+    return args;
+  }
   // claude and agy are Claude-Code-compatible: they need -p (print mode) when
   // the prompt is passed as a command-line argument.
   if (cliCmd === "claude" || cliCmd === "agy") {
@@ -213,7 +250,7 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
 }
 
 // Invoke a local CLI agent (claude, agy, ...) by piping the prompt to stdin.
-function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs = 10 * 60 * 1000, allowUnsandboxedCli = false } = {}) {
+function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs = 10 * 60 * 1000, allowUnsandboxedCli = false, model = null } = {}) {
   let fullPrompt = "";
   if (systemInstruction) {
     fullPrompt += `System Instructions:\n${systemInstruction}\n\n`;
@@ -226,11 +263,11 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
     return callCodexCli(fullPrompt, schema, timeoutMs);
   }
 
-  // claude and agy are Claude-Code-compatible: always -p print mode with `-` stdin
-  // sentinel. A bare invocation launches interactively and hangs until timeout.
-  // Default also forces --permission-mode plan (read-only review isolation).
-  const primaryArgs = cliReviewArgs(cliCmd, { allowUnsandboxedCli });
-  const fallbackOpts = { allowUnsandboxedCli };
+  // claude/agy: -p + stdin `-` + --permission-mode plan.
+  // agent/cursor-agent: -p + stdin `-` + --mode plan + --trust (Cursor CLI).
+  // A bare invocation launches interactively and hangs until timeout.
+  const primaryArgs = cliReviewArgs(cliCmd, { allowUnsandboxedCli, model });
+  const fallbackOpts = { allowUnsandboxedCli, model };
 
   try {
     return execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs);
@@ -255,54 +292,67 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
   }
 }
 
+const NO_LLM_CONFIG_MSG =
+  "No LLM configuration found.\n" +
+  "Set an API key (ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, or AI_GATEWAY_API_KEY),\n" +
+  "or install a local CLI agent (claude, codex, agy, or agent).\n" +
+  "Or run with --prompt-only to just print the prompt.";
+
 // Resolve the LLM provider from flags, environment variables, or an installed local CLI agent.
 export function configureLLM(args) {
   let provider = args.provider;
   let apiKey = null;
   let cliCmd = null;
+  // When auto-detect picks the Gateway inside a builder IDE, prefer a model
+  // family that is NOT the builder's (transport ≠ diversity family).
+  let gatewayPreferModel = null;
 
   if (!provider) {
     const isClaudeCodeEnv = !!(process.env.CLAUDECODE || process.env.CLAUDE_CODE);
     const isCursorEnv = process.env.TERM_PROGRAM === "cursor";
+    const gw = gatewayCredential();
 
     if (isClaudeCodeEnv) {
-      // Builder is Claude. Try to find a non-Claude/Anthropic critic to break the monoculture.
-      if (process.env.GEMINI_API_KEY) {
+      // Builder is Claude. Prefer a non-Anthropic critic.
+      if (envNonEmpty("GEMINI_API_KEY")) {
         provider = "gemini";
-      } else if (process.env.OPENAI_API_KEY) {
+      } else if (envNonEmpty("OPENAI_API_KEY")) {
         provider = "openai";
+      } else if (gw) {
+        provider = "vercel";
+        gatewayPreferModel = "openai/gpt-5";
       } else if (isCmdInstalled("codex")) {
         provider = "cli";
         cliCmd = "codex";
       } else if (isCmdInstalled("agy")) {
         provider = "cli";
         cliCmd = "agy";
-      } else {
-        // Fall back to Claude/Anthropic if nothing else is available
-        if (process.env.ANTHROPIC_API_KEY) {
-          provider = "anthropic";
-        } else if (isCmdInstalled("claude")) {
-          provider = "cli";
-          cliCmd = "claude";
-        } else {
-          throw new Error(
-            "No LLM configuration found.\n" +
-            "Set an API key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY),\n" +
-            "or install a local CLI agent (claude, codex, or agy).\n" +
-            "Or run with --prompt-only to just print the prompt."
-          );
-        }
+      } else if (resolveCursorAgentCmd()) {
+        provider = "cli";
+        cliCmd = resolveCursorAgentCmd();
+      } else if (envNonEmpty("ANTHROPIC_API_KEY")) {
+        provider = "anthropic";
         log.warn("Running in Claude Code, but fell back to Claude for review.");
         log.info("This review is not a pure adversarial review (same provider). To minimize bias, we will execute it in a fresh, isolated context window.");
+      } else if (isCmdInstalled("claude")) {
+        provider = "cli";
+        cliCmd = "claude";
+        log.warn("Running in Claude Code, but fell back to Claude for review.");
+        log.info("This review is not a pure adversarial review (same provider). To minimize bias, we will execute it in a fresh, isolated context window.");
+      } else {
+        throw new Error(NO_LLM_CONFIG_MSG);
       }
     } else if (isCursorEnv) {
-      // Builder is likely Cursor (OpenAI/Claude). Try to find an independent critic first.
-      if (process.env.GEMINI_API_KEY) {
+      // Builder is Cursor. Prefer an independent critic, then the official agent CLI.
+      if (envNonEmpty("GEMINI_API_KEY")) {
         provider = "gemini";
-      } else if (process.env.ANTHROPIC_API_KEY) {
+      } else if (envNonEmpty("ANTHROPIC_API_KEY")) {
         provider = "anthropic";
-      } else if (process.env.OPENAI_API_KEY) {
+      } else if (envNonEmpty("OPENAI_API_KEY")) {
         provider = "openai";
+      } else if (gw) {
+        provider = "vercel";
+        gatewayPreferModel = "anthropic/claude-sonnet-4.6";
       } else if (isCmdInstalled("agy")) {
         provider = "cli";
         cliCmd = "agy";
@@ -312,20 +362,24 @@ export function configureLLM(args) {
       } else if (isCmdInstalled("codex")) {
         provider = "cli";
         cliCmd = "codex";
-      } else {
-        // Default to Cursor's local proxy if no independent options are available
-        provider = "cursor";
-        log.warn("Running in Cursor, but fell back to Cursor's local LLM proxy.");
+      } else if (resolveCursorAgentCmd()) {
+        provider = "cli";
+        cliCmd = resolveCursorAgentCmd();
+        log.warn("Running in Cursor, but fell back to the Cursor Agent CLI for review.");
         log.info("This review is not a pure adversarial review (same provider). To minimize bias, we will execute it in a fresh, isolated context window.");
+      } else {
+        throw new Error(NO_LLM_CONFIG_MSG);
       }
     } else {
-      // Default auto-detection order (Anthropic > Gemini > OpenAI > Local CLI agents)
-      if (process.env.ANTHROPIC_API_KEY) {
+      // Default auto-detection order (Anthropic > Gemini > OpenAI > Gateway > Local CLIs)
+      if (envNonEmpty("ANTHROPIC_API_KEY")) {
         provider = "anthropic";
-      } else if (process.env.GEMINI_API_KEY) {
+      } else if (envNonEmpty("GEMINI_API_KEY")) {
         provider = "gemini";
-      } else if (process.env.OPENAI_API_KEY) {
+      } else if (envNonEmpty("OPENAI_API_KEY")) {
         provider = "openai";
+      } else if (gw) {
+        provider = "vercel";
       } else if (isCmdInstalled("claude")) {
         provider = "cli";
         cliCmd = "claude";
@@ -335,38 +389,56 @@ export function configureLLM(args) {
       } else if (isCmdInstalled("agy")) {
         provider = "cli";
         cliCmd = "agy";
+      } else if (resolveCursorAgentCmd()) {
+        provider = "cli";
+        cliCmd = resolveCursorAgentCmd();
       } else {
-        throw new Error(
-          "No LLM configuration found.\n" +
-          "Set an API key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY),\n" +
-          "or install a local CLI agent (claude, codex, or agy).\n" +
-          "Or run with --prompt-only to just print the prompt."
-        );
+        throw new Error(NO_LLM_CONFIG_MSG);
       }
     }
   } else {
-    const knownApis = ["gemini", "openai", "anthropic", "cursor"];
-    if (!knownApis.includes(provider)) {
-      if (isCmdInstalled(provider)) {
-        cliCmd = provider;
-        provider = "cli";
+    // Normalize alias: gateway → vercel (Gateway is a transport id).
+    if (provider === "gateway") provider = "vercel";
+
+    // Cursor tokens resolve to the official Agent CLI (not a localhost HTTP proxy).
+    if (provider === "cursor" || provider === "agent" || provider === "cursor-agent") {
+      if (provider === "cursor") {
+        cliCmd = resolveCursorAgentCmd();
       } else {
-        throw new Error(`Provider CLI command "${provider}" is not installed or available in PATH.`);
+        cliCmd = isCmdInstalled(provider) ? provider : null;
+      }
+      if (!cliCmd) {
+        throw new Error(
+          `Cursor Agent CLI not found on PATH (tried \`agent\` / \`cursor-agent\`).\n` +
+          `Install the Cursor CLI, run \`agent login\` (or set CURSOR_API_KEY), then retry.\n` +
+          `For a third-party OpenAI-compatible proxy, use --provider openai --api-base <url>.`
+        );
+      }
+      provider = "cli";
+    } else {
+      const knownApis = ["gemini", "openai", "anthropic", "vercel"];
+      if (!knownApis.includes(provider)) {
+        if (isCmdInstalled(provider)) {
+          cliCmd = provider;
+          provider = "cli";
+        } else {
+          throw new Error(`Provider CLI command "${provider}" is not installed or available in PATH.`);
+        }
       }
     }
   }
 
   // Resolve API Key (CLI flag > LLM_API_KEY > provider-specific env var)
-  apiKey = args.apiKey || process.env.LLM_API_KEY;
+  apiKey = args.apiKey || envNonEmpty("LLM_API_KEY");
   if (!apiKey) {
     if (provider === "gemini") {
-      apiKey = process.env.GEMINI_API_KEY;
+      apiKey = envNonEmpty("GEMINI_API_KEY");
     } else if (provider === "openai") {
-      apiKey = process.env.OPENAI_API_KEY;
+      apiKey = envNonEmpty("OPENAI_API_KEY");
     } else if (provider === "anthropic") {
-      apiKey = process.env.ANTHROPIC_API_KEY;
-    } else if (provider === "cursor") {
-      apiKey = process.env.OPENAI_API_KEY || "dummy";
+      apiKey = envNonEmpty("ANTHROPIC_API_KEY");
+    } else if (provider === "vercel") {
+      apiKey = gatewayCredential();
     }
   }
 
@@ -374,38 +446,43 @@ export function configureLLM(args) {
   let apiBase = args.apiBase;
   if (!apiBase) {
     if (provider === "openai") {
-      apiBase = process.env.OPENAI_API_BASE || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
+      apiBase = envNonEmpty("OPENAI_API_BASE") || envNonEmpty("OPENAI_BASE_URL") || "https://api.openai.com/v1";
     } else if (provider === "anthropic") {
-      apiBase = process.env.ANTHROPIC_API_BASE || process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com/v1";
+      apiBase = envNonEmpty("ANTHROPIC_API_BASE") || envNonEmpty("ANTHROPIC_BASE_URL") || "https://api.anthropic.com/v1";
     } else if (provider === "gemini") {
-      apiBase = process.env.GEMINI_API_BASE || process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
-    } else if (provider === "cursor") {
-      apiBase = "http://127.0.0.1:8765/v1";
+      apiBase = envNonEmpty("GEMINI_API_BASE") || envNonEmpty("GEMINI_BASE_URL") || "https://generativelanguage.googleapis.com";
+    } else if (provider === "vercel") {
+      apiBase = envNonEmpty("AI_GATEWAY_API_BASE") || envNonEmpty("AI_GATEWAY_BASE_URL") || "https://ai-gateway.vercel.sh/v1";
     }
   }
 
   const isCustomBase = !!(args.apiBase ||
-    (provider === "openai" && (process.env.OPENAI_API_BASE || process.env.OPENAI_BASE_URL)) ||
-    (provider === "anthropic" && (process.env.ANTHROPIC_API_BASE || process.env.ANTHROPIC_BASE_URL)) ||
-    (provider === "gemini" && (process.env.GEMINI_API_BASE || process.env.GEMINI_BASE_URL))
+    (provider === "openai" && (envNonEmpty("OPENAI_API_BASE") || envNonEmpty("OPENAI_BASE_URL"))) ||
+    (provider === "anthropic" && (envNonEmpty("ANTHROPIC_API_BASE") || envNonEmpty("ANTHROPIC_BASE_URL"))) ||
+    (provider === "gemini" && (envNonEmpty("GEMINI_API_BASE") || envNonEmpty("GEMINI_BASE_URL"))) ||
+    (provider === "vercel" && (envNonEmpty("AI_GATEWAY_API_BASE") || envNonEmpty("AI_GATEWAY_BASE_URL")))
   );
 
-  if (provider !== "cli" && !apiKey && !isCustomBase && provider !== "cursor") {
-    throw new Error(`Provider "${provider}" requested but corresponding API key is not set in environment.`);
+  if (provider !== "cli" && !apiKey && !isCustomBase) {
+    const hint = provider === "openai"
+      ? `\nIf you meant Vercel AI Gateway, use --provider vercel (AI_GATEWAY_API_KEY).`
+      : "";
+    throw new Error(`Provider "${provider}" requested but corresponding API key is not set in environment.${hint}`);
   }
 
   let model = args.model;
   if (!model && provider !== "cli") {
     // Gate quality tracks model tier — default to the strong tier of each
     // provider, not the cheap one. Override with --model for cost control.
+    // Gateway models use provider/model ids.
     if (provider === "gemini") {
       model = "gemini-2.5-pro";
     } else if (provider === "openai") {
       model = "gpt-5";
     } else if (provider === "anthropic") {
       model = "claude-sonnet-4-6";
-    } else if (provider === "cursor") {
-      model = "gpt-4o";
+    } else if (provider === "vercel") {
+      model = gatewayPreferModel || "anthropic/claude-sonnet-4.6";
     }
   }
 
@@ -444,10 +521,10 @@ export function configureLLM(args) {
 // ─── Multi-provider selection (--providers) ─────────────────────────────────
 
 // Family token → provider family. Diversity is keyed on FAMILY, not provider id.
-// `cursor` is intentionally NOT a multi-provider family: it is a local proxy that
-// forwards to the same frontier models (OpenAI/Anthropic), so it adds no INDEPENDENT
-// family diversity — the whole point of this mode. It remains available for
-// single-provider review via --provider cursor.
+// `cursor` / `agent` are intentionally NOT multi-provider families: the Cursor
+// Agent CLI can route to openai/anthropic models, so counting it as an
+// independent family would fake diversity. Single-provider: --provider cursor|agent.
+// Vercel AI Gateway is a TRANSPORT (provider id `vercel`), not a diversity family.
 const TOKEN_FAMILY = {
   gpt: "openai", openai: "openai", codex: "openai",
   claude: "anthropic", anthropic: "anthropic",
@@ -458,14 +535,33 @@ const TOKEN_FAMILY = {
 // for that on-host CLI, so it resolves CLI-only and is NEVER silently upgraded to
 // the family's API (which would send the diff off-host despite the user's intent).
 // Their family label is still used for diversity grouping.
-const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy"]);
+const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy", "agent", "cursor-agent"]);
 
-// Ordered concrete candidates per family: prefer the API (key present) over the
-// local CLI, mirroring the single-provider auto-detection bias.
+// Default Vercel AI Gateway model ids per diversity family (provider/model form).
+export const GATEWAY_FAMILY_MODELS = {
+  openai: "openai/gpt-5",
+  anthropic: "anthropic/claude-sonnet-4.6",
+  gemini: "google/gemini-2.5-pro"
+};
+
+// Ordered concrete candidates per family:
+// native API key → Gateway (one-key multi-family) → local CLI.
 const FAMILY_CANDIDATES = {
-  openai: [{ kind: "api", provider: "openai", envKeys: ["OPENAI_API_KEY"] }, { kind: "cli", cliCmd: "codex" }],
-  anthropic: [{ kind: "api", provider: "anthropic", envKeys: ["ANTHROPIC_API_KEY"] }, { kind: "cli", cliCmd: "claude" }],
-  gemini: [{ kind: "api", provider: "gemini", envKeys: ["GEMINI_API_KEY"] }, { kind: "cli", cliCmd: "agy" }]
+  openai: [
+    { kind: "api", provider: "openai", envKeys: ["OPENAI_API_KEY"] },
+    { kind: "gateway" },
+    { kind: "cli", cliCmd: "codex" }
+  ],
+  anthropic: [
+    { kind: "api", provider: "anthropic", envKeys: ["ANTHROPIC_API_KEY"] },
+    { kind: "gateway" },
+    { kind: "cli", cliCmd: "claude" }
+  ],
+  gemini: [
+    { kind: "api", provider: "gemini", envKeys: ["GEMINI_API_KEY"] },
+    { kind: "gateway" },
+    { kind: "cli", cliCmd: "agy" }
+  ]
 };
 
 // The family of the agent running this review, so auto-selection never picks the
@@ -504,15 +600,46 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
   if (family) {
     for (const cand of FAMILY_CANDIDATES[family]) {
       if (cand.kind === "api") {
-        const matched = cand.envKeys.find((e) => process.env[e]);
-        const key = matched ? process.env[matched] : (allowApiKeyFallback && args.apiKey ? args.apiKey : null);
+        const matched = cand.envKeys.find((e) => envNonEmpty(e));
+        const key = matched ? envNonEmpty(matched) : (allowApiKeyFallback && args.apiKey ? args.apiKey : null);
         if (key) return build(cand.provider, key);
+      }
+      if (cand.kind === "gateway") {
+        const key = gatewayCredential();
+        if (key) {
+          const gwModel = GATEWAY_FAMILY_MODELS[family];
+          return {
+            id,
+            family,
+            config: {
+              ...configureLLM({
+                ...args,
+                provider: "vercel",
+                model: args.model || gwModel,
+                providers: undefined,
+                apiKey: key
+              }),
+              id
+            }
+          };
+        }
       }
       if (cand.kind === "cli" && isCmdInstalled(cand.cliCmd)) {
         return build(cand.cliCmd);
       }
     }
     return { id, family, config: null };
+  }
+  // `cursor` is a single-provider alias for the Agent CLI — NOT the Cursor IDE
+  // binary that often sits on PATH as `cursor`. Never treat that IDE shim as a
+  // review provider (configureLLM would throw and abort --providers entirely).
+  if (id === "cursor") {
+    if (!resolveCursorAgentCmd()) return { id, family: null, config: null };
+    return {
+      id,
+      family: null,
+      config: { ...configureLLM({ ...args, provider: "cursor", providers: undefined }), id }
+    };
   }
   // Unknown token: treat as a raw local CLI command if installed.
   if (isCmdInstalled(id)) return build(id);
@@ -637,7 +764,8 @@ export async function llmCall(config, prompt, systemInstruction = "", schema = n
   if (provider === "cli") {
     return callCliLLM(cliCmd, prompt, systemInstruction, schema, {
       timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      allowUnsandboxedCli: !!allowUnsandboxedCli
+      allowUnsandboxedCli: !!allowUnsandboxedCli,
+      model
     });
   }
 
@@ -693,7 +821,10 @@ export async function llmCall(config, prompt, systemInstruction = "", schema = n
         }
         if (candidate.finishReason === "MAX_TOKENS") throw truncationError("Gemini");
         return candidate.content.parts.map((p) => p.text || "").join("");
-      } else if (provider === "openai" || provider === "cursor") {
+      } else if (provider === "openai" || provider === "vercel") {
+        // vercel (AI Gateway) shares the OpenAI Chat Completions client, including
+        // strict json_schema with automatic degrade to json_object for gateways
+        // that reject it.
         const url = `${apiBase.replace(/\/$/, "")}/chat/completions`;
         const headers = {
           "Content-Type": "application/json",
@@ -702,10 +833,11 @@ export async function llmCall(config, prompt, systemInstruction = "", schema = n
         if (apiKey) {
           headers["Authorization"] = `Bearer ${apiKey}`;
         }
+        const label = provider === "vercel" ? "Vercel AI Gateway" : "OpenAI";
         let responseFormat;
         if (schema) {
           responseFormat =
-            provider === "openai" && !strictSchemaUnsupported
+            !strictSchemaUnsupported
               ? {
                   type: "json_schema",
                   json_schema: { name: "adversarial_review", strict: true, schema: sanitizeSchemaForProvider(schema) }
@@ -736,17 +868,17 @@ export async function llmCall(config, prompt, systemInstruction = "", schema = n
             log.warn("Endpoint rejected strict json_schema output; degrading to json_object mode.");
             strictSchemaUnsupported = true;
             retries--; // The degraded re-attempt counts against the retry budget.
-            if (retries === 0) throw apiError("OpenAI", res.status, text);
+            if (retries === 0) throw apiError(label, res.status, text);
             continue;
           }
-          throw apiError(provider === "cursor" ? "Cursor" : "OpenAI", res.status, text, parseRetryAfterMs(res.headers.get("retry-after")));
+          throw apiError(label, res.status, text, parseRetryAfterMs(res.headers.get("retry-after")));
         }
         const data = await res.json();
         const choice = data.choices?.[0];
         if (!choice?.message) {
-          throw new Error(`Invalid response format from ${provider} API: ` + JSON.stringify(data));
+          throw new Error(`Invalid response format from ${label} API: ` + JSON.stringify(data));
         }
-        if (choice.finish_reason === "length") throw truncationError("OpenAI");
+        if (choice.finish_reason === "length") throw truncationError(label);
         return choice.message.content;
       } else if (provider === "anthropic") {
         const url = `${apiBase.replace(/\/$/, "")}/messages`;

@@ -72,22 +72,25 @@ test("configureLLM handles custom base, key, and headers", () => {
   }
 });
 
-test("configureLLM maps cursor provider correctly", () => {
+test("configureLLM maps cursor provider to the Cursor Agent CLI (not a localhost proxy)", () => {
   const oldEnv = { ...process.env };
   delete process.env.OPENAI_API_KEY;
+  delete process.env.AI_GATEWAY_API_KEY;
+  delete process.env.VERCEL_OIDC_TOKEN;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cursor-"));
+  const binName = process.platform === "win32" ? "agent.cmd" : "agent";
+  const binPath = path.join(tempDir, binName);
+  fs.writeFileSync(binPath, "#!/bin/sh\necho mock");
+  if (process.platform !== "win32") fs.chmodSync(binPath, 0o755);
+  process.env.PATH = tempDir;
   try {
-    const args = {
-      provider: "cursor"
-    };
-
-    const config = configureLLM(args);
-
-    assert.equal(config.provider, "cursor");
-    assert.equal(config.model, "gpt-4o");
-    assert.equal(config.apiKey, "dummy");
-    assert.equal(config.apiBase, "http://127.0.0.1:8765/v1");
+    const config = configureLLM({ provider: "cursor" });
+    assert.equal(config.provider, "cli");
+    assert.equal(config.cliCmd, "agent");
+    assert.notEqual(config.apiBase, "http://127.0.0.1:8765/v1");
   } finally {
     process.env = oldEnv;
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -118,20 +121,27 @@ test("configureLLM auto-detects Cursor context when no provider/key specified", 
   delete process.env.OPENAI_API_KEY;
   delete process.env.ANTHROPIC_API_KEY;
   delete process.env.GEMINI_API_KEY;
+  delete process.env.AI_GATEWAY_API_KEY;
+  delete process.env.VERCEL_OIDC_TOKEN;
   // Running this suite inside Claude Code sets CLAUDECODE; clear it so the
   // Cursor detection branch is actually exercised.
   delete process.env.CLAUDECODE;
   delete process.env.CLAUDE_CODE;
   process.env.TERM_PROGRAM = "cursor";
-  process.env.PATH = ""; // Isolate PATH so no local CLI commands match
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cursor-auto-"));
+  const binName = process.platform === "win32" ? "agent.cmd" : "agent";
+  const binPath = path.join(tempDir, binName);
+  fs.writeFileSync(binPath, "#!/bin/sh\necho mock");
+  if (process.platform !== "win32") fs.chmodSync(binPath, 0o755);
+  process.env.PATH = tempDir;
 
   try {
     const config = configureLLM({});
-    assert.equal(config.provider, "cursor");
-    assert.equal(config.model, "gpt-4o");
-    assert.equal(config.apiBase, "http://127.0.0.1:8765/v1");
+    assert.equal(config.provider, "cli");
+    assert.equal(config.cliCmd, "agent");
   } finally {
     process.env = oldEnv;
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -140,7 +150,9 @@ test("configureLLM auto-detects Claude Code context when no provider/key specifi
   delete process.env.OPENAI_API_KEY;
   delete process.env.ANTHROPIC_API_KEY;
   delete process.env.GEMINI_API_KEY;
-  
+  delete process.env.AI_GATEWAY_API_KEY;
+  delete process.env.VERCEL_OIDC_TOKEN;
+
   process.env.CLAUDE_CODE = "1";
   
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adversarial-test-"));
@@ -189,6 +201,8 @@ test("configureLLM auto-detects agy CLI when only agy is installed and no API ke
   delete process.env.OPENAI_API_KEY;
   delete process.env.ANTHROPIC_API_KEY;
   delete process.env.GEMINI_API_KEY;
+  delete process.env.AI_GATEWAY_API_KEY;
+  delete process.env.VERCEL_OIDC_TOKEN;
   // Builder is Claude; the critic should be the agy (Gemini-family) CLI.
   process.env.CLAUDE_CODE = "1";
 
@@ -225,6 +239,90 @@ test("cliReviewArgs / cliFallbackArgs use plan mode + -p for claude and agy", ()
     ["-p", "PROMPT-BODY"]
   );
   assert.deepEqual(cliFallbackArgs("somecli", "PROMPT-BODY"), ["PROMPT-BODY"]);
+});
+
+test("cliReviewArgs for agent uses --mode plan + -p + --trust (not Claude --permission-mode)", () => {
+  assert.deepEqual(
+    cliReviewArgs("agent"),
+    ["-p", "--trust", "--output-format", "text", "--mode", "plan", "-"]
+  );
+  assert.deepEqual(
+    cliReviewArgs("agent", { allowUnsandboxedCli: true }),
+    ["-p", "--trust", "--output-format", "text", "-"]
+  );
+  assert.deepEqual(
+    cliReviewArgs("agent", { model: "sonnet-4" }),
+    ["-p", "--trust", "--output-format", "text", "--mode", "plan", "--model", "sonnet-4", "-"]
+  );
+  assert.deepEqual(
+    cliFallbackArgs("cursor-agent", "PROMPT-BODY"),
+    ["-p", "--trust", "--output-format", "text", "--mode", "plan", "PROMPT-BODY"]
+  );
+});
+
+test("src/ has no hardcoded Cursor proxy port 8765", () => {
+  const llmSrc = fs.readFileSync(new URL("../src/llm.js", import.meta.url), "utf8");
+  assert.ok(!llmSrc.includes("8765"), "dead localhost proxy default must be removed");
+});
+
+test("configureLLM vercel / gateway defaults (AI Gateway)", () => {
+  const oldEnv = { ...process.env };
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.LLM_API_KEY;
+  delete process.env.AI_GATEWAY_API_BASE;
+  delete process.env.AI_GATEWAY_BASE_URL;
+  process.env.AI_GATEWAY_API_KEY = "test";
+  try {
+    const vercel = configureLLM({ provider: "vercel" });
+    assert.equal(vercel.provider, "vercel");
+    assert.equal(vercel.apiBase, "https://ai-gateway.vercel.sh/v1");
+    assert.equal(vercel.model, "anthropic/claude-sonnet-4.6");
+    assert.equal(vercel.apiKey, "test");
+
+    const alias = configureLLM({ provider: "gateway" });
+    assert.equal(alias.provider, "vercel");
+    assert.equal(alias.apiBase, vercel.apiBase);
+    assert.equal(alias.model, vercel.model);
+  } finally {
+    process.env = oldEnv;
+  }
+});
+
+test("configureLLM auto-detects AI_GATEWAY_API_KEY as vercel", () => {
+  const oldEnv = { ...process.env };
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.LLM_API_KEY;
+  delete process.env.CLAUDECODE;
+  delete process.env.CLAUDE_CODE;
+  delete process.env.TERM_PROGRAM;
+  process.env.AI_GATEWAY_API_KEY = "gw-only";
+  process.env.PATH = "";
+  try {
+    const config = configureLLM({});
+    assert.equal(config.provider, "vercel");
+    assert.equal(config.apiKey, "gw-only");
+  } finally {
+    process.env = oldEnv;
+  }
+});
+
+test("configureLLM openai with only AI_GATEWAY_API_KEY does not silently redirect", () => {
+  const oldEnv = { ...process.env };
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.LLM_API_KEY;
+  process.env.AI_GATEWAY_API_KEY = "gw-only";
+  try {
+    assert.throws(
+      () => configureLLM({ provider: "openai" }),
+      /API key is not set|vercel/i
+    );
+  } finally {
+    process.env = oldEnv;
+  }
 });
 
 test("parseRetryAfterMs parses seconds and HTTP-date, capped", () => {

@@ -178,8 +178,10 @@ Next steps
                        finding (default 1).
 
 # Provider
---provider <name>      anthropic | openai | gemini | cursor | <local-cli-cmd>.
---model <name>         Force the model name.
+--provider <name>      anthropic | openai | gemini | vercel | gateway |
+                       cursor | agent | <local-cli-cmd>.
+                       cursor/agent → Cursor Agent CLI; vercel/gateway → AI Gateway.
+--model <name>         Force the model name (Gateway: use provider/model ids).
 --api-base <url>       Override the active provider's API base URL.
 --api-key <key>        Override the active provider's API key.
 --headers <json>       Inject custom JSON headers into the LLM request.
@@ -244,12 +246,24 @@ a weaker critic. Otherwise:
 1. `ANTHROPIC_API_KEY` → Anthropic API (default model `claude-sonnet-4-6`)
 2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
-4. A local CLI agent on `PATH`: `claude`, `codex`, or `agy` (uses your active session)
+4. `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`) → Vercel AI Gateway
+   (`--provider vercel`, default model `anthropic/claude-sonnet-4.6`)
+5. A local CLI agent on `PATH`: `claude`, `codex`, `agy`, or `agent` (Cursor Agent CLI)
 
-Force any of them with `--provider`, and override the model with `--model`. A local CLI
-agent is selected by passing its command name, e.g. `--provider claude`. Defaults are the
-strong tier of each provider — gate quality tracks model tier; downgrade with `--model`
-deliberately, not accidentally.
+**Cursor Agent CLI** (`--provider cursor` or `agent`): requires `agent` on `PATH` and
+`agent login` or `CURSOR_API_KEY`. Reviews run with `--mode plan` (read-only). This is
+not a localhost HTTP proxy — for third-party OpenAI-compatible proxies use
+`--provider openai --api-base <url>`.
+
+**Vercel AI Gateway** (`--provider vercel` or `gateway`): one key, many `provider/model`
+ids (e.g. `openai/gpt-5`, `anthropic/claude-sonnet-4.6`, `google/gemini-2.5-pro`). With
+only `AI_GATEWAY_API_KEY` set, `--providers auto` can fan across those families through
+the Gateway (native vendor keys still win when present). Family token `anthropic` (not
+the CLI-only token `claude`) selects the Anthropic family via Gateway/API.
+
+Force any of them with `--provider`, and override the model with `--model`. Defaults are
+the strong tier of each provider — gate quality tracks model tier; downgrade with
+`--model` deliberately, not accidentally.
 
 No key and no CLI agent? Use `--prompt-only` to emit the prompt and feed it to a model
 yourself.

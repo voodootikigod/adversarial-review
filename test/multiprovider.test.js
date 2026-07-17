@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { selectProviders, underSatisfiedNotice, resolveProviderToken, builderFamily } from "../src/llm.js";
+import { selectProviders, underSatisfiedNotice, resolveProviderToken, builderFamily, GATEWAY_FAMILY_MODELS } from "../src/llm.js";
 import { runMultiProviderReview } from "../src/review.js";
 
 function approveResult() {
@@ -25,6 +25,8 @@ function withMockBins(cmds, env, fn) {
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.GEMINI_API_KEY;
     delete process.env.LLM_API_KEY;
+    delete process.env.AI_GATEWAY_API_KEY;
+    delete process.env.VERCEL_OIDC_TOKEN;
     delete process.env.CLAUDECODE;
     delete process.env.CLAUDE_CODE;
     delete process.env.TERM_PROGRAM;
@@ -198,4 +200,80 @@ test("#7: synonym tokens for one family are deduped (no quorum inflation)", () =
     assert.equal(sel.requestedCount, 1, "requested diversity is 1 distinct family");
     assert.equal(sel.underSatisfied, false);
   });
+});
+
+test("AI Gateway one-key multi-family: only AI_GATEWAY_API_KEY resolves gpt,anthropic,gemini via vercel", () => {
+  // Use family tokens (anthropic), not CLI-only token `claude` — naming `claude`
+  // resolves to the on-host CLI only and never upgrades to API/Gateway.
+  withMockBins([], { AI_GATEWAY_API_KEY: "gw" }, () => {
+    const sel = selectProviders({ providers: ["gpt", "anthropic", "gemini"] });
+    assert.equal(sel.providers.length, 3);
+    const fams = new Set(sel.providers.map((p) => p.family));
+    assert.deepEqual([...fams].sort(), ["anthropic", "gemini", "openai"]);
+    for (const p of sel.providers) {
+      assert.equal(p.config.provider, "vercel", `${p.family} must use Gateway transport`);
+      assert.equal(p.config.apiBase, "https://ai-gateway.vercel.sh/v1");
+      assert.equal(p.config.model, GATEWAY_FAMILY_MODELS[p.family]);
+    }
+    assert.equal(sel.underSatisfied, false);
+
+    const auto = selectProviders({ providers: "auto" });
+    assert.ok(auto.providers.length >= 2, "auto with Gateway-only must reach >=2 families");
+    assert.ok(auto.providers.every((p) => p.config.provider === "vercel"));
+  });
+});
+
+test("AI Gateway: native OPENAI_API_KEY wins over AI_GATEWAY_API_KEY for openai family", () => {
+  withMockBins([], { OPENAI_API_KEY: "sk-native", AI_GATEWAY_API_KEY: "gw" }, () => {
+    const sel = selectProviders({ providers: ["openai"] });
+    assert.equal(sel.providers.length, 1);
+    assert.equal(sel.providers[0].config.provider, "openai");
+    assert.match(sel.providers[0].config.apiBase, /api\.openai\.com/);
+    assert.equal(sel.providers[0].config.apiKey, "sk-native");
+  });
+});
+
+test("--providers auto never treats cursor/agent as a diversity family", () => {
+  withMockBins(["agent", "codex", "agy", "claude"], { CLAUDE_CODE: "1" }, () => {
+    const sel = selectProviders({ providers: "auto" });
+    const ids = sel.providers.map((p) => p.id);
+    assert.ok(!ids.includes("cursor") && !ids.includes("agent"), `auto must not select cursor/agent, got ${ids}`);
+    for (const p of sel.providers) {
+      assert.notEqual(p.config.cliCmd, "agent");
+    }
+  });
+});
+
+test("empty OPENAI_API_KEY does not block Gateway fallback", () => {
+  withMockBins([], { OPENAI_API_KEY: "", AI_GATEWAY_API_KEY: "gw" }, () => {
+    const r = resolveProviderToken("openai");
+    assert.ok(r.config, "empty native key must be treated as unset");
+    assert.equal(r.config.provider, "vercel");
+  });
+});
+
+test("cursor token without agent CLI is unreachable (does not throw on IDE cursor binary)", () => {
+  // Simulate PATH with a decoy `cursor` binary (like the Cursor IDE shim) but no agent.
+  const oldEnv = { ...process.env };
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cursor-decoy-"));
+  try {
+    const decoy = path.join(tempDir, process.platform === "win32" ? "cursor.cmd" : "cursor");
+    fs.writeFileSync(decoy, "#!/bin/sh\necho ide");
+    if (process.platform !== "win32") fs.chmodSync(decoy, 0o755);
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.AI_GATEWAY_API_KEY;
+    delete process.env.VERCEL_OIDC_TOKEN;
+    delete process.env.LLM_API_KEY;
+    process.env.PATH = tempDir;
+    const r = resolveProviderToken("cursor");
+    assert.equal(r.config, null, "cursor without agent must be unreachable, not throw");
+    const sel = selectProviders({ providers: ["gpt", "cursor"] });
+    assert.equal(sel.providers.length, 0);
+    assert.equal(sel.underSatisfied, true);
+  } finally {
+    process.env = oldEnv;
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+  }
 });

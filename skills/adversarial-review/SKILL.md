@@ -124,8 +124,8 @@ weaker critic, so non-Anthropic providers are preferred first:
 **Inside Claude Code** (`CLAUDECODE` / `CLAUDE_CODE` env set):
 1. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 2. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
-3. Local `codex` CLI on `PATH`
-4. Local `agy` CLI on `PATH`
+3. `AI_GATEWAY_API_KEY` → Vercel AI Gateway (non-Anthropic model preferred)
+4. Local `codex` / `agy` / `agent` CLI on `PATH`
 5. `ANTHROPIC_API_KEY` → Anthropic API (`claude-sonnet-4-6`) ← last resort, with warning
 6. Local `claude` CLI on `PATH` ← last resort, with warning
 
@@ -133,13 +133,20 @@ weaker critic, so non-Anthropic providers are preferred first:
 1. `GEMINI_API_KEY` → Gemini API
 2. `ANTHROPIC_API_KEY` → Anthropic API
 3. `OPENAI_API_KEY` → OpenAI API
-4. Local `agy`, `claude`, or `codex` CLI
+4. `AI_GATEWAY_API_KEY` → Vercel AI Gateway
+5. Local `agy`, `claude`, or `codex` CLI
+6. Local `agent` (Cursor Agent CLI) ← last resort, with warning
 
 **Everywhere else** (default order):
 1. `ANTHROPIC_API_KEY` → Anthropic API (`claude-sonnet-4-6`)
 2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
-4. Local `claude`, `codex`, or `agy` CLI
+4. `AI_GATEWAY_API_KEY` → Vercel AI Gateway (`anthropic/claude-sonnet-4.6`)
+5. Local `claude`, `codex`, `agy`, or `agent` CLI
+
+`--provider cursor|agent` uses the official Cursor Agent CLI (`agent -p --mode plan`),
+not a localhost proxy. `--provider vercel|gateway` uses Vercel AI Gateway
+(`provider/model` ids; one key can drive `--providers auto` across families).
 
 Force with `--provider <name>`; override the model with `--model <name>`. Gate quality
 tracks model tier — defaults are the strong tier of each provider; use `--model` to trade

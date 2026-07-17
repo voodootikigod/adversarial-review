@@ -179,7 +179,15 @@ export function detectFixer(args) {
 // Map known fixer CLIs to their provider family for the same-provider check.
 // agy runs Gemini models, so it is the "gemini" family even though its CLI
 // interface mirrors claude. The legacy `gemini` binary is deprecated and dropped.
-export const FIXER_PROVIDER_MAP = { codex: "openai", claude: "anthropic", agy: "gemini" };
+// agent/cursor-agent are reviewer-oriented (plan mode); not auto-selected as
+// fixers, but mapped when an explicit --loop-fixer names them.
+export const FIXER_PROVIDER_MAP = {
+  codex: "openai",
+  claude: "anthropic",
+  agy: "gemini",
+  agent: "cursor",
+  "cursor-agent": "cursor"
+};
 
 // ─── OS write constraint ──────────────────────────────────────────────────────
 
