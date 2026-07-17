@@ -65,10 +65,13 @@ ${colors.bold("Options:")}
                         credentials in the diff (off by default).
   --timeout <seconds>   Per-request timeout for API and local CLI providers (default 120).
   --allow-unsandboxed-cli
-                        Allow claude/agy review without --permission-mode plan
-                        (older CLIs). Default review isolation uses plan mode.
-  --provider <name>     Force provider: anthropic | openai | gemini | cursor | <local-cli-cmd>.
-  --model <name>        Force the model name.
+                        Allow claude/agy/agent review without plan/read-only mode
+                        (older CLIs or write-capable agent). Default review
+                        isolation uses plan mode.
+  --provider <name>     Force provider: anthropic | openai | gemini | vercel |
+                        gateway | cursor | agent | <local-cli-cmd>.
+                        cursor/agent → Cursor Agent CLI; vercel/gateway → AI Gateway.
+  --model <name>        Force the model name (Gateway: use provider/model ids).
   --api-base <url>      Override the active provider's API base URL.
   --api-key <key>       Override the active provider's API key.
   --headers <json>      Inject custom JSON headers into the LLM request.
@@ -100,15 +103,21 @@ ${colors.bold("Loop mode (--loop):")}
 
 ${colors.bold("LLM selection (when not --prompt-only):")}
   Auto-detected in order: ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY,
-  then a local CLI agent (claude, codex, agy). Override with --provider.
+  AI_GATEWAY_API_KEY, then a local CLI agent (claude, codex, agy, agent).
+  Override with --provider. With only AI_GATEWAY_API_KEY, --providers auto can
+  fan across openai/anthropic/gemini families through the Gateway.
 
 ${colors.bold("Environment Variables:")}
   ANTHROPIC_API_KEY     Use the Anthropic API.
   GEMINI_API_KEY        Use the Gemini API.
   OPENAI_API_KEY        Use the OpenAI API.
+  AI_GATEWAY_API_KEY    Use Vercel AI Gateway (--provider vercel|gateway).
+  VERCEL_OIDC_TOKEN     Alternate Gateway auth (Vercel OIDC).
   OPENAI_API_BASE       Override base URL for OpenAI provider.
   ANTHROPIC_API_BASE    Override base URL for Anthropic provider.
   GEMINI_API_BASE       Override base URL for Gemini provider.
+  AI_GATEWAY_API_BASE   Override base URL for Vercel AI Gateway.
+  CURSOR_API_KEY        Auth for the Cursor Agent CLI (agent login also works).
   LLM_API_KEY           Override API key for the active provider.
   LLM_HEADERS           JSON string of custom headers to inject.
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseArgs } from "../src/utils.js";
+import { HELP_TEXT, parseArgs } from "../src/utils.js";
 
 test("parseArgs rejects missing values and invalid integers", () => {
   const args = parseArgs(["node", "cli", "--base", "--max-files=abc", "--unknown"]);
@@ -210,4 +210,12 @@ test("parseArgs accepts --allow-unsandboxed-cli", () => {
   const args = parseArgs(["node", "cli.js", "--allow-unsandboxed-cli"]);
   assert.equal(args.allowUnsandboxedCli, true);
   assert.deepEqual(args.errors, []);
+});
+
+test("HELP_TEXT documents vercel/gateway and cursor/agent provider tokens", () => {
+  // Pin exact placeholder spelling so hollow-test invert-comparison on `<name>`
+  // / `<local-cli-cmd>` cannot silently rewrite the help surface.
+  assert.match(HELP_TEXT, /--provider <name>\s+Force provider:.*vercel/);
+  assert.match(HELP_TEXT, /gateway \| cursor \| agent \| <local-cli-cmd>\./);
+  assert.match(HELP_TEXT, /--model <name>\s+Force the model name \(Gateway: use provider\/model ids\)\./);
 });
