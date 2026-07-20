@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, parseRetryAfterMs } from "../src/llm.js";
+import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, maxArgvPromptBytes, parseRetryAfterMs } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
@@ -670,7 +670,7 @@ exit 2
   fs.chmodSync(binPath, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${tmpDir}:${oldPath}`;
-  // Prompt larger than MAX_ARGV_PROMPT_BYTES (100 KiB) — previously this path
+  // Prompt larger than the old hardcoded 100 KiB guard — previously this path
   // masked the flag rejection as a "prompt is too large" error.
   const hugePrompt = "x".repeat(110 * 1024);
   try {
@@ -704,6 +704,113 @@ test("CLI provider honors config.timeoutMs (fails faster than the 10m hardcode)"
       /Failed to execute local CLI agent|ETIMEDOUT|timed out|spawnSync/i
     );
     assert.ok(Date.now() - started < 4000, "should time out well under 4s");
+  } finally {
+    process.env.PATH = oldPath;
+    try { fs.unlinkSync(binPath); } catch {}
+    try { fs.rmdirSync(tmpDir); } catch {}
+  }
+});
+
+test("maxArgvPromptBytes derives from platform ARG_MAX, not a 100 KiB constant", () => {
+  // Issue #27: a 114 KB prompt was refused by the old hardcoded 100 KiB guard
+  // even though macOS ARG_MAX is 1 MiB and Linux MAX_ARG_STRLEN is 128 KiB.
+  const macLimit = maxArgvPromptBytes({
+    platform: "darwin",
+    argMax: 1048576,
+    envBytes: 10_000,
+    overheadBytes: 16 * 1024,
+  });
+  assert.ok(macLimit > 114_711, `macOS limit ${macLimit} should allow a 114711-byte prompt`);
+  assert.ok(macLimit > 100 * 1024, "macOS limit must exceed the old 100 KiB hardcode");
+
+  const linuxLimit = maxArgvPromptBytes({
+    platform: "linux",
+    argMax: 2 * 1024 * 1024,
+    envBytes: 10_000,
+    overheadBytes: 16 * 1024,
+  });
+  // Linux is bound by MAX_ARG_STRLEN (128 KiB), not total ARG_MAX.
+  assert.ok(linuxLimit <= 128 * 1024, `linux limit ${linuxLimit} must respect MAX_ARG_STRLEN`);
+  assert.ok(linuxLimit > 114_711, `linux limit ${linuxLimit} should still allow a 114711-byte prompt`);
+  assert.ok(linuxLimit < 200 * 1024, "linux must not use the full 2 MiB ARG_MAX for a single arg");
+
+  // Win32: command-line cap is separate from the environment block.
+  const winLimit = maxArgvPromptBytes({
+    platform: "win32",
+    argMax: 32 * 1024,
+    envBytes: 10_000,
+    overheadBytes: 16 * 1024,
+  });
+  assert.equal(winLimit, 16 * 1024);
+});
+
+test("114 KB prompt falls back to argv on stdin rejection instead of refusing", async () => {
+  const { llmCall } = await import("../src/llm.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-argv-114k-"));
+  const binPath = path.join(tmpDir, "agy");
+  const expected = '{"verdict":"approve","summary":"argv ok"}';
+  // Reject stdin (`-`) but accept a large positional prompt via argv.
+  fs.writeFileSync(
+    binPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args.includes("-")) {
+  console.error("stdin not supported in this mock");
+  process.exit(2);
+}
+const prompt = args[args.length - 1] || "";
+if (Buffer.byteLength(prompt) < 100000) {
+  console.error("FAIL: expected large argv prompt, got " + Buffer.byteLength(prompt));
+  process.exit(1);
+}
+process.stdout.write(${JSON.stringify(expected)});
+`
+  );
+  fs.chmodSync(binPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+  // 114711 mirrors the size that issue #27 observed being refused.
+  const largeBody = "y".repeat(114_711);
+  try {
+    const result = await llmCall(
+      { provider: "cli", cliCmd: "agy", timeoutMs: 10000 },
+      largeBody,
+      "sys"
+    );
+    assert.equal(result, expected);
+  } finally {
+    process.env.PATH = oldPath;
+    try { fs.unlinkSync(binPath); } catch {}
+    try { fs.rmdirSync(tmpDir); } catch {}
+  }
+});
+
+test("argv refusal names the platform limit, not a generic CLI failure", async () => {
+  const { llmCall } = await import("../src/llm.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-too-big-"));
+  const binPath = path.join(tmpDir, "agy");
+  fs.writeFileSync(
+    binPath,
+    `#!/bin/sh
+echo "stdin rejected" >&2
+exit 2
+`
+  );
+  fs.chmodSync(binPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+  // Larger than any realistic single-arg budget (macOS ~1 MiB ARG_MAX,
+  // Linux 128 KiB MAX_ARG_STRLEN) so the pre-check refuses before argv spawn.
+  const enormous = "z".repeat(3 * 1024 * 1024);
+  try {
+    await assert.rejects(
+      () => llmCall({ provider: "cli", cliCmd: "agy", timeoutMs: 10000 }, enormous, "sys"),
+      (err) => {
+        assert.match(err.message, /exceeds this platform's argv limit/);
+        assert.doesNotMatch(err.message, /Failed to execute local CLI agent/);
+        return true;
+      }
+    );
   } finally {
     process.env.PATH = oldPath;
     try { fs.unlinkSync(binPath); } catch {}
