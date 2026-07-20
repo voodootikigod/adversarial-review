@@ -6,9 +6,92 @@ import { log } from "./utils.js";
 import { sanitizeSchemaForProvider } from "./schema-validate.js";
 
 const DEFAULT_TIMEOUT_MS = 120 * 1000;
-// Conservative argv-size guard: macOS caps a single argument well below Linux's
-// ARG_MAX; past this we refuse the argv fallback rather than fail with E2BIG.
-const MAX_ARGV_PROMPT_BYTES = 100 * 1024;
+
+// Linux kernels cap a *single* argument at MAX_ARG_STRLEN (PAGE_SIZE * 32 = 128 KiB
+// on 4 KiB pages). That is the binding constraint for one huge prompt arg even when
+// total ARG_MAX is larger (often ~2 MiB). macOS has no equivalent per-arg cap —
+// its ARG_MAX is typically 1 MiB for args+env combined.
+const LINUX_MAX_ARG_STRLEN = 128 * 1024;
+const DEFAULT_ARGV_OVERHEAD_BYTES = 16 * 1024; // argv entries other than the prompt + margin
+const PLATFORM_ARG_MAX_DEFAULTS = {
+  darwin: 1024 * 1024,
+  linux: 2 * 1024 * 1024,
+  win32: 32 * 1024, // CreateProcess command-line limit is ~32K characters
+};
+
+let cachedProbedArgMax = undefined; // undefined = not probed yet; null = probe failed
+
+function environmentBlockBytes(env = process.env) {
+  let n = 0;
+  for (const [key, value] of Object.entries(env)) {
+    n += Buffer.byteLength(key) + 1 + Buffer.byteLength(value ?? "") + 1;
+  }
+  return n;
+}
+
+function probeArgMax() {
+  if (cachedProbedArgMax !== undefined) return cachedProbedArgMax;
+  try {
+    const out = execFileSync("getconf", ["ARG_MAX"], {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const n = Number.parseInt(out, 10);
+    cachedProbedArgMax = Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    cachedProbedArgMax = null;
+  }
+  return cachedProbedArgMax;
+}
+
+/**
+ * Maximum prompt size safe to pass as a single argv element on this platform.
+ * Prefer probing `getconf ARG_MAX`; fall back to platform defaults. On Linux the
+ * per-argument MAX_ARG_STRLEN ceiling wins over total ARG_MAX.
+ *
+ * Injectable options exist for unit tests. When overriding `platform` for a
+ * cross-platform check, also inject `argMax` — `probeArgMax()` always runs
+ * against the host OS.
+ */
+export function maxArgvPromptBytes({
+  platform = process.platform,
+  argMax = undefined,
+  envBytes = undefined,
+  overheadBytes = DEFAULT_ARGV_OVERHEAD_BYTES,
+} = {}) {
+  const probed = argMax !== undefined ? argMax : probeArgMax();
+  const platformDefault = PLATFORM_ARG_MAX_DEFAULTS[platform] ?? PLATFORM_ARG_MAX_DEFAULTS.linux;
+  const totalArgMax = probed ?? platformDefault;
+
+  // Windows CreateProcess command-line and environment limits are separate;
+  // do not subtract the env block from the ~32K argv budget.
+  const env = platform === "win32"
+    ? 0
+    : (envBytes !== undefined ? envBytes : environmentBlockBytes());
+  const totalBudget = totalArgMax - env - overheadBytes;
+
+  // Linux: a single argument cannot exceed MAX_ARG_STRLEN regardless of ARG_MAX.
+  if (platform === "linux") {
+    // 1 KiB safety margin for NUL terminator + kernel accounting rounding.
+    const perArgBudget = LINUX_MAX_ARG_STRLEN - 1024;
+    return Math.max(0, Math.min(perArgBudget, totalBudget));
+  }
+
+  return Math.max(0, totalBudget);
+}
+
+function argvTooLargeMessage(cliLabel, promptBytes, limitBytes) {
+  return (
+    `${cliLabel} rejected the prompt on stdin, and the prompt (${promptBytes} bytes) ` +
+    `exceeds this platform's argv limit (~${limitBytes} bytes). ` +
+    `Lower --max-bytes, narrow the scope, or use an API provider.`
+  );
+}
+
+function isE2BigError(err) {
+  return err?.code === "E2BIG" || err?.errno === os.constants.errno.E2BIG;
+}
 
 // Robustly extract JSON from a model response, even if wrapped in prose or a markdown fence.
 export function cleanJsonResponse(text) {
@@ -243,13 +326,12 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
       // to that stdin pipe, so the review content is never truncated by argv size limits.
       execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs);
     } catch (stdinErr) {
-      if (Buffer.byteLength(fullPrompt) > MAX_ARGV_PROMPT_BYTES) {
+      const promptBytes = Buffer.byteLength(fullPrompt);
+      const argvLimit = maxArgvPromptBytes();
+      if (promptBytes > argvLimit) {
         const stderr = stdinErr.stderr?.toString("utf8").trim() || "";
         throw new Error(
-          `Codex rejected the prompt on stdin, and the prompt is too large ` +
-            `(${Buffer.byteLength(fullPrompt)} bytes) to pass as a command-line argument. ` +
-            `Lower --max-bytes, narrow the scope, or use an API provider.` +
-            (stderr ? `\n${stderr}` : "")
+          argvTooLargeMessage("Codex", promptBytes, argvLimit) + (stderr ? `\n${stderr}` : "")
         );
       }
       // Argv fallback: pass prompt as positional argument
@@ -257,6 +339,9 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
       try {
         execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs);
       } catch (argvErr) {
+        if (isE2BigError(argvErr)) {
+          throw new Error(argvTooLargeMessage("Codex", promptBytes, argvLimit));
+        }
         const stderr = argvErr.stderr?.toString("utf8") || stdinErr.stderr?.toString("utf8") || "";
         throw new Error(
           `Failed to execute codex: ${argvErr.message || stdinErr.message}` +
@@ -297,17 +382,17 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
     return execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs);
   } catch (err) {
     const stderr = err.stderr?.toString("utf8") || "";
-    // Unknown-flag rejections must surface clearly — not as a prompt-size error.
+    // Unknown-flag rejections must surface clearly — not as a prompt-size / argv error.
     // Retrying argv would pass the same bad flag and fail the same way.
     const flagRejection = describeUnknownFlagRejection(cliCmd, stderr);
     if (flagRejection) {
       throw new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : ""));
     }
-    if (Buffer.byteLength(fullPrompt) > MAX_ARGV_PROMPT_BYTES) {
+    const promptBytes = Buffer.byteLength(fullPrompt);
+    const argvLimit = maxArgvPromptBytes();
+    if (promptBytes > argvLimit) {
       throw new Error(
-        `Local CLI agent "${cliCmd}" rejected the prompt on stdin, and the prompt is too large ` +
-          `(${Buffer.byteLength(fullPrompt)} bytes) to pass as a command-line argument. ` +
-          `Lower --max-bytes, narrow the scope, or use an API provider.` +
+        argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit) +
           (stderr.trim() ? `\n${stderr.trim()}` : "")
       );
     }
@@ -315,6 +400,9 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
       log.substep(`Stdin piping not supported by ${cliCmd}, retrying as argument...`);
       return execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs);
     } catch (err2) {
+      if (isE2BigError(err2)) {
+        throw new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit));
+      }
       const stderr2 = err2.stderr?.toString("utf8") || stderr;
       const flagRejection2 = describeUnknownFlagRejection(cliCmd, stderr2);
       if (flagRejection2) {
