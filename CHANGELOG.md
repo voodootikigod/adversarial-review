@@ -4,6 +4,9 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **`--provider agy`**: pass `--mode plan` instead of Claude’s `--permission-mode plan` (agy 1.1.2 rejects the latter). Unknown-flag rejections from local CLIs are now reported as `provider "X" rejected flag "Y"` instead of being masked as a prompt-size error.
+
 ### Breaking changes
 - **`--provider cursor` no longer targets a localhost HTTP proxy** (`http://127.0.0.1:8765`). It now resolves to the official Cursor Agent CLI (`agent` / `cursor-agent`) in plan/read-only mode. Third-party OpenAI-compatible proxies: `--provider openai --api-base <url>`.
 

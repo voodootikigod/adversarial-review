@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, parseRetryAfterMs } from "../src/llm.js";
+import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, parseRetryAfterMs } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
@@ -228,17 +228,34 @@ test("configureLLM auto-detects agy CLI when only agy is installed and no API ke
   }
 });
 
-test("cliReviewArgs / cliFallbackArgs use plan mode + -p for claude and agy", () => {
-  assert.deepEqual(cliReviewArgs("agy"), ["--permission-mode", "plan", "-p", "-"]);
+test("cliReviewArgs / cliFallbackArgs use per-CLI plan flags for claude and agy", () => {
+  // agy uses --mode plan (not Claude's --permission-mode)
+  assert.deepEqual(cliReviewArgs("agy"), ["--mode", "plan", "-p", "-"]);
   assert.deepEqual(cliReviewArgs("claude"), ["--permission-mode", "plan", "-p", "-"]);
   assert.deepEqual(cliReviewArgs("agy", { allowUnsandboxedCli: true }), ["-p", "-"]);
-  assert.deepEqual(cliFallbackArgs("agy", "PROMPT-BODY"), ["--permission-mode", "plan", "-p", "PROMPT-BODY"]);
+  assert.deepEqual(cliFallbackArgs("agy", "PROMPT-BODY"), ["--mode", "plan", "-p", "PROMPT-BODY"]);
   assert.deepEqual(cliFallbackArgs("claude", "PROMPT-BODY"), ["--permission-mode", "plan", "-p", "PROMPT-BODY"]);
   assert.deepEqual(
     cliFallbackArgs("claude", "PROMPT-BODY", { allowUnsandboxedCli: true }),
     ["-p", "PROMPT-BODY"]
   );
+  assert.deepEqual(
+    cliFallbackArgs("agy", "PROMPT-BODY", { allowUnsandboxedCli: true }),
+    ["-p", "PROMPT-BODY"]
+  );
   assert.deepEqual(cliFallbackArgs("somecli", "PROMPT-BODY"), ["PROMPT-BODY"]);
+});
+
+test("describeUnknownFlagRejection parses Go flag and common unknown-flag stderr", () => {
+  assert.equal(
+    describeUnknownFlagRejection("agy", "flags provided but not defined: -permission-mode\nUsage of agy:\n"),
+    'provider "agy" rejected flag "--permission-mode"'
+  );
+  assert.equal(
+    describeUnknownFlagRejection("claude", "error: unknown flag: --mode\n"),
+    'provider "claude" rejected flag "--mode"'
+  );
+  assert.equal(describeUnknownFlagRejection("agy", "some unrelated failure"), null);
 });
 
 test("cliReviewArgs for agent uses --mode plan + -p + --trust (not Claude --permission-mode)", () => {
@@ -355,11 +372,13 @@ test("agy CLI review path invokes -p print mode and delivers the prompt via stdi
 has_print=false
 read_stdin=false
 has_plan=false
+has_bad_flag=false
 prev=""
 for arg in "$@"; do
   if [ "$arg" = "-p" ] || [ "$arg" = "--print" ]; then has_print=true; fi
   if [ "$arg" = "-" ]; then read_stdin=true; fi
-  if [ "$prev" = "--permission-mode" ] && [ "$arg" = "plan" ]; then has_plan=true; fi
+  if [ "$arg" = "--permission-mode" ]; then has_bad_flag=true; fi
+  if [ "$prev" = "--mode" ] && [ "$arg" = "plan" ]; then has_plan=true; fi
   prev="$arg"
 done
 if [ "$has_print" = "false" ]; then
@@ -369,7 +388,10 @@ if [ "$read_stdin" = "false" ]; then
   echo "FAIL: stdin indicator (-) not passed" >&2; exit 1
 fi
 if [ "$has_plan" = "false" ]; then
-  echo "FAIL: --permission-mode plan not passed (review isolation required)" >&2; exit 1
+  echo "FAIL: --mode plan not passed (review isolation required)" >&2; exit 1
+fi
+if [ "$has_bad_flag" = "true" ]; then
+  echo "FAIL: --permission-mode must not be passed to agy" >&2; exit 1
 fi
 stdin_content=$(cat)
 echo "$stdin_content" | grep -q "${sentinelSystem}" || { echo "FAIL: system instruction missing from stdin" >&2; exit 1; }
@@ -601,7 +623,7 @@ printf '%s' '${expectedResponse}'
   }
 });
 
-test("allowUnsandboxedCli omits --permission-mode plan for claude/agy review", async () => {
+test("allowUnsandboxedCli omits plan-mode sandbox flags for claude/agy review", async () => {
   const { llmCall } = await import("../src/llm.js");
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-unsandbox-"));
   const binPath = path.join(tmpDir, "claude");
@@ -625,6 +647,41 @@ printf '%s' '{"ok":true}'
       "s"
     );
     assert.equal(result, '{"ok":true}');
+  } finally {
+    process.env.PATH = oldPath;
+    try { fs.unlinkSync(binPath); } catch {}
+    try { fs.rmdirSync(tmpDir); } catch {}
+  }
+});
+
+test("unknown-flag CLI rejection is reported as rejected flag, not prompt-size error", async () => {
+  const { llmCall } = await import("../src/llm.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-badflag-"));
+  const binPath = path.join(tmpDir, "agy");
+  // Mimic agy 1.1.2 Go flag rejection for an unrecognized flag.
+  fs.writeFileSync(
+    binPath,
+    `#!/bin/sh
+echo "flags provided but not defined: -permission-mode" >&2
+echo "Usage of agy:" >&2
+exit 2
+`
+  );
+  fs.chmodSync(binPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+  // Prompt larger than MAX_ARGV_PROMPT_BYTES (100 KiB) — previously this path
+  // masked the flag rejection as a "prompt is too large" error.
+  const hugePrompt = "x".repeat(110 * 1024);
+  try {
+    await assert.rejects(
+      () => llmCall({ provider: "cli", cliCmd: "agy", timeoutMs: 10000 }, hugePrompt, "sys"),
+      (err) => {
+        assert.match(err.message, /provider "agy" rejected flag "--permission-mode"/);
+        assert.doesNotMatch(err.message, /prompt is too large/);
+        return true;
+      }
+    );
   } finally {
     process.env.PATH = oldPath;
     try { fs.unlinkSync(binPath); } catch {}

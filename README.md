@@ -158,7 +158,7 @@ Next steps
 --context-lines <n>    Diff context lines passed to git diff -U<n> (default 10).
 --include-files        Also inline full post-change file contents (budgeted).
 --allow-summary-review Allow API providers to review summary-only large diffs.
---allow-unsandboxed-cli Allow claude/agy review without --permission-mode plan.
+--allow-unsandboxed-cli Allow claude/agy/agent review without plan/read-only mode.
 --allow-secrets        Send the payload even if the secret scan finds likely
                        credentials in the diff (off by default).
 

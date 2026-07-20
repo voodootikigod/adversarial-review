@@ -122,11 +122,39 @@ function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000) {
 }
 
 // Claude-Code-compatible CLIs (claude, agy): always use print mode (-p) with the
-// stdin sentinel (-). For review, also force --permission-mode plan so an untrusted
-// diff cannot prompt-inject writes (mirrors Codex --sandbox read-only). Opt out
-// with --allow-unsandboxed-cli when an older CLI rejects plan mode.
+// stdin sentinel (-). For review, also force plan/read-only mode so an untrusted
+// diff cannot prompt-inject writes (mirrors Codex --sandbox read-only). Flag name
+// is per-CLI: claude uses --permission-mode; agy uses --mode. Opt out with
+// --allow-unsandboxed-cli when an older CLI rejects plan mode.
 export function isCursorAgentCli(cliCmd) {
   return cliCmd === "agent" || cliCmd === "cursor-agent";
+}
+
+/** Plan/read-only sandbox flags for a local CLI (empty when unsandboxed or unknown). */
+export function cliSandboxArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
+  if (allowUnsandboxedCli) return [];
+  if (cliCmd === "claude") return ["--permission-mode", "plan"];
+  if (cliCmd === "agy" || isCursorAgentCli(cliCmd)) return ["--mode", "plan"];
+  return [];
+}
+
+/**
+ * Detect an unknown-flag rejection in CLI stderr (Go flag package, common CLIs).
+ * Returns a clear error string, or null if stderr does not look like a flag rejection.
+ */
+export function describeUnknownFlagRejection(cliCmd, stderr) {
+  const text = (stderr || "").toString();
+  // Go's flag package: "flags provided but not defined: -permission-mode"
+  // (one leading dash is stripped in the echo; the caller passed --permission-mode).
+  const goMatch = text.match(/flags provided but not defined:\s*-{0,2}(\S+)/i);
+  if (goMatch) {
+    return `provider "${cliCmd}" rejected flag "--${goMatch[1].replace(/^-+/, "")}"`;
+  }
+  const unknownMatch = text.match(/unknown (?:flag|option)[:\s]+-{0,2}(\S+)/i);
+  if (unknownMatch) {
+    return `provider "${cliCmd}" rejected flag "--${unknownMatch[1].replace(/^-+/, "")}"`;
+  }
+  return null;
 }
 
 function envNonEmpty(name) {
@@ -149,24 +177,22 @@ function resolveCursorAgentCmd() {
 export function cliReviewArgs(cliCmd, { allowUnsandboxedCli = false, model = null } = {}) {
   if (isCursorAgentCli(cliCmd)) {
     // Cursor Agent CLI: -p alone grants write/shell tools — force --mode plan
-    // for review isolation (mirrors claude/agy --permission-mode plan).
+    // for review isolation (same intent as claude --permission-mode / agy --mode).
     const args = ["-p", "--trust", "--output-format", "text"];
-    if (!allowUnsandboxedCli) args.push("--mode", "plan");
+    args.push(...cliSandboxArgs(cliCmd, { allowUnsandboxedCli }));
     if (model) args.push("--model", model);
     args.push("-");
     return args;
   }
   if (cliCmd !== "claude" && cliCmd !== "agy") return [];
-  const args = [];
-  if (!allowUnsandboxedCli) args.push("--permission-mode", "plan");
-  args.push("-p", "-");
+  const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli }), "-p", "-"];
   return args;
 }
 
 export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = false, model = null } = {}) {
   if (isCursorAgentCli(cliCmd)) {
     const args = ["-p", "--trust", "--output-format", "text"];
-    if (!allowUnsandboxedCli) args.push("--mode", "plan");
+    args.push(...cliSandboxArgs(cliCmd, { allowUnsandboxedCli }));
     if (model) args.push("--model", model);
     args.push(fullPrompt);
     return args;
@@ -174,10 +200,7 @@ export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = fals
   // claude and agy are Claude-Code-compatible: they need -p (print mode) when
   // the prompt is passed as a command-line argument.
   if (cliCmd === "claude" || cliCmd === "agy") {
-    const args = [];
-    if (!allowUnsandboxedCli) args.push("--permission-mode", "plan");
-    args.push("-p", fullPrompt);
-    return args;
+    return [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli }), "-p", fullPrompt];
   }
   return [fullPrompt];
 }
@@ -263,7 +286,8 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
     return callCodexCli(fullPrompt, schema, timeoutMs);
   }
 
-  // claude/agy: -p + stdin `-` + --permission-mode plan.
+  // claude: -p + stdin `-` + --permission-mode plan.
+  // agy: -p + stdin `-` + --mode plan.
   // agent/cursor-agent: -p + stdin `-` + --mode plan + --trust (Cursor CLI).
   // A bare invocation launches interactively and hangs until timeout.
   const primaryArgs = cliReviewArgs(cliCmd, { allowUnsandboxedCli, model });
@@ -272,21 +296,31 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
   try {
     return execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs);
   } catch (err) {
+    const stderr = err.stderr?.toString("utf8") || "";
+    // Unknown-flag rejections must surface clearly — not as a prompt-size error.
+    // Retrying argv would pass the same bad flag and fail the same way.
+    const flagRejection = describeUnknownFlagRejection(cliCmd, stderr);
+    if (flagRejection) {
+      throw new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : ""));
+    }
     if (Buffer.byteLength(fullPrompt) > MAX_ARGV_PROMPT_BYTES) {
-      const stderr = err.stderr?.toString("utf8").trim() || "";
       throw new Error(
         `Local CLI agent "${cliCmd}" rejected the prompt on stdin, and the prompt is too large ` +
           `(${Buffer.byteLength(fullPrompt)} bytes) to pass as a command-line argument. ` +
           `Lower --max-bytes, narrow the scope, or use an API provider.` +
-          (stderr ? `\n${stderr}` : "")
+          (stderr.trim() ? `\n${stderr.trim()}` : "")
       );
     }
     try {
       log.substep(`Stdin piping not supported by ${cliCmd}, retrying as argument...`);
       return execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs);
     } catch (err2) {
-      const stderr = err2.stderr?.toString("utf8") || err.stderr?.toString("utf8") || "";
-      const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
+      const stderr2 = err2.stderr?.toString("utf8") || stderr;
+      const flagRejection2 = describeUnknownFlagRejection(cliCmd, stderr2);
+      if (flagRejection2) {
+        throw new Error(flagRejection2 + (stderr2.trim() ? `\n${stderr2.trim()}` : ""));
+      }
+      const suffix = stderr2.trim() ? `\n${stderr2.trim()}` : "";
       throw new Error(`Failed to execute local CLI agent "${cliCmd}": ${err2.message || err.message}${suffix}`);
     }
   }
