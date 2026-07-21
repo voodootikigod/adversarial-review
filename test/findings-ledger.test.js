@@ -170,9 +170,9 @@ test("T20: an existing permissive ledger is secured BEFORE the sensitive entry i
     const ledger = path.join(root, "findings.jsonl");
     fs.writeFileSync(ledger, "old\n");
     fs.chmodSync(ledger, 0o644);
-    appendLedger(ledger, [{ secret: "quoted-source" }]);
+    appendLedger(ledger, [{ excerpt: "quoted-repo-source" }]);
     assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "tightened");
-    assert.match(fs.readFileSync(ledger, "utf8"), /quoted-source/, "entry written");
+    assert.match(fs.readFileSync(ledger, "utf8"), /quoted-repo-source/, "entry written");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
