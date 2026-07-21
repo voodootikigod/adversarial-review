@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { toLedgerEntries, appendLedger } from "../src/findings-ledger.js";
+import { toLedgerEntries, appendLedger, appendRecordSync } from "../src/findings-ledger.js";
 import { deriveVerdict } from "../src/review.js";
 
 function finding(overrides = {}) {
@@ -186,6 +186,35 @@ test("T20: a large ledger entry is written whole (no partial-write truncation)",
     appendLedger(ledger, [big]);
     const line = fs.readFileSync(ledger, "utf8").trim();
     assert.deepEqual(JSON.parse(line), big, "the full record round-trips");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("T20: a short write followed by an I/O error rolls back — no corrupt JSONL tail", { skip: process.platform === "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-rollback-"));
+  try {
+    const ledger = path.join(root, "findings.jsonl");
+    fs.writeFileSync(ledger, "{\"good\":1}\n");            // an existing, valid record
+    const before = fs.readFileSync(ledger, "utf8");
+    const fd = fs.openSync(ledger, fs.constants.O_WRONLY | fs.constants.O_APPEND);
+    // writeSync writes 3 bytes, then throws ENOSPC — the crash-after-partial case.
+    let calls = 0;
+    const flakyWrite = () => {
+      if (calls++ === 0) return 3;
+      const e = new Error("ENOSPC"); e.code = "ENOSPC"; throw e;
+    };
+    try {
+      assert.throws(
+        () => appendRecordSync(fd, Buffer.from("{\"partial\":true}\n"), { writeSync: flakyWrite }),
+        /ENOSPC/
+      );
+    } finally {
+      fs.closeSync(fd);
+    }
+    const after = fs.readFileSync(ledger, "utf8");
+    assert.equal(after, before, "the partial record must be rolled back, leaving the ledger parseable");
+    for (const line of after.trim().split("\n")) JSON.parse(line); // still valid JSONL
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

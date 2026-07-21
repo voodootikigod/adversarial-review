@@ -46,13 +46,30 @@ export function toLedgerEntries(result, assessments, { failOn = "medium", minCon
 // while the file is world-readable. A chmod failure PROPAGATES rather than being
 // swallowed — the caller (recordFindings) warns and skips the ledger, so we
 // never write findings to a file we could not secure.
-function writeAllSync(fd, buffer) {
-  // fs.writeSync may write fewer bytes than requested (signals, quotas, some
-  // filesystems). Loop until the whole buffer is on disk, or a truncated JSONL
-  // record would silently corrupt the ledger.
-  let offset = 0;
-  while (offset < buffer.length) {
-    offset += fs.writeSync(fd, buffer, offset);
+// Append `buffer` as an all-or-nothing record. fs.writeSync can write fewer
+// bytes than requested (signals, quotas) — so we loop — and can THROW after a
+// partial write (ENOSPC, EDQUOT), which would leave a truncated JSON object as
+// the file's tail and break every future parse of the ledger. On any failure we
+// ftruncate back to the pre-append EOF, so the ledger is either fully extended
+// by this record or left exactly as it was.
+//
+// (Interleaving between two concurrent review processes appending to the same
+// ledger is best effort: robust cross-process append atomicity needs advisory
+// locking Node does not expose portably, and the ledger is an append-only
+// advisory artifact, not a transactional store. The crash/short-write case —
+// which corrupts a SINGLE process's own output — is what the rollback closes.)
+// `writeSync` is an injectable seam so the rollback path can be tested without a
+// real ENOSPC; production callers omit it.
+export function appendRecordSync(fd, buffer, { writeSync = fs.writeSync } = {}) {
+  const startSize = fs.fstatSync(fd).size; // append point (O_APPEND ⇒ EOF)
+  try {
+    let offset = 0;
+    while (offset < buffer.length) {
+      offset += writeSync(fd, buffer, offset);
+    }
+  } catch (err) {
+    try { fs.ftruncateSync(fd, startSize); } catch { /* best effort rollback */ }
+    throw err;
   }
 }
 
@@ -68,7 +85,7 @@ export function appendLedger(ledgerPath, entries) {
     if (process.platform !== "win32" && (fs.fstatSync(fd).mode & 0o777) !== 0o600) {
       fs.fchmodSync(fd, 0o600);
     }
-    writeAllSync(fd, buffer);
+    appendRecordSync(fd, buffer);
   } finally {
     try { fs.closeSync(fd); } catch { /* ignore */ }
   }
