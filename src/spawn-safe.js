@@ -196,9 +196,17 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
   // SIGTERM by default; callers escalate to SIGKILL for a process that ignored it.
   const signal = options.signal ?? "SIGTERM";
+  // A SIGKILL escalation deliberately skips the liveness gate: the leader may
+  // already be reaped while descendants in the same group are still running.
+  const requireAlive = options.requireAlive ?? true;
   const runCommandImpl = options.runCommandImpl ?? runCommand;
 
-  if (!isPidAlive(pid, killImpl)) {
+  if (requireAlive && !isPidAlive(pid, killImpl)) {
+    return { attempted: false, delivered: false, method: null };
+  }
+  // Even when the gate is skipped, never signal a non-positive pid: kill(-0)
+  // and kill(0) are group-relative and would target our OWN process group.
+  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
     return { attempted: false, delivered: false, method: null };
   }
 

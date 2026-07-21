@@ -1039,7 +1039,7 @@ export async function runLoop(cwd, args) {
 
       // Best effort: a failed fixer often leaves a resumable session behind, and
       // losing it means losing the work already done. Never fails the run.
-      const resumeHint = extractResumeHint(fixerResult.stderr || "");
+      const resumeHint = extractResumeHint(fixerResult.stderr || "", { cli: fixerCmd });
       if (resumeHint && !args.json) log.info(`Resume here: ${resumeHint.command}`);
 
       emitEvent(args.json, { type: "review_result", result: lastResult, iteration: fixCount + 1 });
@@ -1422,7 +1422,7 @@ export async function runBranchLoop(cwd, args) {
 
       // Best effort: a failed fixer often leaves a resumable session behind, and
       // losing it means losing the work already done. Never fails the run.
-      const resumeHint = extractResumeHint(fixerResult.stderr || "");
+      const resumeHint = extractResumeHint(fixerResult.stderr || "", { cli: fixerCmd });
       if (resumeHint && !args.json) log.info(`Resume here: ${resumeHint.command}`);
       emitEvent(args.json, { type: "review_result", result: lastResult, iteration: fixCount + 1 });
       log.warn(`Earlier fix commit(s) (if any) left on '${branch}'. To undo all: ${recoveryLine}`);

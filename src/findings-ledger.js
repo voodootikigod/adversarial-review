@@ -30,6 +30,41 @@ export function toLedgerEntries(result, assessments, { failOn = "medium", minCon
     }));
 }
 
+// Walk every directory component of `target` and refuse if any is a symbolic
+// link. lstat does not follow, so this inspects the link itself rather than
+// what it points at. Checking the chain — not just the leaf — is what stops a
+// symlinked `.adlc` from redirecting the write.
+// The walk is BOUNDED to components at or below `base` (the working directory).
+// Only those are attacker-controlled — `.adlc` inside the reviewed repository is
+// the threat. Walking to filesystem root instead rejects legitimate paths: /var
+// is itself a symlink on macOS, so an unbounded check refuses every temp
+// directory, which is a false positive that breaks normal use.
+function assertNoSymlinkedParents(target, base = process.cwd()) {
+  const resolved = path.resolve(target);
+  const root = path.resolve(base);
+  // Only inspect the chain when the ledger actually lives under `base`.
+  if (!resolved.startsWith(root + path.sep)) return;
+
+  let current = path.dirname(resolved);
+  while (current.startsWith(root + path.sep)) {
+    let st;
+    try {
+      st = fs.lstatSync(current);
+    } catch {
+      break; // does not exist yet; nothing to traverse through
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(
+        `Refusing to write the findings ledger: "${current}" is a symbolic link. ` +
+        `Writing through it would append to, and change the permissions of, files outside the intended path.`
+      );
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
 // Append entries to the ledger as JSONL. Creates parent dirs; appends (never
 // truncates); writes all lines in a single call so a line is never half-written
 // under concurrent runs. No-op when there are no entries.
@@ -40,6 +75,13 @@ export function appendLedger(ledgerPath, entries) {
   const dir = path.dirname(ledgerPath);
   if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const buffer = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+
+  // O_NOFOLLOW below guards only the FINAL component. The default ledger path
+  // is `.adlc/findings.jsonl` inside the reviewed repository, so the PARENT is
+  // attacker-controlled too: a repo shipping `.adlc` as a symlink redirects the
+  // whole write, and both the append and the fchmod land outside the repo.
+  // Reject a symlink anywhere in the directory chain we are about to traverse.
+  assertNoSymlinkedParents(ledgerPath);
 
   // The default ledger path lives INSIDE the repository under review, so its
   // final component is attacker-controlled. Path-based append + chmod follow

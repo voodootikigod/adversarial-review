@@ -179,7 +179,10 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
       // been judged hung, and terminateProcessTree stays gated on liveness, so
       // the SIGKILL is a no-op if SIGTERM already worked.
       try { terminateImpl(pid); } catch { /* already gone */ }
-      try { terminateImpl(pid, { signal: "SIGKILL" }); } catch { /* already gone */ }
+      // The SIGKILL must NOT re-gate on the direct child: SIGTERM often reaps
+      // the group leader while a descendant ignores it, and a liveness probe on
+      // the dead leader would then skip signalling the still-live group.
+      try { terminateImpl(pid, { signal: "SIGKILL", requireAlive: false }); } catch { /* already gone */ }
     };
 
     const failWith = (ErrCls, message, extra) => {

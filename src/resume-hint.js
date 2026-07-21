@@ -29,6 +29,11 @@ const ID_SHAPE = /^[A-Za-z0-9._:-]{6,128}$/;
 // token back to the terminal instead of rejecting it outright.
 const ID_CHARS = "[A-Za-z0-9._:-]";
 const ID_CAPTURE = `(${ID_CHARS}{6,128})(?!${ID_CHARS})`;
+// NOTE ON CODEX: every codex invocation in this project passes --ephemeral
+// (src/llm.js review path, src/loop.js fixer path), which disables session
+// persistence — so there is no session to resume and this pattern cannot fire
+// in production today. It is retained because dropping --ephemeral is the only
+// prerequisite, but no caller should advertise codex resume support until then.
 const PATTERNS = [
   { cli: "codex", re: new RegExp(`\\bcodex\\s+resume\\s+${ID_CAPTURE}`, "i") },
   { cli: "agy", re: new RegExp(`\\bagy\\s+resume\\s+${ID_CAPTURE}`, "i") },
@@ -41,11 +46,17 @@ const PATTERNS = [
  *
  * @returns {{cli: string, id: string, command: string} | null}
  */
-export function extractResumeHint(text) {
+export function extractResumeHint(text, { cli: onlyCli = null } = {}) {
   if (typeof text !== "string" || !text) return null;
   const tail = text.length > MAX_SCAN_BYTES ? text.slice(-MAX_SCAN_BYTES) : text;
 
-  for (const { cli, re } of PATTERNS) {
+  // Scope to the CLI that ACTUALLY RAN when the caller knows it. The scanned
+  // text is attacker-influenceable, so trying every pattern in a fixed order
+  // lets repository content forge a hint for a different CLI — "codex resume
+  // <id>" planted in a diff would outrank a genuine agy hint and hand the user
+  // a command for a session that never existed.
+  const candidates = onlyCli ? PATTERNS.filter((p) => p.cli === onlyCli) : PATTERNS;
+  for (const { cli, re } of candidates) {
     const match = tail.match(re);
     if (!match) continue;
     const id = match[1];
@@ -61,7 +72,7 @@ export function extractResumeHint(text) {
  * `failed` is passed explicitly rather than inferred: a successful review whose
  * diff happens to contain resume-shaped text must never produce a hint.
  */
-export function resumeHintForError(error, { failed = true } = {}) {
+export function resumeHintForError(error, { failed = true, cli = null } = {}) {
   if (!failed || !error) return null;
   // The watchdog attaches stdout/stderr to every rejection precisely so this
   // works (T13 AC15); execFileSync errors carry them too.
@@ -69,7 +80,7 @@ export function resumeHintForError(error, { failed = true } = {}) {
     .map((s) => (Buffer.isBuffer(s) ? s.toString("utf8") : s))
     .filter((s) => typeof s === "string" && s);
   for (const s of streams) {
-    const hint = extractResumeHint(s);
+    const hint = extractResumeHint(s, { cli });
     if (hint) return hint;
   }
   return null;

@@ -82,3 +82,22 @@ test("T14: the minimum id length boundary is 6 characters", () => {
   assert.equal(extractResumeHint("codex resume abc123").id, "abc123", "6 chars is a valid id");
   assert.equal(extractResumeHint("codex resume abc12"), null, "5 chars is below the floor");
 });
+
+test("T14: a forged hint for another CLI cannot outrank the one that actually ran", () => {
+  // The scanned text is attacker-influenceable. Searching every pattern in a
+  // fixed order let repository content plant "codex resume <id>" and outrank a
+  // genuine agy hint, handing the user a command for a session that never
+  // existed.
+  const stderr = "codex resume 01JFORGEDBYDIFF\nagy resume sess_realone1";
+  assert.equal(extractResumeHint(stderr, { cli: "agy" }).id, "sess_realone1");
+  assert.equal(extractResumeHint(stderr, { cli: "agy" }).cli, "agy");
+  // A CLI with no hint present yields nothing rather than borrowing another's.
+  assert.equal(extractResumeHint("codex resume 01JFORGEDBYDIFF", { cli: "agy" }), null);
+});
+
+test("T14: resumeHintForError forwards the CLI scope", () => {
+  const err = Object.assign(new Error("x"), {
+    stderr: "codex resume 01JFORGEDBYDIFF\nagy resume sess_genuine9"
+  });
+  assert.equal(resumeHintForError(err, { cli: "agy" }).id, "sess_genuine9");
+});
