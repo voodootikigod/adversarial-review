@@ -75,7 +75,12 @@ test("AC3: a grandparent symlink two levels up is refused", () => {
   }
 });
 
-test("AC4: a symlink that resolves INSIDE the repo is allowed (no escape, no victim)", () => {
+test("AC4: a symlink that resolves INSIDE the repo is ALSO refused (revised)", () => {
+  // Original spec allowed an in-repo redirect. Isolated review (T20 round 1)
+  // showed that lets a Git-encodable `.adlc` symlink redirect the append and the
+  // 0600 chmod onto another repo file. Any suffix symlink is now refused, in-repo
+  // or escaping — the attacker controls the whole checkout, so "inside" is not
+  // safe.
   const root = tmpRoot("inside");
   try {
     const repo = path.join(root, "repo");
@@ -84,9 +89,32 @@ test("AC4: a symlink that resolves INSIDE the repo is allowed (no escape, no vic
     fs.mkdirSync(realDir);
     fs.symlinkSync(realDir, path.join(repo, ".adlc")); // .adlc -> repo/real-adlc (still inside)
 
-    const fd = openContainedAppendFd(path.join(repo, ".adlc", "findings.jsonl"), { base: repo });
-    appendVia(fd, "{\"id\":1}\n");
-    assert.equal(fs.readFileSync(path.join(realDir, "findings.jsonl"), "utf8"), "{\"id\":1}\n");
+    assert.throws(
+      () => openContainedAppendFd(path.join(repo, ".adlc", "findings.jsonl"), { base: repo }),
+      UncontainedPathError
+    );
+    assert.equal(fs.existsSync(path.join(realDir, "findings.jsonl")), false, "no write via the in-repo link");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("AC3b: mkdir must NOT create directories outside base before the guard fires", () => {
+  // The check runs before any mkdir, so a `.adlc -> OUTSIDE` link cannot make us
+  // create OUTSIDE/sub as a side effect and only then throw.
+  const root = tmpRoot("nomkdir");
+  try {
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(outside);
+    const repo = path.join(root, "repo");
+    fs.mkdirSync(repo);
+    fs.symlinkSync(outside, path.join(repo, ".adlc"));
+
+    assert.throws(
+      () => openContainedAppendFd(path.join(repo, ".adlc", "sub", "findings.jsonl"), { base: repo }),
+      UncontainedPathError
+    );
+    assert.equal(fs.existsSync(path.join(outside, "sub")), false, "no directory created outside base");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
