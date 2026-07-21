@@ -324,3 +324,11 @@ test("CLI: single-provider --json verdict matches derived gate (not raw model ve
   assert.equal(out.verdict, "needs-attention", "JSON verdict must match derived exit gate");
   assert.match(r.stderr, /Model verdict was "approve"/);
 });
+
+test("T14: the CLI error boundary scopes resume-hint extraction to config.cliCmd", () => {
+  // bin/cli.js line 324 must pass the running CLI, or a forged 'codex resume'
+  // in a diff surfaces on an agy run. Guard by asserting the source wires it.
+  const src = fs.readFileSync(new URL("../bin/cli.js", import.meta.url), "utf8");
+  assert.match(src, /resumeHintForError\(err,\s*\{\s*cli:/,
+    "resumeHintForError at the CLI boundary must be scoped to the CLI that ran");
+});

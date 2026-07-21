@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, maxArgvPromptBytes, parseRetryAfterMs } from "../src/llm.js";
+import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, maxArgvPromptBytes, parseRetryAfterMs, isCmdInstalled, llmCall } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
@@ -816,4 +816,71 @@ exit 2
     try { fs.unlinkSync(binPath); } catch {}
     try { fs.rmdirSync(tmpDir); } catch {}
   }
+});
+
+// ─── T12: spawn safety ──────────────────────────────────────────────────────
+
+test("T12 AC1: no spawn site derives `shell` from the platform or the environment", () => {
+  // Regression guard for the Windows argument-injection defect: execCli used
+  // `shell: process.platform === "win32"`, handing every argument to cmd.exe.
+  // Every module that can spawn, not just llm.js — the actual spawn moved into
+  // exec-watchdog.js when the watchdog landed, and a guard pinned to one file
+  // would have silently stopped covering the thing it guards.
+  const modules = ["../src/llm.js", "../src/exec-watchdog.js", "../src/spawn-safe.js"];
+  let explicitFalse = 0;
+  let legacyWindowsShell = 0;
+
+  for (const mod of modules) {
+    const raw = fs.readFileSync(new URL(mod, import.meta.url), "utf8");
+    // Scan CODE, not prose: the fix is documented in comments that necessarily
+    // quote the old `shell: process.platform === "win32"` construct, and a naive
+    // grep would flag that explanation as the defect it describes.
+    const code = raw
+      .split("\n")
+      .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+      .join("\n");
+
+    for (const line of code.split("\n").filter((l) => /^\s*shell:/.test(l))) {
+      if (/shell:\s*false/.test(line)) { explicitFalse++; continue; }
+      // ONE deliberate exemption: the win32 legacy branch in llm.js keeps main's
+      // execFileSync(shell:true) behaviour verbatim. Four review rounds found
+      // four different defects in this branch's attempts to replace it, none
+      // verifiable because CI is Ubuntu-only. Shipping the known-unsafe status
+      // quo beat shipping a fifth guess. Owned by T19.
+      assert.match(line, /shell:\s*true/, `${mod}: unexpected shell option ${line.trim()}`);
+      assert.equal(mod, "../src/llm.js", "the only shell:true exemption lives in llm.js");
+      legacyWindowsShell++;
+    }
+    // The ORIGINAL defect was a shell selected by an EXPRESSION over platform or
+    // env. That must still never appear: the exemption above is a literal inside
+    // an explicit, commented win32 branch, not a computed value.
+    assert.ok(!/shell:\s*process\.(platform|env)/.test(code), `${mod}: shell must never be derived from platform/env`);
+    assert.ok(!/process\.env\.SHELL/.test(code), `${mod}: SHELL must not select a shell`);
+  }
+
+  assert.ok(explicitFalse > 0, "at least one spawn site must set shell:false explicitly");
+  assert.equal(legacyWindowsShell, 1, "exactly one documented win32 exemption — no more may accumulate");
+});
+
+test("T12: isCmdInstalled still answers correctly via resolveCommand", () => {
+  assert.equal(isCmdInstalled("node"), true);
+  assert.equal(isCmdInstalled("definitely-not-a-real-binary-xyz"), false);
+  // Paths and metacharacters are not bare commands and must not resolve.
+  for (const bad of ["/bin/sh", "../evil", "a;b"]) {
+    assert.equal(isCmdInstalled(bad), false, `${bad} must not be treated as installed`);
+  }
+});
+
+test("T12 AC11: an unresolvable local CLI throws an error naming the command", async () => {
+  // Declared in T12's coldstart amendment: when resolveCommand returns null,
+  // execCli must fail with a clear message rather than passing a bare name to
+  // the OS and hoping. Previously untested.
+  const err = await llmCall(
+    { provider: "cli", cliCmd: "definitely-not-a-real-binary-xyz", timeoutMs: 5000 },
+    "prompt",
+    "system"
+  ).catch((e) => e);
+  assert.ok(err instanceof Error);
+  assert.match(err.message, /definitely-not-a-real-binary-xyz/, "the message must name the command");
+  assert.match(err.message, /not found on PATH/);
 });

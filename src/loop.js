@@ -2,6 +2,14 @@ import { execFileSync, spawn } from "child_process";
 import path from "path";
 import { log, colors } from "./utils.js";
 import { scanForSecrets } from "./secrets.js";
+import { extractResumeHint } from "./resume-hint.js";
+
+// Keep the END of a bounded stderr excerpt. CLI failures put the reason — and
+// any resume command — last, so truncating from the front throws away exactly
+// what both a human and extractResumeHint need.
+export function tailOf(text, limit) {
+  return text.length > limit ? text.slice(-limit) : text;
+}
 import { collectReviewContext } from "./git-context.js";
 import {
   buildPrompt,
@@ -124,8 +132,8 @@ function emitEvent(jsonMode, event) {
 // "findings acknowledged with documented justification", a human P6 decision the
 // automated loop cannot make; it is emitted as 0 to keep the evidence string
 // complete/copy-pastable, and the human overrides it when recording.
-export function buildLoopSummary({ providers, iterations, exitReason, survivingCount }) {
-  return {
+export function buildLoopSummary({ providers, iterations, exitReason, survivingCount, resumeHint = null }) {
+  const summary = {
     type: "loop_summary",
     providers,
     iterations,
@@ -134,6 +142,11 @@ export function buildLoopSummary({ providers, iterations, exitReason, survivingC
     survivingCount,
     acceptedCount: 0
   };
+  // Best-effort only, and only on a non-clean exit: a resumable session survives
+  // a failed CLI run, and losing it means losing the work already done. Absent
+  // when there is nothing to resume, so consumers can treat presence as signal.
+  if (resumeHint) summary.resumeHint = resumeHint;
+  return summary;
 }
 
 // ─── Recovery command ─────────────────────────────────────────────────────────
@@ -467,7 +480,7 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
       if (done) return;
       done = true;
       try { process.kill(-child.pid, "SIGKILL"); } catch {}
-      const stderr = Buffer.concat(stderrChunks).toString("utf8").slice(0, 2048);
+      const stderr = tailOf(Buffer.concat(stderrChunks).toString("utf8"), 2048);
       resolve({ timedOut: true, stderr });
     }, timeoutMs);
 
@@ -475,7 +488,7 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      const stderr = Buffer.concat(stderrChunks).toString("utf8").slice(0, 2048);
+      const stderr = tailOf(Buffer.concat(stderrChunks).toString("utf8"), 2048);
       resolve(code === 0 ? { success: true, stderr } : { error: true, code, stderr });
     });
 
@@ -1024,6 +1037,11 @@ export async function runLoop(cwd, args) {
       }
       if (fixerResult.stderr) log.error(`Fixer stderr:\n${fixerResult.stderr.trimEnd()}`);
 
+      // Best effort: a failed fixer often leaves a resumable session behind, and
+      // losing it means losing the work already done. Never fails the run.
+      const resumeHint = extractResumeHint(fixerResult.stderr || "", { cli: fixerCmd });
+      if (resumeHint && !args.json) log.info(`Resume here: ${resumeHint.command}`);
+
       emitEvent(args.json, { type: "review_result", result: lastResult, iteration: fixCount + 1 });
       emitEvent(args.json, {
         type: "loop_end",
@@ -1032,7 +1050,7 @@ export async function runLoop(cwd, args) {
         stashRef: hasPartial ? null : stashRef,
         fixerStderr: fixerResult.stderr
       });
-      emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason, survivingCount: gatings.length }));
+      emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason, survivingCount: gatings.length, resumeHint }));
       process.exit(2);
     }
 
@@ -1224,9 +1242,9 @@ export async function runBranchLoop(cwd, args) {
   let lastResult = null;
 
   // Terminal exit: emit loop_end + the consolidated loop_summary, then exit.
-  const finish = (exitReason, exitCode, survivingCount) => {
+  const finish = (exitReason, exitCode, survivingCount, resumeHint = null) => {
     emitEvent(args.json, { type: "loop_end", exitReason, iterations: fixCount, originalHead });
-    emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason, survivingCount }));
+    emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason, survivingCount, resumeHint }));
     process.exit(exitCode);
   };
 
@@ -1401,9 +1419,14 @@ export async function runBranchLoop(cwd, args) {
       if (fixerResult.timedOut) log.error(`Fixer timed out after ${fixerTimeoutMs / 1000}s.`);
       else log.error(`Fixer exited with code ${fixerResult.code}.`);
       if (fixerResult.stderr) log.error(`Fixer stderr:\n${fixerResult.stderr.trimEnd()}`);
+
+      // Best effort: a failed fixer often leaves a resumable session behind, and
+      // losing it means losing the work already done. Never fails the run.
+      const resumeHint = extractResumeHint(fixerResult.stderr || "", { cli: fixerCmd });
+      if (resumeHint && !args.json) log.info(`Resume here: ${resumeHint.command}`);
       emitEvent(args.json, { type: "review_result", result: lastResult, iteration: fixCount + 1 });
       log.warn(`Earlier fix commit(s) (if any) left on '${branch}'. To undo all: ${recoveryLine}`);
-      finish(fixerResult.timedOut ? "fixer-timeout" : "fixer-error", 2, gatings.length);
+      finish(fixerResult.timedOut ? "fixer-timeout" : "fixer-error", 2, gatings.length, resumeHint);
     }
 
     // No-diff → the fixer changed nothing; nothing to commit.

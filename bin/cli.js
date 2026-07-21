@@ -21,6 +21,7 @@ import {
   renderReport
 } from "../src/review.js";
 import { runLoop } from "../src/loop.js";
+import { resumeHintForError } from "../src/resume-hint.js";
 
 // Multi-provider review: fan the same prompt out to each selected provider
 // independently, merge with cross-provider corroboration, and derive a
@@ -315,6 +316,16 @@ async function main() {
     }
   } catch (err) {
     log.error(err.message);
+    // A failed local-CLI run often leaves a resumable session behind, and losing
+    // it means losing the work already done. The watchdog attaches the captured
+    // stderr to every rejection precisely so it can be read here, and the
+    // timeout wrappers preserve it when they re-wrap. Best effort — never
+    // changes the exit code.
+    // Scope to the CLI that actually ran: the scanned streams are
+    // attacker-influenceable, and searching every provider pattern lets a diff
+    // forge a hint for a CLI that never executed.
+    const hint = resumeHintForError(err, { cli: config?.cliCmd ?? null });
+    if (hint) log.info(`Resume here: ${hint.command}`);
     process.exit(1);
   }
 

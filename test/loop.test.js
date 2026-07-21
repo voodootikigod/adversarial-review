@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { log } from "../src/utils.js";
-import { getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
+import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
 
 test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemini key", () => {
   assert.equal(FIXER_PROVIDER_MAP.agy, "gemini");
@@ -279,4 +279,29 @@ test("T15: rejected cited paths are reported, never dropped silently", () => {
     log.warn = originalWarn;
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("T14 AC7: loop_summary carries a resume hint on a failed run and omits it otherwise", () => {
+  const withHint = buildLoopSummary({
+    providers: "codex", iterations: 2, exitReason: "fixer-error", survivingCount: 1,
+    resumeHint: { cli: "codex", id: "01JABC", command: "codex resume 01JABC" }
+  });
+  assert.equal(withHint.resumeHint.command, "codex resume 01JABC");
+  assert.equal(withHint.verdict, "needs-attention");
+
+  const clean = buildLoopSummary({
+    providers: "codex", iterations: 1, exitReason: "clean", survivingCount: 0
+  });
+  assert.ok(!("resumeHint" in clean), "a clean run must not carry a resume hint");
+});
+
+test("T14: bounded stderr keeps the TAIL, where resume commands live", () => {
+  // Regression: stderr was truncated with slice(0, 2048) — the HEAD — while
+  // extractResumeHint deliberately scans the tail because CLI resume lines
+  // appear last. The wiring was live but the data had already been discarded.
+  const noise = "x".repeat(5000);
+  const kept = tailOf(`${noise}\ncodex resume 01JTAILKEPT`, 2048);
+  assert.ok(kept.includes("codex resume 01JTAILKEPT"), "the resume line must survive truncation");
+  assert.ok(kept.length <= 2048, "the bound must still hold");
+  assert.equal(tailOf("short", 2048), "short", "shorter input is unchanged");
 });

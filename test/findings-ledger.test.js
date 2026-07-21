@@ -102,3 +102,31 @@ test("appendLedger creates a missing nested parent directory (mkdir -p)", () => 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("T14: a new ledger file is created owner-only (0600)", { skip: process.platform === "win32" }, () => {
+  // The minimal, kept T14 behaviour: new ledgers are 0600 rather than umask
+  // default, since gating findings can quote repository source. Existing-mode
+  // tightening and symlink safety for the attacker-controlled default path are
+  // T20 (canonicalize-contain-open), reviewed in isolation.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-mode-"));
+  try {
+    const ledger = path.join(root, "nested", "findings.jsonl");
+    appendLedger(ledger, [{ id: "a" }]);
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "new file must be owner-only");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("T14: appending again does not loosen the mode", { skip: process.platform === "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-mode2-"));
+  try {
+    const ledger = path.join(root, "findings.jsonl");
+    appendLedger(ledger, [{ id: "a" }]);
+    appendLedger(ledger, [{ id: "b" }]);
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600);
+    assert.equal(fs.readFileSync(ledger, "utf8").trim().split("\n").length, 2, "both entries present");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

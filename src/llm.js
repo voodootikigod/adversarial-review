@@ -1,4 +1,6 @@
 import { execFileSync } from "child_process";
+import { resolveCommand } from "./spawn-safe.js";
+import { spawnWithWatchdog } from "./exec-watchdog.js";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -166,42 +168,56 @@ export function cleanJsonResponse(text) {
   return cleaned;
 }
 
-// Check if a shell command is installed and executable.
+// Check if a shell command is installed and executable. Thin boolean wrapper
+// over resolveCommand, which does the PATH/PATHEXT walk and returns the path
+// the spawn sites actually need.
 export function isCmdInstalled(cmd) {
-  if (!/^[A-Za-z0-9._-]+$/.test(cmd)) {
-    return false;
-  }
-  const pathDirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
-  const extensions = process.platform === "win32"
-    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").map(ext => ext.toLowerCase())
-    : [""];
-
-  return pathDirs.some((dir) => {
-    for (const ext of extensions) {
-      const file = ext && cmd.toLowerCase().endsWith(ext) ? cmd : `${cmd}${ext}`;
-      const candidate = path.join(dir, file);
-      try {
-        fs.accessSync(candidate, fs.constants.X_OK);
-        if (fs.statSync(candidate).isFile()) {
-          return true;
-        }
-      } catch {
-        // Continue
-      }
-    }
-    return false;
-  });
+  return resolveCommand(cmd) !== null;
 }
 
-function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000) {
-  return execFileSync(cliCmd, args, {
+async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true } = {}) {
+  // SECURITY: shell:false on every platform. This previously passed
+  // `shell: process.platform === "win32"`, which handed every argument to
+  // cmd.exe for re-parsing on Windows and lost argv metacharacter safety.
+  //
+  // That flag was not gratuitous — it was how npm-installed `.cmd` shims got
+  // resolved. So it cannot simply be removed: resolveCommand performs that
+  // lookup explicitly (PATH + PATHEXT) and we spawn the resolved absolute path,
+  // which removes the only reason the shell was needed.
+  // WINDOWS IS DELIBERATELY UNCHANGED FROM main. Four successive review rounds
+  // found this branch's Windows handling wrong in a different way each time —
+  // .cmd shims are not executable images, cmd.exe re-parses argv after /c, a
+  // blanket argument refusal broke every npm-installed CLI, and a bare cmd.exe
+  // fallback is resolvable from the reviewed repository. None of it has ever
+  // executed on Windows, because CI is Ubuntu-only.
+  //
+  // Windows here keeps the exact behaviour it has in main: execFileSync with
+  // shell:true. This path is KNOWN-UNSAFE — arguments are re-parsed by cmd.exe —
+  // and remains the original defect; it is unchanged, not fixed. T19 tracks the
+  // correct Windows implementation, gated on windows-latest CI.
+  if (process.platform === "win32") {
+    return execFileSync(cliCmd, args, {
+      input,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: timeoutMs,
+      shell: true
+    }).trim();
+  }
+
+  const resolved = resolveCommand(cliCmd);
+  if (!resolved) {
+    throw new Error(
+      `Local CLI agent "${cliCmd}" was not found on PATH. Install it, or pass --provider <other>.`
+    );
+  }
+  return spawnWithWatchdog(resolved, args, {
     input,
-    encoding: "utf8",
-    stdio: ["pipe", "pipe", "pipe"],
-    maxBuffer: 10 * 1024 * 1024,
-    timeout: timeoutMs,
-    shell: process.platform === "win32"
-  }).trim();
+    timeoutMs,
+    streamStdout: stream,
+    argsContainUntrusted
+  });
 }
 
 // Claude-Code-compatible CLIs (claude, agy): always use print mode (-p) with the
@@ -294,7 +310,7 @@ export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = fals
 // so Codex enforces the output shape natively rather than relying on scraping.
 // The prompt is piped via stdin (`-`) to avoid argv size limits on large diffs;
 // the argv path is used as a fallback if stdin is rejected.
-function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
+async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { stream = false } = {}) {
   // Create a private temp directory so path prediction / symlink race attacks
   // against shared /tmp are not possible; the directory is owned by this process.
   const privateDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-review-codex-"));
@@ -324,10 +340,10 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
       // "If not provided as an argument (or if `-` is used), instructions are read from
       // stdin"). We rely on execFileSync's `input` option to wire the full prompt payload
       // to that stdin pipe, so the review content is never truncated by argv size limits.
-      execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs);
+      await execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs, { stream, argsContainUntrusted: false });
     } catch (stdinErr) {
       if (stdinErr.code === "ETIMEDOUT") {
-        throw new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+        throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: stdinErr.stdout, stderr: stdinErr.stderr, cause: stdinErr });
       }
       const promptBytes = Buffer.byteLength(fullPrompt);
       const argvLimit = maxArgvPromptBytes();
@@ -340,13 +356,13 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
       // Argv fallback: pass prompt as positional argument
       log.substep("Codex stdin path failed, retrying as argument...");
       try {
-        execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs);
+        await execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs, { stream });
       } catch (argvErr) {
         if (argvErr.code === "ETIMEDOUT") {
-          throw new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+          throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
         }
         if (isE2BigError(argvErr)) {
-          throw new Error(argvTooLargeMessage("Codex", promptBytes, argvLimit));
+          throw Object.assign(new Error(argvTooLargeMessage("Codex", promptBytes, argvLimit)), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
         }
         const stderr = argvErr.stderr?.toString("utf8") || stdinErr.stderr?.toString("utf8") || "";
         throw new Error(
@@ -364,7 +380,7 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
 }
 
 // Invoke a local CLI agent (claude, agy, ...) by piping the prompt to stdin.
-function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs = 10 * 60 * 1000, allowUnsandboxedCli = false, model = null } = {}) {
+async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs = 10 * 60 * 1000, allowUnsandboxedCli = false, model = null, stream = false } = {}) {
   let fullPrompt = "";
   if (systemInstruction) {
     fullPrompt += `System Instructions:\n${systemInstruction}\n\n`;
@@ -374,7 +390,7 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
   log.step(`Invoking local subscription agent via command: "${cliCmd}"...`);
 
   if (cliCmd === "codex") {
-    return callCodexCli(fullPrompt, schema, timeoutMs);
+    return callCodexCli(fullPrompt, schema, timeoutMs, { stream });
   }
 
   // claude: -p + stdin `-` + --permission-mode plan.
@@ -385,17 +401,17 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
   const fallbackOpts = { allowUnsandboxedCli, model };
 
   try {
-    return execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs);
+    return await execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs, { stream, argsContainUntrusted: false });
   } catch (err) {
     if (err.code === "ETIMEDOUT") {
-      throw new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+      throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: err.stdout, stderr: err.stderr, cause: err });
     }
     const stderr = err.stderr?.toString("utf8") || "";
     // Unknown-flag rejections must surface clearly — not as a prompt-size / argv error.
     // Retrying argv would pass the same bad flag and fail the same way.
     const flagRejection = describeUnknownFlagRejection(cliCmd, stderr);
     if (flagRejection) {
-      throw new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : ""));
+      throw Object.assign(new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : "")), { stdout: err.stdout, stderr: err.stderr, cause: err });
     }
     const promptBytes = Buffer.byteLength(fullPrompt);
     const argvLimit = maxArgvPromptBytes();
@@ -407,21 +423,27 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
     }
     try {
       log.substep(`Stdin piping not supported by ${cliCmd}, retrying as argument...`);
-      return execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs);
+      return await execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs, { stream });
     } catch (err2) {
       if (err2.code === "ETIMEDOUT") {
-        throw new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+        throw Object.assign(
+          new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`),
+          { stdout: err2.stdout, stderr: err2.stderr, cause: err2 }
+        );
       }
       if (isE2BigError(err2)) {
-        throw new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit));
+        throw Object.assign(new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit)), { stdout: err2.stdout, stderr: err2.stderr, cause: err2 });
       }
       const stderr2 = err2.stderr?.toString("utf8") || stderr;
       const flagRejection2 = describeUnknownFlagRejection(cliCmd, stderr2);
       if (flagRejection2) {
-        throw new Error(flagRejection2 + (stderr2.trim() ? `\n${stderr2.trim()}` : ""));
+        throw Object.assign(new Error(flagRejection2 + (stderr2.trim() ? `\n${stderr2.trim()}` : "")), { stdout: err2.stdout, stderr: err2.stderr, cause: err2 });
       }
       const suffix = stderr2.trim() ? `\n${stderr2.trim()}` : "";
-      throw new Error(`Failed to execute local CLI agent "${cliCmd}": ${err2.message || err.message}${suffix}`);
+      throw Object.assign(
+        new Error(`Failed to execute local CLI agent "${cliCmd}": ${err2.message || err.message}${suffix}`),
+        { stdout: err2.stdout ?? err.stdout, stderr: err2.stderr ?? err.stderr, cause: err2 }
+      );
     }
   }
 }
@@ -649,7 +671,7 @@ export function configureLLM(args) {
 
   const allowUnsandboxedCli = !!args.allowUnsandboxedCli;
 
-  return { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli };
+  return { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli, stream: !!args.stream };
 }
 
 // ─── Multi-provider selection (--providers) ─────────────────────────────────
@@ -893,13 +915,14 @@ function isRetryable(err) {
 // responseSchema) so well-formed JSON is enforced at the API layer, not by
 // post-hoc text scraping.
 export async function llmCall(config, prompt, systemInstruction = "", schema = null) {
-  const { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli } = config;
+  const { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli, stream } = config;
 
   if (provider === "cli") {
     return callCliLLM(cliCmd, prompt, systemInstruction, schema, {
       timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
       allowUnsandboxedCli: !!allowUnsandboxedCli,
-      model
+      model,
+      stream: !!stream
     });
   }
 

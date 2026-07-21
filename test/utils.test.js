@@ -219,3 +219,9 @@ test("HELP_TEXT documents vercel/gateway and cursor/agent provider tokens", () =
   assert.match(HELP_TEXT, /gateway \| cursor \| agent \| <local-cli-cmd>\./);
   assert.match(HELP_TEXT, /--model <name>\s+Force the model name \(Gateway: use provider\/model ids\)\./);
 });
+
+test("T13 AC10: --stream parses as a boolean and is documented", () => {
+  assert.equal(parseArgs(["node", "cli", "--stream"]).stream, true);
+  assert.equal(parseArgs(["node", "cli"]).stream, false);
+  assert.match(HELP_TEXT, /--stream/);
+});
