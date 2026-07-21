@@ -35,8 +35,12 @@ export function toLedgerEntries(result, assessments, { failOn = "medium", minCon
 // under concurrent runs. No-op when there are no entries.
 export function appendLedger(ledgerPath, entries) {
   if (!entries || entries.length === 0) return;
+  // Gating findings quote source code, so the ledger can contain excerpts of the
+  // reviewed repository. Create it owner-only rather than inheriting umask.
   const dir = path.dirname(ledgerPath);
-  if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true });
+  if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const buffer = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
-  fs.appendFileSync(ledgerPath, buffer);
+  // `mode` applies only when appendFileSync creates the file; an existing
+  // ledger keeps whatever mode it already has, so this never loosens one.
+  fs.appendFileSync(ledgerPath, buffer, { mode: 0o600 });
 }

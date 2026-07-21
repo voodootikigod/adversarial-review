@@ -124,8 +124,8 @@ function emitEvent(jsonMode, event) {
 // "findings acknowledged with documented justification", a human P6 decision the
 // automated loop cannot make; it is emitted as 0 to keep the evidence string
 // complete/copy-pastable, and the human overrides it when recording.
-export function buildLoopSummary({ providers, iterations, exitReason, survivingCount }) {
-  return {
+export function buildLoopSummary({ providers, iterations, exitReason, survivingCount, resumeHint = null }) {
+  const summary = {
     type: "loop_summary",
     providers,
     iterations,
@@ -134,6 +134,11 @@ export function buildLoopSummary({ providers, iterations, exitReason, survivingC
     survivingCount,
     acceptedCount: 0
   };
+  // Best-effort only, and only on a non-clean exit: a resumable session survives
+  // a failed CLI run, and losing it means losing the work already done. Absent
+  // when there is nothing to resume, so consumers can treat presence as signal.
+  if (resumeHint) summary.resumeHint = resumeHint;
+  return summary;
 }
 
 // ─── Recovery command ─────────────────────────────────────────────────────────

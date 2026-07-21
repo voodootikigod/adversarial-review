@@ -102,3 +102,28 @@ test("appendLedger creates a missing nested parent directory (mkdir -p)", () => 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("T14 AC8: the ledger dir is created 0700 and the file 0600", { skip: process.platform === "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-mode-"));
+  try {
+    const ledger = path.join(root, "nested", "findings.jsonl");
+    appendLedger(ledger, [{ id: "a" }]);
+    assert.equal(fs.statSync(path.dirname(ledger)).mode & 0o777, 0o700, "directory must be owner-only");
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "file must be owner-only");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("T14 AC9: appending again does not loosen the mode", { skip: process.platform === "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-mode2-"));
+  try {
+    const ledger = path.join(root, "findings.jsonl");
+    appendLedger(ledger, [{ id: "a" }]);
+    appendLedger(ledger, [{ id: "b" }]);
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600);
+    assert.equal(fs.readFileSync(ledger, "utf8").trim().split("\n").length, 2, "both entries present");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
