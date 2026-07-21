@@ -320,7 +320,7 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
       await execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs, { stream });
     } catch (stdinErr) {
       if (stdinErr.code === "ETIMEDOUT") {
-        throw new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+        throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: stdinErr.stdout, stderr: stdinErr.stderr, cause: stdinErr });
       }
       const promptBytes = Buffer.byteLength(fullPrompt);
       const argvLimit = maxArgvPromptBytes();
@@ -336,7 +336,7 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
         await execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs, { stream });
       } catch (argvErr) {
         if (argvErr.code === "ETIMEDOUT") {
-          throw new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+          throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: stdinErr.stdout, stderr: stdinErr.stderr, cause: stdinErr });
         }
         if (isE2BigError(argvErr)) {
           throw new Error(argvTooLargeMessage("Codex", promptBytes, argvLimit));
@@ -381,7 +381,7 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
     return await execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs, { stream });
   } catch (err) {
     if (err.code === "ETIMEDOUT") {
-      throw new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+      throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: err.stdout, stderr: err.stderr, cause: err });
     }
     const stderr = err.stderr?.toString("utf8") || "";
     // Unknown-flag rejections must surface clearly — not as a prompt-size / argv error.

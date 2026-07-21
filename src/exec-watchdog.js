@@ -27,8 +27,9 @@
 // silently collapsing the design back to a single guard.
 
 import { spawn } from "child_process";
+import { StringDecoder } from "string_decoder";
 import path from "path";
-import { resolveCommand, terminateProcessTree } from "./spawn-safe.js";
+import { resolveCommand, terminateProcessTree, buildSpawnTarget } from "./spawn-safe.js";
 
 export const DEFAULT_IDLE_TIMEOUT_MS = 180 * 1000;
 export const DEFAULT_MAX_MS = 900 * 1000;
@@ -110,7 +111,10 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
     clearTimeoutImpl = clearTimeout,
     spawnImpl = spawn,
     terminateImpl = terminateProcessTree,
-    stdoutSink = (chunk) => process.stdout.write(chunk)
+    // Progress goes to STDERR. stdout carries the --json result and the --loop
+    // NDJSON event stream, and interleaving raw provider output into it produces
+    // unparseable machine output for every CI consumer.
+    stdoutSink = (chunk) => process.stderr.write(chunk)
   } = options;
 
   const { maxMs, idleMs } = resolveWindows({ timeoutMs, idleTimeoutMs });
@@ -127,11 +131,21 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
 
     let stdout = "";
     let stderr = "";
+    let byteCount = 0;
+    // Per-chunk Buffer.toString() corrupts any multibyte code point split
+    // across chunk boundaries, substituting replacement characters. A review can
+    // stay valid JSON while its evidence or file paths are silently mutated —
+    // and mutated evidence then fails grounding and loses confidence. Decode
+    // incrementally so split sequences are carried to the next chunk.
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
     let settled = false;
     let idleTimer = null;
     let hardTimer = null;
 
-    const child = spawnImpl(resolved, args, {
+    // Route Windows .cmd/.bat shims through the interpreter explicitly.
+    const target = buildSpawnTarget(resolved, args);
+    const child = spawnImpl(target.command, target.args, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
       windowsHide: true,
@@ -188,14 +202,16 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
 
     const onChunk = (which) => (buf) => {
       if (settled) return;
-      const text = buf.toString();
+      // maxBuffer is documented in BYTES; string .length counts UTF-16 units.
+      byteCount += Buffer.isBuffer(buf) ? buf.length : Buffer.byteLength(String(buf));
+      const text = which === "stdout" ? outDecoder.write(buf) : errDecoder.write(buf);
       if (which === "stdout") {
         stdout += text;
-        if (streamStdout) stdoutSink(text);
+        if (text && streamStdout) stdoutSink(text);
       } else {
         stderr += text;
       }
-      if (stdout.length + stderr.length > maxBuffer) {
+      if (byteCount > maxBuffer) {
         failWith(
           ExecBufferError,
           `"${cmd}" produced more than ${maxBuffer} bytes of output; aborting.`,

@@ -359,3 +359,26 @@ test("T13: a silent long-running process is NOT killed when no idle guard is set
   child.emit("close", 0, null);
   assert.equal(await promise, "finally done");
 });
+
+test("T13: a multibyte character split across chunks is not corrupted", async () => {
+  // "→" is E2 86 92. Splitting it across two data events made Buffer.toString()
+  // emit replacement characters, silently mutating review evidence while the
+  // JSON stayed valid.
+  const arrow = Buffer.from("a→b", "utf8");
+  const { promise, child } = run();
+  child.stdout.emit("data", arrow.subarray(0, 2)); // "a" + first byte of →
+  child.stdout.emit("data", arrow.subarray(2));    // rest of → + "b"
+  child.emit("close", 0, null);
+  const out = await promise;
+  assert.equal(out, "a→b");
+  assert.ok(!out.includes("�"), "no replacement characters");
+});
+
+test("T13: maxBuffer counts BYTES, not UTF-16 units", async () => {
+  // Multibyte content must count against the cap by its real byte size, or the
+  // documented 10 MB ceiling silently becomes much larger in memory.
+  const { promise, child } = run({ maxBuffer: 10, timeoutMs: 100_000 });
+  child.stdout.emit("data", Buffer.from("→→→→→", "utf8")); // 15 bytes, 5 chars
+  const err = await promise.catch((e) => e);
+  assert.equal(err.code, "EBUFFER", "15 bytes must exceed a 10-byte cap");
+});

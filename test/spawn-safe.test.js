@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resolveCommand, isPidAlive, terminateProcessTree } from "../src/spawn-safe.js";
+import { resolveCommand, isPidAlive, terminateProcessTree, buildSpawnTarget } from "../src/spawn-safe.js";
 
 // ─── resolveCommand ─────────────────────────────────────────────────────────
 // Resolving to an absolute path is what lets every spawn site use shell:false.
@@ -130,16 +130,60 @@ test("T12: POSIX falls back to the bare pid when the group signal fails", () => 
   assert.ok(calls.some(([p, s]) => p === 999 && s === "SIGTERM"), "bare pid fallback must run");
 });
 
-test("T12 AC8: on win32 taskkill is used with /T and /F", () => {
+test("T12 AC8: on win32 taskkill is used with /T and /F, by ABSOLUTE path", () => {
   const runs = [];
   const runCommandImpl = (cmd, args) => { runs.push({ cmd, args }); return { status: 0, error: null, stdout: "", stderr: "" }; };
-  const res = terminateProcessTree(777, { platform: "win32", killImpl: () => {}, runCommandImpl });
+  const res = terminateProcessTree(777, {
+    platform: "win32",
+    killImpl: () => {},
+    runCommandImpl,
+    env: { SystemRoot: "C:\\Windows" }
+  });
   assert.equal(res.delivered, true);
   assert.equal(res.method, "taskkill");
-  assert.equal(runs[0].cmd, "taskkill");
+  // Windows resolves a BARE executable name against the current directory
+  // before PATH, and our cwd is the untrusted repository under review. A repo
+  // shipping taskkill.exe would otherwise be executed with our privileges the
+  // moment a watchdog guard fired.
+  assert.notEqual(runs[0].cmd, "taskkill", "a bare name is resolvable from the reviewed repo");
+  assert.match(runs[0].cmd, /System32[\\/]taskkill\.exe$/i);
   assert.ok(runs[0].args.includes("/T"), "must kill the tree");
   assert.ok(runs[0].args.includes("/F"), "must force");
   assert.ok(runs[0].args.includes("777"));
+});
+
+test("T12: Windows .cmd/.bat shims are run through the interpreter, not spawned directly", () => {
+  // .cmd/.bat are not executable images — CreateProcess cannot run them. The
+  // resolve-the-path approach that lets us drop shell:true breaks outright for
+  // npm-installed shims unless the interpreter is invoked explicitly.
+  const t = buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "-"], {
+    platform: "win32",
+    env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }
+  });
+  assert.equal(t.viaInterpreter, true);
+  assert.equal(t.command, "C:\\Windows\\System32\\cmd.exe");
+  // Explicit argv — never shell:true, which re-parses the whole command line.
+  assert.deepEqual(t.args, ["/d", "/s", "/c", "C:\\npm\\claude.cmd", "-p", "-"]);
+});
+
+test("T12: a real .exe and any POSIX binary are spawned directly", () => {
+  const exe = buildSpawnTarget("C:\\tools\\codex.exe", ["a"], { platform: "win32", env: {} });
+  assert.equal(exe.viaInterpreter, false);
+  assert.equal(exe.command, "C:\\tools\\codex.exe");
+  assert.deepEqual(exe.args, ["a"]);
+
+  const posix = buildSpawnTarget("/usr/local/bin/codex", ["a"], { platform: "linux", env: {} });
+  assert.equal(posix.viaInterpreter, false);
+  assert.equal(posix.command, "/usr/local/bin/codex");
+});
+
+test("T12: the interpreter comes from ComSpec, never from SHELL", () => {
+  const t = buildSpawnTarget("C:\\npm\\agy.bat", [], {
+    platform: "win32",
+    env: { SHELL: "C:\\evil\\pwn.exe" }
+  });
+  assert.ok(!t.command.includes("evil"), "SHELL must never select the interpreter");
+  assert.match(t.command, /cmd\.exe$/i);
 });
 
 test("T12: win32 falls back to kill when taskkill is unavailable", () => {

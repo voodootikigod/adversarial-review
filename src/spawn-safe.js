@@ -57,6 +57,35 @@ export function resolveCommand(cmd, { platform = process.platform, env = process
   return null;
 }
 
+// Windows batch shims (.cmd/.bat) are NOT executable images: CreateProcess
+// cannot run them, they require the command interpreter. Resolving the shim
+// path and spawning it with shell:false therefore fails outright — which is how
+// npm installs codex/claude/agy on Windows.
+//
+// The interpreter is invoked EXPLICITLY with an argv array, never via
+// `shell: true`. shell:true re-parses the whole command line as a string, which
+// is the metacharacter-injection hole this module exists to close. `/d` skips
+// AutoRun registry commands, `/s` fixes quote handling, `/c` runs and exits.
+// ComSpec is the documented interpreter location; SHELL is never consulted.
+const BATCH_EXTENSIONS = new Set([".cmd", ".bat"]);
+
+export function buildSpawnTarget(resolvedPath, args = [], { platform = process.platform, env = process.env } = {}) {
+  if (platform === "win32" && BATCH_EXTENSIONS.has(path.extname(resolvedPath).toLowerCase())) {
+    const comspec = env.ComSpec || env.COMSPEC || "cmd.exe";
+    return { command: comspec, args: ["/d", "/s", "/c", resolvedPath, ...args], viaInterpreter: true };
+  }
+  return { command: resolvedPath, args, viaInterpreter: false };
+}
+
+// taskkill must be an ABSOLUTE path. Windows resolves a bare executable name
+// against the CURRENT DIRECTORY before PATH, and our current directory is the
+// untrusted repository under review — so a repo shipping taskkill.exe would be
+// executed with the reviewer's privileges the moment a guard fired.
+function taskkillPath(env = process.env) {
+  const root = env.SystemRoot || env.SYSTEMROOT || "C:\\Windows";
+  return path.join(root, "System32", "taskkill.exe");
+}
+
 /**
  * Is `pid` currently alive? Probe with signal 0; ESRCH means gone. Any other
  * error (notably EPERM) means the process exists and we merely cannot signal it.
@@ -119,7 +148,7 @@ export function terminateProcessTree(pid, options = {}) {
   }
 
   if (platform === "win32") {
-    const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"]);
+    const result = runCommandImpl(taskkillPath(options.env), ["/PID", String(pid), "/T", "/F"]);
     if (!result.error && result.status === 0) {
       return { attempted: true, delivered: true, method: "taskkill" };
     }

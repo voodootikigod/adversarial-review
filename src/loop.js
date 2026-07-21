@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "child_process";
 import path from "path";
 import { log, colors } from "./utils.js";
 import { scanForSecrets } from "./secrets.js";
+import { extractResumeHint } from "./resume-hint.js";
 import { collectReviewContext } from "./git-context.js";
 import {
   buildPrompt,
@@ -1029,6 +1030,11 @@ export async function runLoop(cwd, args) {
       }
       if (fixerResult.stderr) log.error(`Fixer stderr:\n${fixerResult.stderr.trimEnd()}`);
 
+      // Best effort: a failed fixer often leaves a resumable session behind, and
+      // losing it means losing the work already done. Never fails the run.
+      const resumeHint = extractResumeHint(fixerResult.stderr || "");
+      if (resumeHint && !args.json) log.info(`Resume here: ${resumeHint.command}`);
+
       emitEvent(args.json, { type: "review_result", result: lastResult, iteration: fixCount + 1 });
       emitEvent(args.json, {
         type: "loop_end",
@@ -1037,7 +1043,7 @@ export async function runLoop(cwd, args) {
         stashRef: hasPartial ? null : stashRef,
         fixerStderr: fixerResult.stderr
       });
-      emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason, survivingCount: gatings.length }));
+      emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason, survivingCount: gatings.length, resumeHint }));
       process.exit(2);
     }
 
@@ -1406,6 +1412,11 @@ export async function runBranchLoop(cwd, args) {
       if (fixerResult.timedOut) log.error(`Fixer timed out after ${fixerTimeoutMs / 1000}s.`);
       else log.error(`Fixer exited with code ${fixerResult.code}.`);
       if (fixerResult.stderr) log.error(`Fixer stderr:\n${fixerResult.stderr.trimEnd()}`);
+
+      // Best effort: a failed fixer often leaves a resumable session behind, and
+      // losing it means losing the work already done. Never fails the run.
+      const resumeHint = extractResumeHint(fixerResult.stderr || "");
+      if (resumeHint && !args.json) log.info(`Resume here: ${resumeHint.command}`);
       emitEvent(args.json, { type: "review_result", result: lastResult, iteration: fixCount + 1 });
       log.warn(`Earlier fix commit(s) (if any) left on '${branch}'. To undo all: ${recoveryLine}`);
       finish(fixerResult.timedOut ? "fixer-timeout" : "fixer-error", 2, gatings.length);
