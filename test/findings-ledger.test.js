@@ -144,3 +144,26 @@ test("T14: an existing permissive ledger is hardened on the next append", { skip
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("T14: a symlinked ledger path is refused, not written through", { skip: process.platform === "win32" }, () => {
+  // The default ledger lives INSIDE the reviewed repository, so its final
+  // component is attacker-controlled. Path-based append + chmod follow
+  // symlinks: a repo pre-creating .adlc/findings.jsonl as a symlink got our
+  // JSON appended to the target AND that target chmod-ed to 0600 — an arbitrary
+  // write plus a permission change on a file we never meant to touch. The
+  // hardening made it worse before this fix, since it added the chmod.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-symlink-"));
+  try {
+    const victim = path.join(root, "victim.txt");
+    fs.writeFileSync(victim, "important\n");
+    fs.chmodSync(victim, 0o644);
+    const ledger = path.join(root, "findings.jsonl");
+    fs.symlinkSync(victim, ledger);
+
+    assert.throws(() => appendLedger(ledger, [{ id: "x" }]), /symbolic link/i);
+    assert.equal(fs.readFileSync(victim, "utf8"), "important\n", "victim must not be written");
+    assert.equal(fs.statSync(victim).mode & 0o777, 0o644, "victim mode must not be changed");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

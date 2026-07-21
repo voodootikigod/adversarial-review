@@ -40,17 +40,48 @@ export function appendLedger(ledgerPath, entries) {
   const dir = path.dirname(ledgerPath);
   if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const buffer = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
-  // `mode` applies only when appendFileSync creates the file; an existing
-  // ledger keeps whatever mode it already has, so this never loosens one.
-  fs.appendFileSync(ledgerPath, buffer, { mode: 0o600 });
-  // Harden a pre-existing ledger too: { mode } is honored only when the file is
-  // created, so a ledger written before this change keeps its umask default
-  // (commonly 0644) indefinitely — and those are the ones already holding
-  // quoted repository source. Best effort; never fail the run over it.
-  if (process.platform !== "win32") {
-    try {
-      const current = fs.statSync(ledgerPath).mode & 0o777;
-      if (current !== 0o600) fs.chmodSync(ledgerPath, 0o600);
-    } catch { /* ignore */ }
+
+  // The default ledger path lives INSIDE the repository under review, so its
+  // final component is attacker-controlled. Path-based append + chmod follow
+  // symlinks: a repo that pre-creates .adlc/findings.jsonl as a symlink gets our
+  // JSON appended to the target AND that target chmod-ed to 0600 — an arbitrary
+  // write plus a permission change on a file we never intended to touch.
+  //
+  // O_NOFOLLOW makes the open fail (ELOOP) when the final component is a
+  // symlink, and every subsequent operation goes through the resulting fd
+  // rather than the path, so the target cannot be swapped between calls.
+  const NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0; // not meaningful on win32
+  let fd;
+  try {
+    fd = fs.openSync(
+      ledgerPath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | NOFOLLOW,
+      0o600
+    );
+  } catch (err) {
+    if (err.code === "ELOOP") {
+      throw new Error(
+        `Refusing to write the findings ledger: "${ledgerPath}" is a symbolic link. ` +
+        `Writing through it would append to, and change the permissions of, another file.`
+      );
+    }
+    throw err;
+  }
+
+  try {
+    fs.writeSync(fd, buffer);
+    // Harden a pre-existing ledger too: the mode argument is honored only when
+    // the file is CREATED, so a ledger written before this change keeps its
+    // umask default (commonly 0644) indefinitely — and those are the ones
+    // already holding quoted repository source. fchmod acts on the fd we just
+    // wrote, so it cannot be redirected. Best effort; never fail the run.
+    if (process.platform !== "win32") {
+      try {
+        const current = fs.fstatSync(fd).mode & 0o777;
+        if (current !== 0o600) fs.fchmodSync(fd, 0o600);
+      } catch { /* ignore */ }
+    }
+  } finally {
+    try { fs.closeSync(fd); } catch { /* ignore */ }
   }
 }

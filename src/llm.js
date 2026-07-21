@@ -364,7 +364,7 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
           throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
         }
         if (isE2BigError(argvErr)) {
-          throw new Error(argvTooLargeMessage("Codex", promptBytes, argvLimit));
+          throw Object.assign(new Error(argvTooLargeMessage("Codex", promptBytes, argvLimit)), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
         }
         const stderr = argvErr.stderr?.toString("utf8") || stdinErr.stderr?.toString("utf8") || "";
         throw new Error(
@@ -413,7 +413,7 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
     // Retrying argv would pass the same bad flag and fail the same way.
     const flagRejection = describeUnknownFlagRejection(cliCmd, stderr);
     if (flagRejection) {
-      throw new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : ""));
+      throw Object.assign(new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : "")), { stdout: err.stdout, stderr: err.stderr, cause: err });
     }
     const promptBytes = Buffer.byteLength(fullPrompt);
     const argvLimit = maxArgvPromptBytes();
@@ -434,12 +434,12 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
         );
       }
       if (isE2BigError(err2)) {
-        throw new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit));
+        throw Object.assign(new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit)), { stdout: err2.stdout, stderr: err2.stderr, cause: err2 });
       }
       const stderr2 = err2.stderr?.toString("utf8") || stderr;
       const flagRejection2 = describeUnknownFlagRejection(cliCmd, stderr2);
       if (flagRejection2) {
-        throw new Error(flagRejection2 + (stderr2.trim() ? `\n${stderr2.trim()}` : ""));
+        throw Object.assign(new Error(flagRejection2 + (stderr2.trim() ? `\n${stderr2.trim()}` : "")), { stdout: err2.stdout, stderr: err2.stderr, cause: err2 });
       }
       const suffix = stderr2.trim() ? `\n${stderr2.trim()}` : "";
       throw Object.assign(
