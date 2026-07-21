@@ -150,3 +150,48 @@ test("T12: win32 falls back to kill when taskkill is unavailable", () => {
   assert.equal(res.method, "kill");
   assert.deepEqual(killed, [555]);
 });
+
+test("T12: resolveCommand's bare-name guard blocks traversal, not just non-strings", () => {
+  // `||` vs `&&` in the guard: with `&&`, a *string* like "../evil" skips the
+  // rejection entirely and reaches path.join(dir, "../evil"), which escapes the
+  // PATH directory. Plant a real executable exactly where that would land.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-traverse-"));
+  try {
+    const binDir = path.join(root, "bin");
+    fs.mkdirSync(binDir);
+    const evil = path.join(root, "evil");
+    fs.writeFileSync(evil, "#!/bin/sh");
+    fs.chmodSync(evil, 0o755);
+    assert.equal(
+      resolveCommand("../evil", { platform: "linux", env: { PATH: binDir } }),
+      null,
+      "a traversal name must be rejected before any path join"
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("T12: resolveCommand uses the PATHEXT actually supplied, not the default list", () => {
+  // `env.PATHEXT || DEFAULT` vs `&&`: with `&&` the default list is used even
+  // when PATHEXT is set. A default-only extension list cannot resolve ".foo".
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-pathext2-"));
+  try {
+    fs.writeFileSync(path.join(dir, "tool.foo"), "x");
+    const resolved = resolveCommand("tool", {
+      platform: "win32",
+      env: { PATH: dir, PATHEXT: ".FOO" }
+    });
+    assert.ok(resolved, "the supplied PATHEXT must be honored");
+    assert.ok(resolved.toLowerCase().endsWith("tool.foo"), `got ${resolved}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T12: isPidAlive accepts pid 1 — the boundary is 0, not 1", () => {
+  // `pid <= 0` vs `pid <= 1`: pid 1 is a real process (init/launchd). Treating
+  // it as dead would silently skip terminating a legitimate target.
+  assert.equal(isPidAlive(1, () => {}), true);
+  assert.equal(isPidAlive(0, () => { throw new Error("must not signal"); }), false);
+});
