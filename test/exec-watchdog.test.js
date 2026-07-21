@@ -16,18 +16,29 @@ test("T13 AC14: the configured timeout IS the ceiling; the default only fills in
   assert.deepEqual(resolveWindows({}).maxMs, DEFAULT_MAX_MS);
 });
 
-test("T13 AC14: the idle window is clamped strictly below the ceiling", () => {
-  // Without the clamp, --timeout 60 leaves a 180s idle guard that can never
-  // fire — silently collapsing the two-guard design back to one.
-  const { idleMs, maxMs } = resolveWindows({ timeoutMs: 60_000 });
+test("T13 AC14: an explicitly requested idle window is clamped below the ceiling", () => {
+  // Without the clamp, --timeout 60 with a 180s idle request leaves a guard
+  // that can never fire — silently collapsing the design back to one guard.
+  const { idleMs, maxMs } = resolveWindows({ timeoutMs: 60_000, idleTimeoutMs: 180_000 });
   assert.equal(maxMs, 60_000);
   assert.ok(idleMs < maxMs, `idle ${idleMs} must be < ceiling ${maxMs}`);
   assert.ok(idleMs > 0);
 });
 
-test("T13: with a generous ceiling the idle window keeps its default", () => {
-  const { idleMs } = resolveWindows({ timeoutMs: DEFAULT_MAX_MS });
-  assert.equal(idleMs, DEFAULT_IDLE_TIMEOUT_MS);
+test("T13: the idle guard is OFF unless a caller explicitly asks for it", () => {
+  // Dogfooding killed a healthy codex review: we invoke codex with
+  // --output-last-message, which suppresses its event stream, so silence means
+  // "working", not "wedged". No default can tell those apart without the
+  // per-item signal we do not have, and killing healthy work is strictly worse
+  // than waiting for the ceiling.
+  assert.equal(resolveWindows({ timeoutMs: DEFAULT_MAX_MS }).idleMs, null);
+  assert.equal(resolveWindows({}).idleMs, null);
+  assert.equal(resolveWindows({ timeoutMs: 60_000, idleTimeoutMs: 0 }).idleMs, null);
+  // ...but honored when requested.
+  assert.equal(
+    resolveWindows({ timeoutMs: 600_000, idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS }).idleMs,
+    DEFAULT_IDLE_TIMEOUT_MS
+  );
 });
 
 // ─── fake-timer harness ─────────────────────────────────────────────────────
@@ -227,6 +238,7 @@ test("T13 AC9: timers are unref'd so a pending watchdog cannot hold the loop ope
   };
   const child = fakeChild();
   const promise = spawnWithWatchdog("node", [], {
+    idleTimeoutMs: 5000, // opt in so both timers exist for this check
     setTimeoutImpl: wrapped,
     clearTimeoutImpl: clock.clearTimeoutImpl,
     spawnImpl: () => child,
@@ -311,4 +323,39 @@ test("T13: any positive timeout is honored as the ceiling, including 1ms", () =>
   assert.equal(resolveWindows({ timeoutMs: 1 }).maxMs, 1);
   assert.equal(resolveWindows({ timeoutMs: 0 }).maxMs, DEFAULT_MAX_MS, "0 is not a timeout");
   assert.equal(resolveWindows({ timeoutMs: -5 }).maxMs, DEFAULT_MAX_MS, "negative is not a timeout");
+});
+
+test("T13: stdin is closed even when there is no input to write", async () => {
+  // Regression: execFileSync closes stdin for you; spawn does not. With
+  // `input: null` the child was left waiting on an open stdin forever. The
+  // argv-fallback path passes null, so a real review hung and then answered
+  // conversationally instead of reviewing.
+  const out = await spawnWithWatchdog(
+    "node",
+    ["-e", "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>process.stdout.write('eof:'+d.length))"],
+    { input: null, timeoutMs: 30_000 }
+  );
+  assert.equal(out, "eof:0", "the child must observe EOF on stdin, not block");
+});
+
+test("T13: a silent long-running process is NOT killed when no idle guard is set", async () => {
+  // The default must let a legitimately quiet CLI keep working — codex emits
+  // nothing under --output-last-message until it finishes.
+  const clock = fakeClock();
+  const child = fakeChild();
+  let settled = false;
+  const promise = spawnWithWatchdog("node", [], {
+    timeoutMs: 600_000, // no idleTimeoutMs => idle guard off
+    setTimeoutImpl: clock.setTimeoutImpl,
+    clearTimeoutImpl: clock.clearTimeoutImpl,
+    spawnImpl: () => child,
+    terminateImpl: () => {}
+  });
+  promise.then(() => { settled = true; }, () => { settled = true; });
+  clock.advance(500_000); // far past the old 180s default, still silent
+  await Promise.resolve();
+  assert.equal(settled, false, "silence alone must not kill a healthy run");
+  child.stdout.emit("data", Buffer.from("finally done"));
+  child.emit("close", 0, null);
+  assert.equal(await promise, "finally done");
 });

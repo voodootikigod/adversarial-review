@@ -67,11 +67,24 @@ export class ExecBufferError extends Error {
  */
 export function resolveWindows({ timeoutMs, idleTimeoutMs } = {}) {
   const maxMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_MAX_MS;
-  const requested = Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0
-    ? idleTimeoutMs
-    : DEFAULT_IDLE_TIMEOUT_MS;
-  // Strictly below the ceiling; never below 1s, and never zero.
-  const idleMs = Math.max(1000, Math.min(requested, Math.floor(maxMs * 0.9)));
+
+  // The idle guard is OPT-IN. It was originally on by default at 180s, and
+  // dogfooding immediately proved that wrong: we invoke codex with
+  // --output-last-message, which suppresses its event stream, so a healthy
+  // codex review is legitimately silent for minutes and got killed mid-run.
+  //
+  // This is the failure mode the two-guard design was meant to avoid, and a
+  // default cannot distinguish "silent because wedged" from "silent because
+  // working" without the per-item signal we do not have. Killing healthy work
+  // is strictly worse than waiting for the ceiling, so the ceiling is the
+  // default backstop and the idle guard is enabled only when a caller asks.
+  if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
+    return { maxMs, idleMs: null };
+  }
+
+  // Strictly below the ceiling; never below 1s. Without the clamp a short
+  // --timeout would leave an idle window that can never fire.
+  const idleMs = Math.max(1000, Math.min(idleTimeoutMs, Math.floor(maxMs * 0.9)));
   return { maxMs, idleMs };
 }
 
@@ -149,7 +162,7 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
     };
 
     const armIdle = () => {
-      if (settled) return;
+      if (settled || idleMs === null) return; // opt-in; see resolveWindows
       if (idleTimer !== null) clearTimeoutImpl(idleTimer);
       idleTimer = setTimeoutImpl(() => {
         idleTimer = null;
@@ -215,9 +228,13 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
       settle(reject, err);
     });
 
-    if (input !== null && child.stdin) {
+    // ALWAYS close stdin, even with no input. execFileSync closes it for you;
+    // spawn does not. A CLI reading from an open, never-closed stdin waits
+    // forever — the argv-fallback path (input === null) hung and then answered
+    // conversationally instead of reviewing.
+    if (child.stdin) {
       child.stdin.on("error", () => { /* child may exit before we finish writing */ });
-      child.stdin.end(input, "utf8");
+      child.stdin.end(input ?? "", "utf8");
     }
 
     armIdle();
