@@ -251,3 +251,45 @@ test("T13: all timers are cleared once settled", async () => {
   await promise;
   assert.equal(clock.pending(), 0, "no dangling timers after settle");
 });
+
+// ─── real-process integration ───────────────────────────────────────────────
+// Every test above injects a fake child, so the actual spawn path — command
+// resolution, detached process group, stdio wiring, stdin piping — is otherwise
+// unexercised. These use a real `node` subprocess.
+
+test("T13: real subprocess round-trips stdin to stdout", async () => {
+  const out = await spawnWithWatchdog(
+    "node",
+    ["-e", "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>process.stdout.write('got:'+d))"],
+    { input: "PAYLOAD", timeoutMs: 30_000 }
+  );
+  assert.equal(out, "got:PAYLOAD");
+});
+
+test("T13: a real non-zero exit rejects with stderr attached", async () => {
+  const err = await spawnWithWatchdog(
+    "node",
+    ["-e", "process.stderr.write('real failure');process.exit(4)"],
+    { timeoutMs: 30_000 }
+  ).catch((e) => e);
+  assert.equal(err.code, 4);
+  assert.match(err.stderr, /real failure/);
+});
+
+test("T13: a real wedged process is killed by the ceiling, not left hanging", async () => {
+  const started = Date.now();
+  const err = await spawnWithWatchdog(
+    "node",
+    ["-e", "setInterval(()=>{},1000)"], // never exits, never speaks
+    { timeoutMs: 1500, idleTimeoutMs: 1000 }
+  ).catch((e) => e);
+  // Silent process: the idle guard should reach it first.
+  assert.equal(err.code, "EIDLE");
+  assert.ok(Date.now() - started < 10_000, "must not wait out a long timeout");
+});
+
+test("T13: an unresolvable command rejects instead of hanging", async () => {
+  const err = await spawnWithWatchdog("definitely-not-a-real-binary-xyz", [], { timeoutMs: 5000 })
+    .catch((e) => e);
+  assert.match(err.message, /not found on PATH/);
+});

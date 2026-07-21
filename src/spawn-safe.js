@@ -36,7 +36,7 @@ export function resolveCommand(cmd, { platform = process.platform, env = process
   // for anything installed by npm. Resolving the real filename ourselves is
   // what lets us drop `shell: true`, which was only ever there to make the
   // shell perform this lookup for us.
-  const extensions = platform === "win32"
+  const extensions = platform !== "win32"
     ? (env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean).map((e) => e.toLowerCase())
     : [""];
 
