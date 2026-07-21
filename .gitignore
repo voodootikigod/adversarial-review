@@ -9,3 +9,4 @@ blog/
 !.adlc/tickets.json
 .worktrees/
 .omo/
+.booster/
