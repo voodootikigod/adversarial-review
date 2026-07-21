@@ -300,7 +300,21 @@ export function getFixFiles(cwd, findings, args) {
   // directories and symlinks that resolve outside the repository.
   const tracked = gitRun(cwd, ["ls-files"], { allowFail: true }).split("\n").filter(Boolean);
   const cited = [...new Set(findings.map(f => f.file).filter(Boolean))];
-  const files = sanitizeEditablePaths(cited, { allowlist: tracked.length ? tracked : null });
+  if (tracked.length === 0) {
+    // Fail CLOSED. An empty result means either an empty repo or a failed
+    // ls-files; in both cases we cannot establish which paths are real. Falling
+    // back to lexical validation would silently downgrade to the weaker check
+    // this allowlist exists to replace, and hand model-invented paths to a
+    // write-capable agent.
+    if (cited.length) {
+      log.warn(
+        "Could not determine the git-tracked file set; offering the fixer no files.\n" +
+        "  Model-cited paths are not trusted without it."
+      );
+    }
+    return [];
+  }
+  const files = sanitizeEditablePaths(cited, { allowlist: tracked });
   const rejected = cited.length - files.length;
   if (rejected > 0) {
     // Never drop silently: a cited file vanishing from the fixer's list changes

@@ -236,6 +236,28 @@ test("T15: getFixFiles keeps only cited paths that git actually tracks", () => {
   }
 });
 
+test("T15: an undeterminable tracked-file set fails closed, not open", () => {
+  // If git ls-files cannot answer, we cannot tell which cited paths are real.
+  // Falling back to lexical validation would silently downgrade to the weaker
+  // check the allowlist replaces — and hand invented paths to a write-capable
+  // agent. Offer nothing instead, and say so.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-nogit-"));
+  const warnings = [];
+  const originalWarn = log.warn;
+  log.warn = (m) => warnings.push(String(m));
+  try {
+    const files = getFixFiles(dir, [{ file: "anything.js" }], { loopFixerScope: "sc2" });
+    assert.deepEqual(files, [], "must not fall back to lexical-only validation");
+    assert.ok(
+      warnings.some((w) => /tracked file set/i.test(w)),
+      `expected a warning about the undeterminable tracked set, got: ${JSON.stringify(warnings)}`
+    );
+  } finally {
+    log.warn = originalWarn;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("T15: rejected cited paths are reported, never dropped silently", () => {
   // A cited file vanishing from the fixer's list changes what gets fixed, so
   // the operator has to be told.
