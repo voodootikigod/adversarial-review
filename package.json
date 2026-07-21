@@ -17,6 +17,7 @@
     "src/",
     "skills/adversarial-review/",
     "prompt-template.md",
+    "prompt-template-artifact.md",
     "schema.json",
     "NOTICE",
     "LICENSE"
