@@ -294,8 +294,19 @@ function getFixFiles(cwd, findings, args) {
     return allFiles;
   }
 
-  // sc2: finding-cited files only
-  const files = [...new Set(findings.map(f => f.file).filter(Boolean))];
+  // sc2: finding-cited files only. finding.file is raw model output, so it is
+  // intersected with the set git actually tracks rather than trusted as a path.
+  // This is what makes the list authoritative — lexical validation alone accepts
+  // directories and symlinks that resolve outside the repository.
+  const tracked = gitRun(cwd, ["ls-files"], { allowFail: true }).split("\n").filter(Boolean);
+  const cited = [...new Set(findings.map(f => f.file).filter(Boolean))];
+  const files = sanitizeEditablePaths(cited, { allowlist: tracked.length ? tracked : null });
+  const rejected = cited.length - files.length;
+  if (rejected > 0) {
+    // Never drop silently: a cited file vanishing from the fixer's list changes
+    // what gets fixed, and an operator needs to see it.
+    log.warn(`${rejected} finding-cited path(s) rejected as not tracked/valid; not offered to the fixer.`);
+  }
   if (files.length === 0) {
     log.warn(
       "All gating findings cite no specific file. Fix prompt will list no files.\n" +
@@ -309,15 +320,30 @@ function getFixFiles(cwd, findings, args) {
 // model-derived from an untrusted diff, and this list is handed to an agent with
 // write access — fencing a path does NOT sanitize it, because the fixer acts on
 // the path either way. Absolute paths and anything climbing out are dropped.
-export function sanitizeEditablePaths(files) {
+// Control characters are the sharp edge here, not traversal. This list is
+// rendered into the AUTHORITATIVE scaffolding — outside every fence — so a
+// filename containing a newline does not merely look odd, it injects new prompt
+// structure (a second "## Files to Edit", extra instructions) that the fixer
+// reads as ours. Any C0/DEL byte disqualifies a path outright.
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+// `allowlist`, when supplied, is the authoritative set of paths git actually
+// tracks. Lexical checks alone cannot establish containment: they accept ".",
+// bare directories, and symlinks that resolve outside the repository. Exact
+// membership in a git-derived set does.
+export function sanitizeEditablePaths(files, { allowlist = null } = {}) {
+  const permitted = allowlist ? new Set(allowlist) : null;
   const safe = [];
   for (const raw of files || []) {
     if (typeof raw !== "string" || !raw.trim()) continue;
     const p = raw.trim();
-    if (p.includes("\0")) continue;
+    if (CONTROL_CHARS.test(p)) continue;
     if (path.isAbsolute(p) || /^[A-Za-z]:[\\/]/.test(p)) continue; // POSIX + Windows drive
     const normalized = path.normalize(p).split(path.sep).join("/");
     if (normalized === ".." || normalized.startsWith("../")) continue;
+    if (normalized === "." || normalized === "./") continue;
+    if (normalized.endsWith("/")) continue; // a directory, not an editable file
+    if (permitted && !permitted.has(normalized)) continue;
     safe.push(normalized);
   }
   return safe;
