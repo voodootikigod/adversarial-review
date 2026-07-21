@@ -3,7 +3,9 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
+import { execFileSync } from "node:child_process";
+import { log } from "../src/utils.js";
+import { getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
 
 test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemini key", () => {
   assert.equal(FIXER_PROVIDER_MAP.agy, "gemini");
@@ -196,4 +198,63 @@ test("T15: an allowlist restricts editable paths to known tracked files", () => 
 
 test("T15: '.' and bare directory paths are rejected even without an allowlist", () => {
   assert.deepEqual(sanitizeEditablePaths([".", "./", "src/"]), []);
+});
+
+// getFixFiles is where the git-derived allowlist is actually applied, so the
+// end-to-end guarantee lives here rather than in sanitizeEditablePaths alone.
+function tempRepo(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-fixfiles-"));
+  const run = (args) => execFileSync("git", args, { cwd: dir, stdio: "ignore" });
+  run(["init", "-q"]);
+  run(["config", "user.email", "t@example.com"]);
+  run(["config", "user.name", "t"]);
+  for (const f of files) {
+    fs.mkdirSync(path.join(dir, path.dirname(f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), "x");
+  }
+  run(["add", "-A"]);
+  run(["commit", "-qm", "init"]);
+  return dir;
+}
+
+test("T15: getFixFiles keeps only cited paths that git actually tracks", () => {
+  const dir = tempRepo(["src/real.js", "src/other.js"]);
+  try {
+    const files = getFixFiles(
+      dir,
+      [
+        { file: "src/real.js" },
+        { file: "src/invented.js" },      // model hallucinated a path
+        { file: "../../etc/passwd" },     // traversal
+        { file: `evil.js${LF}- /etc/crontab` } // control-char injection
+      ],
+      { loopFixerScope: "sc2" }
+    );
+    assert.deepEqual(files, ["src/real.js"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T15: rejected cited paths are reported, never dropped silently", () => {
+  // A cited file vanishing from the fixer's list changes what gets fixed, so
+  // the operator has to be told.
+  const dir = tempRepo(["src/real.js"]);
+  const warnings = [];
+  const originalWarn = log.warn;
+  log.warn = (m) => warnings.push(String(m));
+  try {
+    getFixFiles(dir, [{ file: "src/real.js" }, { file: "src/gone.js" }], { loopFixerScope: "sc2" });
+    assert.ok(
+      warnings.some((w) => /rejected/i.test(w) && /1/.test(w)),
+      `expected a warning naming the rejected count, got: ${JSON.stringify(warnings)}`
+    );
+    // And no warning when everything is legitimate.
+    warnings.length = 0;
+    getFixFiles(dir, [{ file: "src/real.js" }], { loopFixerScope: "sc2" });
+    assert.deepEqual(warnings.filter((w) => /rejected/i.test(w)), []);
+  } finally {
+    log.warn = originalWarn;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -278,7 +278,7 @@ function redactSecretsInFindings(findings) {
   });
 }
 
-function getFixFiles(cwd, findings, args) {
+export function getFixFiles(cwd, findings, args) {
   if (args.loopFixerScope === "unrestricted") {
     const cap = args.loopFixerFileCap || 100;
     const allFiles = gitRun(cwd, ["ls-files"], { allowFail: true }).split("\n").filter(Boolean);
