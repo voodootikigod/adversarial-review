@@ -161,3 +161,32 @@ test("T20: a symlinked ledger inside the repo is refused; victim untouched", () 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("T20: an existing permissive ledger is secured BEFORE the sensitive entry is written", { skip: process.platform === "win32" }, () => {
+  // Order matters: chmod-then-write, so the new finding never lands while the
+  // file is still world-readable.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-order-"));
+  try {
+    const ledger = path.join(root, "findings.jsonl");
+    fs.writeFileSync(ledger, "old\n");
+    fs.chmodSync(ledger, 0o644);
+    appendLedger(ledger, [{ secret: "quoted-source" }]);
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "tightened");
+    assert.match(fs.readFileSync(ledger, "utf8"), /quoted-source/, "entry written");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("T20: a large ledger entry is written whole (no partial-write truncation)", { skip: process.platform === "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-big-"));
+  try {
+    const ledger = path.join(root, "findings.jsonl");
+    const big = { desc: "x".repeat(2 * 1024 * 1024) }; // 2 MB, past a single write chunk
+    appendLedger(ledger, [big]);
+    const line = fs.readFileSync(ledger, "utf8").trim();
+    assert.deepEqual(JSON.parse(line), big, "the full record round-trips");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

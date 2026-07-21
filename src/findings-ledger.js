@@ -40,26 +40,35 @@ export function toLedgerEntries(result, assessments, { failOn = "medium", minCon
 // path, refuse an escape or any symlinked component, and hand back an fd we
 // operate through so nothing can be swapped after the check. See src/safe-fs.js.
 //
-// Gating findings quote source, so the ledger can hold repository excerpts:
-// new files are created 0600, and an existing looser ledger is tightened via the
-// fd (not the path). Both are best effort — the ledger is a side effect, so a
-// write failure warns rather than aborting the review (handled by the caller).
+// Gating findings quote source, so the ledger can hold repository excerpts, and
+// new files are created 0600. Order matters: an existing looser ledger is
+// tightened BEFORE the sensitive entry is written, so the new data never lands
+// while the file is world-readable. A chmod failure PROPAGATES rather than being
+// swallowed — the caller (recordFindings) warns and skips the ledger, so we
+// never write findings to a file we could not secure.
+function writeAllSync(fd, buffer) {
+  // fs.writeSync may write fewer bytes than requested (signals, quotas, some
+  // filesystems). Loop until the whole buffer is on disk, or a truncated JSONL
+  // record would silently corrupt the ledger.
+  let offset = 0;
+  while (offset < buffer.length) {
+    offset += fs.writeSync(fd, buffer, offset);
+  }
+}
+
 export function appendLedger(ledgerPath, entries) {
   if (!entries || entries.length === 0) return;
-  const buffer = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  const buffer = Buffer.from(entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
 
   const fd = openContainedAppendFd(ledgerPath, { mode: 0o600, mkdirMode: 0o700 });
   try {
-    fs.writeSync(fd, buffer);
-    // Tighten a pre-existing loose ledger. The mode arg only applies on
-    // creation, so a ledger written before this landed keeps its umask default
-    // (commonly 0644) — and those already hold quoted source. fchmod acts on the
-    // fd, so it cannot be redirected. Best effort; POSIX only.
-    if (process.platform !== "win32") {
-      try {
-        if ((fs.fstatSync(fd).mode & 0o777) !== 0o600) fs.fchmodSync(fd, 0o600);
-      } catch { /* ignore */ }
+    // Secure FIRST, then write. The mode arg only applies on creation, so an
+    // existing ledger written before this landed keeps its umask default
+    // (commonly 0644). fchmod acts on the fd, so it cannot be redirected.
+    if (process.platform !== "win32" && (fs.fstatSync(fd).mode & 0o777) !== 0o600) {
+      fs.fchmodSync(fd, 0o600);
     }
+    writeAllSync(fd, buffer);
   } finally {
     try { fs.closeSync(fd); } catch { /* ignore */ }
   }

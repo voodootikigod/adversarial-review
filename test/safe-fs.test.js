@@ -215,3 +215,27 @@ test("AC11: the module documents the TOCTOU / static-threat boundary", () => {
   assert.match(src, /statically planted symlink/i, "must state the static-threat scope");
   assert.match(src, /TOCTOU/, "must name the excluded live-race case");
 });
+
+test("AC (predicate): a child whose name starts with '..' is treated as inside base and walked", () => {
+  // Regression for the `!rel.startsWith("..")` bug: `..cache` is a legitimate
+  // child, not a traversal, and a symlinked `..cache` must be refused, not
+  // waved through as an operator-external path.
+  const root = tmpRoot("dotdotname");
+  try {
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(outside);
+    const repo = path.join(root, "repo");
+    fs.mkdirSync(repo);
+    fs.symlinkSync(outside, path.join(repo, "..cache"));
+    assert.throws(
+      () => openContainedAppendFd(path.join(repo, "..cache", "findings.jsonl"), { base: repo }),
+      UncontainedPathError
+    );
+    // A REAL ..cache child still works.
+    const fd = openContainedAppendFd(path.join(repo, "..data", "findings.jsonl"), { base: repo });
+    appendVia(fd, "ok\n");
+    assert.equal(fs.readFileSync(path.join(repo, "..data", "findings.jsonl"), "utf8"), "ok\n");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

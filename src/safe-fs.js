@@ -62,7 +62,12 @@ export function openContainedAppendFd(
   const lexicalBase = path.resolve(base);
   const lexicalTarget = path.resolve(lexicalBase, targetPath);
   const rel = path.relative(lexicalBase, lexicalTarget);
-  const insideBase = rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  // A path is inside base only if `rel` is a real descendant. `!rel.startsWith("..")`
+  // is WRONG: a legitimate child like `..cache/x` starts with ".." without being
+  // a traversal, and would then skip the suffix walk. Match the traversal token
+  // exactly — ".." alone or "../…".
+  const escapes = rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel);
+  const insideBase = rel !== "" && !escapes;
 
   if (insideBase) {
     // The attacker-controlled region is every component STRICTLY UNDER base,
