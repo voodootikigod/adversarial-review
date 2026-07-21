@@ -169,18 +169,17 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
       fn(value);
     };
 
-    const KILL_GRACE_MS = 5000;
     const kill = () => {
       const pid = child.pid;
+      // SIGTERM is a REQUEST; a process that traps or ignores it keeps running.
+      // The child is detached, so it outlives us — and we reject immediately
+      // after this, whereupon the CLI calls process.exit(). A deferred
+      // escalation timer is therefore UNREACHABLE: it was scheduled, unref-ed,
+      // and never ran. Escalate synchronously instead. The process has already
+      // been judged hung, and terminateProcessTree stays gated on liveness, so
+      // the SIGKILL is a no-op if SIGTERM already worked.
       try { terminateImpl(pid); } catch { /* already gone */ }
-      // SIGTERM is a REQUEST. A process that traps or ignores it keeps running
-      // after we have rejected, and it is detached, so it outlives this process.
-      // Escalate once after a grace period; harmless if it already exited,
-      // because terminateProcessTree is gated on liveness.
-      const escalation = setTimeoutImpl(() => {
-        try { terminateImpl(pid, { signal: "SIGKILL" }); } catch { /* gone */ }
-      }, KILL_GRACE_MS);
-      escalation?.unref?.();
+      try { terminateImpl(pid, { signal: "SIGKILL" }); } catch { /* already gone */ }
     };
 
     const failWith = (ErrCls, message, extra) => {

@@ -129,7 +129,7 @@ test("T13 AC3: the idle guard fires when no output arrives", async () => {
   clock.advance(1001);
   const err = await promise.catch((e) => e);
   assert.equal(err.code, "EIDLE");
-  assert.deepEqual(terminated, [4242], "the process tree must be terminated");
+  assert.deepEqual(terminated, [4242, 4242], "SIGTERM then an immediate SIGKILL escalation");
 });
 
 test("T13 AC4: output resets the idle guard", async () => {
@@ -157,7 +157,7 @@ test("T13 AC5: the hard ceiling fires even while output keeps arriving", async (
   }
   const err = await promise.catch((e) => e);
   assert.equal(err.code, "ETIMEDOUT", "a chatty but wedged process must still be killed");
-  assert.deepEqual(terminated, [4242]);
+  assert.deepEqual(terminated, [4242, 4242], "SIGTERM then SIGKILL");
 });
 
 test("T13 AC12: the idle message differs from the ceiling message and names the window", async () => {
@@ -181,7 +181,7 @@ test("T13 AC6: exceeding maxBuffer fails loudly instead of growing unbounded", a
   const err = await promise.catch((e) => e);
   assert.equal(err.code, "EBUFFER");
   assert.match(err.message, /32/);
-  assert.deepEqual(terminated, [4242]);
+  assert.deepEqual(terminated, [4242, 4242], "SIGTERM then SIGKILL");
 });
 
 // ─── error payloads (cross-ticket contract with T14) ────────────────────────
@@ -255,7 +255,7 @@ test("T13: settling is one-shot — a later close cannot re-settle", async () =>
   const err = await promise.catch((e) => e);
   assert.equal(err.code, "EIDLE");
   child.emit("close", 0, null); // must be ignored
-  assert.deepEqual(terminated, [4242], "no second termination");
+  assert.deepEqual(terminated, [4242, 4242], "one escalation pair, not a second round");
 });
 
 test("T13: all timers are cleared once settled", async () => {

@@ -184,6 +184,30 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
   // resolved. So it cannot simply be removed: resolveCommand performs that
   // lookup explicitly (PATH + PATHEXT) and we spawn the resolved absolute path,
   // which removes the only reason the shell was needed.
+  // WINDOWS IS DELIBERATELY UNCHANGED FROM main. Four successive review rounds
+  // found this branch's Windows handling wrong in a different way each time —
+  // .cmd shims are not executable images, cmd.exe re-parses argv after /c, a
+  // blanket argument refusal broke every npm-installed CLI, and a bare cmd.exe
+  // fallback is resolvable from the reviewed repository. None of it has ever
+  // executed on Windows, because CI is Ubuntu-only.
+  //
+  // Rather than ship a fifth guess, Windows keeps exactly the behaviour it has
+  // in main: execFileSync with shell:true. That is KNOWN-UNSAFE (arguments are
+  // re-parsed by cmd.exe) and is the original defect — but it works, and
+  // shipping a broken-but-differently-unsafe path is worse than shipping the
+  // status quo with the fix scoped to the platform we can actually verify.
+  // T19 owns Windows, with windows-latest CI as its first acceptance criterion.
+  if (process.platform === "win32") {
+    return execFileSync(cliCmd, args, {
+      input,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: timeoutMs,
+      shell: true
+    }).trim();
+  }
+
   const resolved = resolveCommand(cliCmd);
   if (!resolved) {
     throw new Error(
@@ -418,7 +442,10 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
         throw new Error(flagRejection2 + (stderr2.trim() ? `\n${stderr2.trim()}` : ""));
       }
       const suffix = stderr2.trim() ? `\n${stderr2.trim()}` : "";
-      throw new Error(`Failed to execute local CLI agent "${cliCmd}": ${err2.message || err.message}${suffix}`);
+      throw Object.assign(
+        new Error(`Failed to execute local CLI agent "${cliCmd}": ${err2.message || err.message}${suffix}`),
+        { stdout: err2.stdout ?? err.stdout, stderr: err2.stderr ?? err.stderr, cause: err2 }
+      );
     }
   }
 }
