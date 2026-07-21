@@ -823,22 +823,31 @@ exit 2
 test("T12 AC1: no spawn site derives `shell` from the platform or the environment", () => {
   // Regression guard for the Windows argument-injection defect: execCli used
   // `shell: process.platform === "win32"`, handing every argument to cmd.exe.
-  const raw = fs.readFileSync(new URL("../src/llm.js", import.meta.url), "utf8");
-  // Scan CODE, not prose: the fix is documented in a comment that necessarily
-  // quotes the old `shell: process.platform === "win32"` construct, and a naive
-  // grep would flag that explanation as the defect it describes.
-  const code = raw
-    .split("\n")
-    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
-    .join("\n");
+  // Every module that can spawn, not just llm.js — the actual spawn moved into
+  // exec-watchdog.js when the watchdog landed, and a guard pinned to one file
+  // would have silently stopped covering the thing it guards.
+  const modules = ["../src/llm.js", "../src/exec-watchdog.js", "../src/spawn-safe.js"];
+  let explicitFalse = 0;
 
-  const shellLines = code.split("\n").filter((l) => /^\s*shell:/.test(l));
-  assert.ok(shellLines.length > 0, "expected at least one explicit shell option");
-  for (const line of shellLines) {
-    assert.match(line, /shell:\s*false/, `spawn must not enable a shell: ${line.trim()}`);
+  for (const mod of modules) {
+    const raw = fs.readFileSync(new URL(mod, import.meta.url), "utf8");
+    // Scan CODE, not prose: the fix is documented in comments that necessarily
+    // quote the old `shell: process.platform === "win32"` construct, and a naive
+    // grep would flag that explanation as the defect it describes.
+    const code = raw
+      .split("\n")
+      .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+      .join("\n");
+
+    for (const line of code.split("\n").filter((l) => /^\s*shell:/.test(l))) {
+      assert.match(line, /shell:\s*false/, `${mod} must not enable a shell: ${line.trim()}`);
+      explicitFalse++;
+    }
+    assert.ok(!/shell:\s*process\.(platform|env)/.test(code), `${mod}: shell must never come from platform/env`);
+    assert.ok(!/process\.env\.SHELL/.test(code), `${mod}: SHELL must not select a shell`);
   }
-  assert.ok(!/shell:\s*process\.(platform|env)/.test(code), "shell must never come from platform/env");
-  assert.ok(!/process\.env\.SHELL/.test(code), "SHELL is attacker-influenceable and must not select a shell");
+
+  assert.ok(explicitFalse > 0, "at least one spawn site must set shell:false explicitly");
 });
 
 test("T12: isCmdInstalled still answers correctly via resolveCommand", () => {

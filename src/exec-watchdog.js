@@ -1,0 +1,225 @@
+// Anti-hang process invocation.
+//
+// Ported in spirit from the upstream Codex plugin's watchdog
+// (Robbyfuu/codex-plugin-cc, commit 5545215 — see docs/peer-port-plan.md A2),
+// adapted for a standalone CLI that reads raw stdout from four different local
+// agents rather than a structured JSON-RPC event stream.
+//
+// TWO INDEPENDENT GUARDS, NOT ONE.
+//
+// The obvious design — reset a timer on every chunk, kill when it expires —
+// is wrong, and upstream documented why: a long-running operation emits a start
+// event and then NOTHING until it completes, so "no output for N seconds" kills
+// healthy work. Our exposure is worse than theirs, because we have no structured
+// events at all: a local agent can legitimately spend minutes on a silent tool
+// call.
+//
+// So:
+//   idleMs  — a fast, well-diagnosed error in the common case (a truly wedged
+//             process emits nothing at all). An optimisation.
+//   maxMs   — a hard ceiling that fires regardless of activity. THE backstop,
+//             and the only thing that can end a run that is producing output
+//             forever.
+//
+// The ceiling is mandatory; the idle guard must never be the only one. The idle
+// window is also clamped strictly below the ceiling, because otherwise a caller
+// passing a short --timeout would get an idle window that can never fire,
+// silently collapsing the design back to a single guard.
+
+import { spawn } from "child_process";
+import path from "path";
+import { resolveCommand, terminateProcessTree } from "./spawn-safe.js";
+
+export const DEFAULT_IDLE_TIMEOUT_MS = 180 * 1000;
+export const DEFAULT_MAX_MS = 900 * 1000;
+export const DEFAULT_MAX_BUFFER = 10 * 1024 * 1024;
+
+export class ExecIdleError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "ExecIdleError";
+    this.code = "EIDLE";
+    Object.assign(this, details);
+  }
+}
+
+export class ExecTimeoutError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "ExecTimeoutError";
+    this.code = "ETIMEDOUT";
+    Object.assign(this, details);
+  }
+}
+
+export class ExecBufferError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "ExecBufferError";
+    this.code = "EBUFFER";
+    Object.assign(this, details);
+  }
+}
+
+/**
+ * Effective guard windows. The ceiling is the caller's timeout when given; the
+ * idle window is clamped strictly below it so both guards can actually fire.
+ */
+export function resolveWindows({ timeoutMs, idleTimeoutMs } = {}) {
+  const maxMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_MAX_MS;
+  const requested = Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0
+    ? idleTimeoutMs
+    : DEFAULT_IDLE_TIMEOUT_MS;
+  // Strictly below the ceiling; never below 1s, and never zero.
+  const idleMs = Math.max(1000, Math.min(requested, Math.floor(maxMs * 0.9)));
+  return { maxMs, idleMs };
+}
+
+/**
+ * Spawn a command, pipe `input` to stdin, and return its buffered stdout.
+ *
+ * Rejects with EIDLE (no output for the idle window), ETIMEDOUT (hard ceiling),
+ * EBUFFER (output exceeded maxBuffer), or a plain Error on non-zero exit. EVERY
+ * rejection carries the stdout/stderr captured so far — T14 parses that stderr
+ * for resume ids, and discarding it would make that impossible.
+ *
+ * The setTimeout/clearTimeout seams exist so the timing behaviour is testable
+ * with fake timers instead of real wall-clock sleeps.
+ */
+export function spawnWithWatchdog(cmd, args = [], options = {}) {
+  const {
+    input = null,
+    timeoutMs,
+    idleTimeoutMs,
+    maxBuffer = DEFAULT_MAX_BUFFER,
+    streamStdout = false,
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
+    spawnImpl = spawn,
+    terminateImpl = terminateProcessTree,
+    stdoutSink = (chunk) => process.stdout.write(chunk)
+  } = options;
+
+  const { maxMs, idleMs } = resolveWindows({ timeoutMs, idleTimeoutMs });
+
+  return new Promise((resolve, reject) => {
+    // Accept either a bare command name (resolved here) or a path the caller
+    // already resolved. execCli resolves first so it can raise a better error,
+    // and re-running the bare-name guard on that absolute path would reject it.
+    const resolved = path.isAbsolute(cmd) ? cmd : resolveCommand(cmd);
+    if (!resolved) {
+      reject(new Error(`Command "${cmd}" was not found on PATH.`));
+      return;
+    }
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let idleTimer = null;
+    let hardTimer = null;
+
+    const child = spawnImpl(resolved, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+      windowsHide: true,
+      // Own process group so terminateProcessTree can signal the whole tree.
+      detached: process.platform !== "win32"
+    });
+
+    const clearTimers = () => {
+      if (idleTimer !== null) { clearTimeoutImpl(idleTimer); idleTimer = null; }
+      if (hardTimer !== null) { clearTimeoutImpl(hardTimer); hardTimer = null; }
+    };
+
+    // One-shot and terminal: once we settle, no further callback may fire.
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      fn(value);
+    };
+
+    const kill = () => {
+      try { terminateImpl(child.pid); } catch { /* already gone */ }
+    };
+
+    const failWith = (ErrCls, message, extra) => {
+      kill();
+      settle(reject, new ErrCls(message, { stdout, stderr, ...extra }));
+    };
+
+    const armIdle = () => {
+      if (settled) return;
+      if (idleTimer !== null) clearTimeoutImpl(idleTimer);
+      idleTimer = setTimeoutImpl(() => {
+        idleTimer = null;
+        failWith(
+          ExecIdleError,
+          `No output from "${cmd}" for ${Math.round(idleMs / 1000)}s; treating it as hung. ` +
+          `Retry with --timeout <larger>, or --stream to watch it work.`,
+          { idleMs }
+        );
+      }, idleMs);
+      idleTimer?.unref?.();
+    };
+
+    hardTimer = setTimeoutImpl(() => {
+      hardTimer = null;
+      failWith(
+        ExecTimeoutError,
+        `"${cmd}" exceeded ${Math.round(maxMs / 1000)}s; retry with --timeout <larger>.`,
+        { timeoutMs: maxMs }
+      );
+    }, maxMs);
+    hardTimer?.unref?.();
+
+    const onChunk = (which) => (buf) => {
+      if (settled) return;
+      const text = buf.toString();
+      if (which === "stdout") {
+        stdout += text;
+        if (streamStdout) stdoutSink(text);
+      } else {
+        stderr += text;
+      }
+      if (stdout.length + stderr.length > maxBuffer) {
+        failWith(
+          ExecBufferError,
+          `"${cmd}" produced more than ${maxBuffer} bytes of output; aborting.`,
+          { maxBuffer }
+        );
+        return;
+      }
+      // Any byte on either stream is evidence of life.
+      armIdle();
+    };
+
+    child.stdout?.on("data", onChunk("stdout"));
+    child.stderr?.on("data", onChunk("stderr"));
+
+    child.on("error", (err) => {
+      settle(reject, Object.assign(err, { stdout, stderr }));
+    });
+
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      if (code === 0) {
+        settle(resolve, stdout.trim());
+        return;
+      }
+      const err = new Error(
+        `"${cmd}" exited with ${signal ? `signal ${signal}` : `code ${code}`}.` +
+        (stderr.trim() ? `\n${stderr.trim()}` : "")
+      );
+      Object.assign(err, { stdout, stderr, code, signal });
+      settle(reject, err);
+    });
+
+    if (input !== null && child.stdin) {
+      child.stdin.on("error", () => { /* child may exit before we finish writing */ });
+      child.stdin.end(input, "utf8");
+    }
+
+    armIdle();
+  });
+}

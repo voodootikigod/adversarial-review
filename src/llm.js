@@ -1,5 +1,6 @@
 import { execFileSync } from "child_process";
 import { resolveCommand } from "./spawn-safe.js";
+import { spawnWithWatchdog } from "./exec-watchdog.js";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -174,7 +175,7 @@ export function isCmdInstalled(cmd) {
   return resolveCommand(cmd) !== null;
 }
 
-function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000) {
+async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false } = {}) {
   // SECURITY: shell:false on every platform. This previously passed
   // `shell: process.platform === "win32"`, which handed every argument to
   // cmd.exe for re-parsing on Windows and lost argv metacharacter safety.
@@ -189,15 +190,11 @@ function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000) {
       `Local CLI agent "${cliCmd}" was not found on PATH. Install it, or pass --provider <other>.`
     );
   }
-  return execFileSync(resolved, args, {
+  return spawnWithWatchdog(resolved, args, {
     input,
-    encoding: "utf8",
-    stdio: ["pipe", "pipe", "pipe"],
-    maxBuffer: 10 * 1024 * 1024,
-    timeout: timeoutMs,
-    shell: false,
-    windowsHide: true
-  }).trim();
+    timeoutMs,
+    streamStdout: stream
+  });
 }
 
 // Claude-Code-compatible CLIs (claude, agy): always use print mode (-p) with the
@@ -290,7 +287,7 @@ export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = fals
 // so Codex enforces the output shape natively rather than relying on scraping.
 // The prompt is piped via stdin (`-`) to avoid argv size limits on large diffs;
 // the argv path is used as a fallback if stdin is rejected.
-function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
+async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { stream = false } = {}) {
   // Create a private temp directory so path prediction / symlink race attacks
   // against shared /tmp are not possible; the directory is owned by this process.
   const privateDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-review-codex-"));
@@ -320,7 +317,7 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
       // "If not provided as an argument (or if `-` is used), instructions are read from
       // stdin"). We rely on execFileSync's `input` option to wire the full prompt payload
       // to that stdin pipe, so the review content is never truncated by argv size limits.
-      execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs);
+      await execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs, { stream });
     } catch (stdinErr) {
       if (stdinErr.code === "ETIMEDOUT") {
         throw new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
@@ -336,7 +333,7 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
       // Argv fallback: pass prompt as positional argument
       log.substep("Codex stdin path failed, retrying as argument...");
       try {
-        execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs);
+        await execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs, { stream });
       } catch (argvErr) {
         if (argvErr.code === "ETIMEDOUT") {
           throw new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
@@ -360,7 +357,7 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
 }
 
 // Invoke a local CLI agent (claude, agy, ...) by piping the prompt to stdin.
-function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs = 10 * 60 * 1000, allowUnsandboxedCli = false, model = null } = {}) {
+async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs = 10 * 60 * 1000, allowUnsandboxedCli = false, model = null, stream = false } = {}) {
   let fullPrompt = "";
   if (systemInstruction) {
     fullPrompt += `System Instructions:\n${systemInstruction}\n\n`;
@@ -370,7 +367,7 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
   log.step(`Invoking local subscription agent via command: "${cliCmd}"...`);
 
   if (cliCmd === "codex") {
-    return callCodexCli(fullPrompt, schema, timeoutMs);
+    return callCodexCli(fullPrompt, schema, timeoutMs, { stream });
   }
 
   // claude: -p + stdin `-` + --permission-mode plan.
@@ -381,7 +378,7 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
   const fallbackOpts = { allowUnsandboxedCli, model };
 
   try {
-    return execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs);
+    return await execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs, { stream });
   } catch (err) {
     if (err.code === "ETIMEDOUT") {
       throw new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
@@ -403,7 +400,7 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
     }
     try {
       log.substep(`Stdin piping not supported by ${cliCmd}, retrying as argument...`);
-      return execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs);
+      return await execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs, { stream });
     } catch (err2) {
       if (err2.code === "ETIMEDOUT") {
         throw new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
@@ -645,7 +642,7 @@ export function configureLLM(args) {
 
   const allowUnsandboxedCli = !!args.allowUnsandboxedCli;
 
-  return { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli };
+  return { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli, stream: !!args.stream };
 }
 
 // ─── Multi-provider selection (--providers) ─────────────────────────────────
@@ -889,13 +886,14 @@ function isRetryable(err) {
 // responseSchema) so well-formed JSON is enforced at the API layer, not by
 // post-hoc text scraping.
 export async function llmCall(config, prompt, systemInstruction = "", schema = null) {
-  const { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli } = config;
+  const { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli, stream } = config;
 
   if (provider === "cli") {
     return callCliLLM(cliCmd, prompt, systemInstruction, schema, {
       timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
       allowUnsandboxedCli: !!allowUnsandboxedCli,
-      model
+      model,
+      stream: !!stream
     });
   }
 

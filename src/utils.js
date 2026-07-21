@@ -37,6 +37,8 @@ ${colors.bold("Options:")}
                         text within --max-bytes (a per-file cap in this mode);
                         missing/binary/oversize inputs error (never a silent skip).
   --prompt-only         Print the assembled prompt to stdout and exit (no LLM call).
+  --stream              Stream local-CLI output live as it arrives (does not change
+                        the result; useful when a long review looks stalled).
   --json                Print JSON result (verdict matches the derived exit gate).
   --max-files <n>       Inline-diff cutoff by changed-file count (default 50).
   --max-bytes <n>       Inline-diff cutoff by diff size in bytes (default 262144).
@@ -134,6 +136,7 @@ export function parseArgs(argv) {
     scope: "auto",
     input: null,
     promptOnly: false,
+    stream: false,
     json: false,
     maxFiles: 50,
     maxBytes: 256 * 1024,
@@ -254,6 +257,8 @@ export function parseArgs(argv) {
       args.help = true;
     } else if (arg === "--prompt-only") {
       args.promptOnly = true;
+    } else if (arg === "--stream") {
+      args.stream = true;
     } else if (arg === "--json") {
       args.json = true;
     } else if (arg === "--allow-summary-review") {
