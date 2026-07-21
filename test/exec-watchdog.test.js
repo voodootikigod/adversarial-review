@@ -5,7 +5,8 @@ import {
   spawnWithWatchdog,
   resolveWindows,
   DEFAULT_IDLE_TIMEOUT_MS,
-  DEFAULT_MAX_MS
+  DEFAULT_MAX_MS,
+  DEFAULT_MAX_BUFFER
 } from "../src/exec-watchdog.js";
 
 // ─── window resolution ──────────────────────────────────────────────────────
@@ -292,4 +293,22 @@ test("T13: an unresolvable command rejects instead of hanging", async () => {
   const err = await spawnWithWatchdog("definitely-not-a-real-binary-xyz", [], { timeoutMs: 5000 })
     .catch((e) => e);
   assert.match(err.message, /not found on PATH/);
+});
+
+test("T13: the safety envelope defaults are pinned to their specified values", () => {
+  // These three constants ARE the safety envelope. Asserting them against
+  // themselves (as the window tests do) is mutation-invariant, so pin the
+  // literals: a silent change to any of them changes how long a hung review
+  // blocks, or how much memory a runaway CLI can consume, with nothing failing.
+  assert.equal(DEFAULT_IDLE_TIMEOUT_MS, 180_000, "idle guard: 3 minutes");
+  assert.equal(DEFAULT_MAX_MS, 900_000, "hard ceiling fallback: 15 minutes");
+  assert.equal(DEFAULT_MAX_BUFFER, 10 * 1024 * 1024, "output cap: 10 MB");
+});
+
+test("T13: any positive timeout is honored as the ceiling, including 1ms", () => {
+  // Pins the `> 0` boundary. With `> 1`, a 1ms ceiling would silently fall back
+  // to the 15-minute default — the opposite of what the caller asked for.
+  assert.equal(resolveWindows({ timeoutMs: 1 }).maxMs, 1);
+  assert.equal(resolveWindows({ timeoutMs: 0 }).maxMs, DEFAULT_MAX_MS, "0 is not a timeout");
+  assert.equal(resolveWindows({ timeoutMs: -5 }).maxMs, DEFAULT_MAX_MS, "negative is not a timeout");
 });
