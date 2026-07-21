@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { buildFixPrompt, buildFixerCmd, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
+import { sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
 
 test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemini key", () => {
   assert.equal(FIXER_PROVIDER_MAP.agy, "gemini");
@@ -133,4 +133,28 @@ test("T15 AC6: traversal and absolute paths never reach the editable file list",
   assert.ok(section.includes("ok/file.js"), "legitimate path must survive");
   assert.ok(!section.includes("/etc/passwd"), "absolute path reached the fixer");
   assert.ok(!section.includes(".."), "traversal path reached the fixer");
+});
+
+test("T15: sanitizeEditablePaths tolerates non-string and empty entries", () => {
+  // finding.file is model-derived, so the list can contain nulls, numbers, or
+  // blanks. The guard must reject each WITHOUT throwing — a fixer invocation
+  // that crashes on a malformed finding is a denial of the whole loop.
+  const out = sanitizeEditablePaths([null, undefined, 123, "", "   ", "ok.js"]);
+  assert.deepEqual(out, ["ok.js"]);
+});
+
+test("T15: the visible finding heading matches its fence label", () => {
+  // A heading that says "Finding 2" above a <<<UNTRUSTED:FINDING_1>>> block
+  // misdirects the fixer about which defect it is acting on.
+  const prompt = buildFixPrompt([fixFinding(), fixFinding({ title: "Second" })], ["src/job.js"]);
+  for (const n of [1, 2]) {
+    const heading = prompt.indexOf(`## Finding ${n}`);
+    const label = prompt.indexOf(`<<<UNTRUSTED:FINDING_${n}:`);
+    assert.ok(heading !== -1, `heading ${n} missing`);
+    assert.ok(label !== -1, `fence label ${n} missing`);
+    assert.ok(label > heading, `fence FINDING_${n} must follow heading ${n}`);
+    // Nothing may sit between the heading and its own fence except whitespace.
+    const between = prompt.slice(heading + `## Finding ${n}`.length, label).trim();
+    assert.equal(between, "", `heading ${n} is not adjacent to fence FINDING_${n}`);
+  }
 });
