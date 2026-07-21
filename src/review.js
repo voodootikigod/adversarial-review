@@ -30,8 +30,11 @@ const UNTRUSTED_CLOSE_TOKEN = "<<<END:";
 
 // What a neutralized sentinel becomes. Visible on purpose: a reviewer reading
 // the prompt should be able to tell that something was defanged rather than
-// silently altered.
-const REDACTED_FENCE_TOKEN = "[redacted-fence-token]";
+// silently altered. The two tokens map to DISTINCT placeholders so the mapping
+// stays injective — a reviewer (human or model) can tell which sentinel was
+// neutralized and reconstruct the original line.
+const REDACTED_OPEN_TOKEN = "[redacted-fence-open]";
+const REDACTED_CLOSE_TOKEN = "[redacted-fence-close]";
 
 // Neutralize every fence sentinel in a value so it cannot forge an opening or a
 // closing marker. Matching is label- AND nonce-agnostic on purpose: any
@@ -46,8 +49,8 @@ const REDACTED_FENCE_TOKEN = "[redacted-fence-token]";
 // neutralizing the prefix alone is sufficient, and it is content-preserving.
 function stripFenceSentinels(value) {
   return value
-    .split(UNTRUSTED_OPEN_TOKEN).join(REDACTED_FENCE_TOKEN)
-    .split(UNTRUSTED_CLOSE_TOKEN).join(REDACTED_FENCE_TOKEN);
+    .split(UNTRUSTED_OPEN_TOKEN).join(REDACTED_OPEN_TOKEN)
+    .split(UNTRUSTED_CLOSE_TOKEN).join(REDACTED_CLOSE_TOKEN);
 }
 
 // Wrap untrusted content in clearly-labeled, data-only fences. Content that
@@ -154,7 +157,13 @@ export function assessFindings(result, context, { apiMode = true } = {}) {
       effectiveConfidence /= 2;
     }
     if (haystack && f.evidence && f.evidence.trim()) {
-      if (!haystack.includes(collapseWhitespace(f.evidence))) {
+      // Normalize BOTH sides through the same neutralization. Reviewers reach
+      // the source by two different routes: API providers read the fenced
+      // prompt (already neutralized), while local CLI agents read the files on
+      // disk (raw). Neutralizing only one side grounds one route and penalizes
+      // the other. Running both through stripFenceSentinels makes the check
+      // agnostic to which text the reviewer actually quoted.
+      if (!haystack.includes(collapseWhitespace(stripFenceSentinels(f.evidence)))) {
         notes.push("quoted evidence was not found in the provided context");
         effectiveConfidence /= 2;
       }
