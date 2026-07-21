@@ -6,8 +6,8 @@
 // by @adlc/model-ratchet: { ts, tool, file, line, category, severity, desc }.
 
 import fs from "node:fs";
-import path from "node:path";
 import { isGatingFinding } from "./review.js";
+import { openContainedAppendFd } from "./safe-fs.js";
 
 // Pure: map a validated review result to ledger entry objects for its gating
 // findings. `assessments` are the grounding assessments (index-aligned with
@@ -30,24 +30,63 @@ export function toLedgerEntries(result, assessments, { failOn = "medium", minCon
     }));
 }
 
-// Append entries to the ledger as JSONL. Creates parent dirs; appends (never
-// truncates); writes all lines in a single call so a line is never half-written
-// under concurrent runs. No-op when there are no entries.
+// Append entries to the ledger as JSONL, one write so a line is never
+// half-formed under concurrent runs. No-op when there are no entries.
 //
-// Scope note: this is the MINIMAL T14 behaviour — new ledgers are created
-// owner-only (0600), a strict improvement over inheriting umask. It does NOT
-// harden a pre-existing ledger's mode, and it does NOT defend the
-// attacker-controlled default path (`.adlc/findings.jsonl` inside the reviewed
-// repository) against planted symlinks. That symlink safety kept regenerating
-// review findings when patched piecemeal here, so it is being solved completely
-// and reviewed in isolation as T20 (canonicalize-contain-open). Following a
-// symlink on append is no worse than main today; the fix belongs in T20.
+// The default ledger path is `.adlc/findings.jsonl` INSIDE the reviewed
+// repository, so it is attacker-controlled: a hostile repo can plant a symlink
+// anywhere in the chain to redirect this write (and the mode change) onto a
+// victim file. openContainedAppendFd handles that completely — canonicalize the
+// path, refuse an escape or any symlinked component, and hand back an fd we
+// operate through so nothing can be swapped after the check. See src/safe-fs.js.
+//
+// Gating findings quote source, so the ledger can hold repository excerpts, and
+// new files are created 0600. Order matters: an existing looser ledger is
+// tightened BEFORE the sensitive entry is written, so the new data never lands
+// while the file is world-readable. A chmod failure PROPAGATES rather than being
+// swallowed — the caller (recordFindings) warns and skips the ledger, so we
+// never write findings to a file we could not secure.
+// Append `buffer` as an all-or-nothing record. fs.writeSync can write fewer
+// bytes than requested (signals, quotas) — so we loop — and can THROW after a
+// partial write (ENOSPC, EDQUOT), which would leave a truncated JSON object as
+// the file's tail and break every future parse of the ledger. On any failure we
+// ftruncate back to the pre-append EOF, so the ledger is either fully extended
+// by this record or left exactly as it was.
+//
+// (Interleaving between two concurrent review processes appending to the same
+// ledger is best effort: robust cross-process append atomicity needs advisory
+// locking Node does not expose portably, and the ledger is an append-only
+// advisory artifact, not a transactional store. The crash/short-write case —
+// which corrupts a SINGLE process's own output — is what the rollback closes.)
+// `writeSync` is an injectable seam so the rollback path can be tested without a
+// real ENOSPC; production callers omit it.
+export function appendRecordSync(fd, buffer, { writeSync = fs.writeSync } = {}) {
+  const startSize = fs.fstatSync(fd).size; // append point (O_APPEND ⇒ EOF)
+  try {
+    let offset = 0;
+    while (offset < buffer.length) {
+      offset += writeSync(fd, buffer, offset);
+    }
+  } catch (err) {
+    try { fs.ftruncateSync(fd, startSize); } catch { /* best effort rollback */ }
+    throw err;
+  }
+}
+
 export function appendLedger(ledgerPath, entries) {
   if (!entries || entries.length === 0) return;
-  const dir = path.dirname(ledgerPath);
-  if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true });
-  const buffer = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
-  // `mode` applies only when appendFileSync CREATES the file; an existing ledger
-  // keeps whatever mode it already has, so this never loosens one.
-  fs.appendFileSync(ledgerPath, buffer, { mode: 0o600 });
+  const buffer = Buffer.from(entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
+
+  const fd = openContainedAppendFd(ledgerPath, { mode: 0o600, mkdirMode: 0o700 });
+  try {
+    // Secure FIRST, then write. The mode arg only applies on creation, so an
+    // existing ledger written before this landed keeps its umask default
+    // (commonly 0644). fchmod acts on the fd, so it cannot be redirected.
+    if (process.platform !== "win32" && (fs.fstatSync(fd).mode & 0o777) !== 0o600) {
+      fs.fchmodSync(fd, 0o600);
+    }
+    appendRecordSync(fd, buffer);
+  } finally {
+    try { fs.closeSync(fd); } catch { /* ignore */ }
+  }
 }

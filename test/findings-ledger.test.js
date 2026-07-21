@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { toLedgerEntries, appendLedger } from "../src/findings-ledger.js";
+import { toLedgerEntries, appendLedger, appendRecordSync } from "../src/findings-ledger.js";
 import { deriveVerdict } from "../src/review.js";
 
 function finding(overrides = {}) {
@@ -103,29 +103,118 @@ test("appendLedger creates a missing nested parent directory (mkdir -p)", () => 
   }
 });
 
-test("T14: a new ledger file is created owner-only (0600)", { skip: process.platform === "win32" }, () => {
-  // The minimal, kept T14 behaviour: new ledgers are 0600 rather than umask
-  // default, since gating findings can quote repository source. Existing-mode
-  // tightening and symlink safety for the attacker-controlled default path are
-  // T20 (canonicalize-contain-open), reviewed in isolation.
+// ─── T20: ledger-level integration on the symlink-safe primitive ────────────
+
+test("T14/T20: a new ledger file is created owner-only (0600)", { skip: process.platform === "win32" }, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-mode-"));
   try {
     const ledger = path.join(root, "nested", "findings.jsonl");
     appendLedger(ledger, [{ id: "a" }]);
-    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "new file must be owner-only");
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "new file owner-only");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("T14: appending again does not loosen the mode", { skip: process.platform === "win32" }, () => {
+test("T14/T20: appending again preserves entries and keeps 0600", { skip: process.platform === "win32" }, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-mode2-"));
   try {
     const ledger = path.join(root, "findings.jsonl");
     appendLedger(ledger, [{ id: "a" }]);
     appendLedger(ledger, [{ id: "b" }]);
     assert.equal(fs.statSync(ledger).mode & 0o777, 0o600);
-    assert.equal(fs.readFileSync(ledger, "utf8").trim().split("\n").length, 2, "both entries present");
+    assert.equal(fs.readFileSync(ledger, "utf8").trim().split("\n").length, 2);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("T20: an existing permissive ledger is tightened on the next append", { skip: process.platform === "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-legacy-"));
+  try {
+    const ledger = path.join(root, "findings.jsonl");
+    fs.writeFileSync(ledger, "");
+    fs.chmodSync(ledger, 0o644);
+    appendLedger(ledger, [{ id: "a" }]);
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "tightened via fd, not left as found");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("T20: a symlinked ledger inside the repo is refused; victim untouched", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-symlink-")));
+  const cwd = process.cwd();
+  try {
+    process.chdir(root); // default ledger resolves relative to cwd (the repo)
+    const victim = path.join(root, "victim.txt");
+    fs.writeFileSync(victim, "important\n");
+    fs.chmodSync(victim, 0o644);
+    fs.mkdirSync(path.join(root, ".adlc"));
+    fs.symlinkSync(victim, path.join(root, ".adlc", "findings.jsonl"));
+
+    assert.throws(() => appendLedger(".adlc/findings.jsonl", [{ id: "x" }]), /symbolic link/i);
+    assert.equal(fs.readFileSync(victim, "utf8"), "important\n", "victim not written");
+    assert.equal(fs.statSync(victim).mode & 0o777, 0o644, "victim mode unchanged");
+  } finally {
+    process.chdir(cwd);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("T20: an existing permissive ledger is secured BEFORE the sensitive entry is written", { skip: process.platform === "win32" }, () => {
+  // Order matters: chmod-then-write, so the new finding never lands while the
+  // file is still world-readable.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-order-"));
+  try {
+    const ledger = path.join(root, "findings.jsonl");
+    fs.writeFileSync(ledger, "old\n");
+    fs.chmodSync(ledger, 0o644);
+    appendLedger(ledger, [{ excerpt: "quoted-repo-source" }]);
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "tightened");
+    assert.match(fs.readFileSync(ledger, "utf8"), /quoted-repo-source/, "entry written");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("T20: a large ledger entry is written whole (no partial-write truncation)", { skip: process.platform === "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-big-"));
+  try {
+    const ledger = path.join(root, "findings.jsonl");
+    const big = { desc: "x".repeat(2 * 1024 * 1024) }; // 2 MB, past a single write chunk
+    appendLedger(ledger, [big]);
+    const line = fs.readFileSync(ledger, "utf8").trim();
+    assert.deepEqual(JSON.parse(line), big, "the full record round-trips");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("T20: a short write followed by an I/O error rolls back — no corrupt JSONL tail", { skip: process.platform === "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-rollback-"));
+  try {
+    const ledger = path.join(root, "findings.jsonl");
+    fs.writeFileSync(ledger, "{\"good\":1}\n");            // an existing, valid record
+    const before = fs.readFileSync(ledger, "utf8");
+    const fd = fs.openSync(ledger, fs.constants.O_WRONLY | fs.constants.O_APPEND);
+    // writeSync writes 3 bytes, then throws ENOSPC — the crash-after-partial case.
+    let calls = 0;
+    const flakyWrite = () => {
+      if (calls++ === 0) return 3;
+      const e = new Error("ENOSPC"); e.code = "ENOSPC"; throw e;
+    };
+    try {
+      assert.throws(
+        () => appendRecordSync(fd, Buffer.from("{\"partial\":true}\n"), { writeSync: flakyWrite }),
+        /ENOSPC/
+      );
+    } finally {
+      fs.closeSync(fd);
+    }
+    const after = fs.readFileSync(ledger, "utf8");
+    assert.equal(after, before, "the partial record must be rolled back, leaving the ledger parseable");
+    for (const line of after.trim().split("\n")) JSON.parse(line); // still valid JSONL
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
