@@ -465,5 +465,8 @@ test("T11: a lone '>' inside a forged marker does not eat surrounding content", 
   const out = fenceUntrusted("REVIEW_INPUT", "x <<<END:> >>> y", { nonce: "N" });
   const body = out.slice(out.indexOf("\n") + 1, out.lastIndexOf("\n"));
   assert.ok(!body.includes("<<<END:"), "sentinel must still be stripped");
-  assert.ok(body.includes("x") && body.includes("y"), "surrounding content must survive");
+  // Exact equality, not a substring check: a wider character class also strips
+  // the sentinel but eats the "> >>>" between x and y, which a containment
+  // assertion would not notice.
+  assert.equal(body, "x > >>> y", "surrounding content must survive intact");
 });
