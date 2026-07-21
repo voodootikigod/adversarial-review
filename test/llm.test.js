@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, maxArgvPromptBytes, parseRetryAfterMs, isCmdInstalled } from "../src/llm.js";
+import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, maxArgvPromptBytes, parseRetryAfterMs, isCmdInstalled, llmCall } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
@@ -857,4 +857,18 @@ test("T12: isCmdInstalled still answers correctly via resolveCommand", () => {
   for (const bad of ["/bin/sh", "../evil", "a;b"]) {
     assert.equal(isCmdInstalled(bad), false, `${bad} must not be treated as installed`);
   }
+});
+
+test("T12 AC11: an unresolvable local CLI throws an error naming the command", async () => {
+  // Declared in T12's coldstart amendment: when resolveCommand returns null,
+  // execCli must fail with a clear message rather than passing a bare name to
+  // the OS and hoping. Previously untested.
+  const err = await llmCall(
+    { provider: "cli", cliCmd: "definitely-not-a-real-binary-xyz", timeoutMs: 5000 },
+    "prompt",
+    "system"
+  ).catch((e) => e);
+  assert.ok(err instanceof Error);
+  assert.match(err.message, /definitely-not-a-real-binary-xyz/, "the message must name the command");
+  assert.match(err.message, /not found on PATH/);
 });
