@@ -326,6 +326,9 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
       // to that stdin pipe, so the review content is never truncated by argv size limits.
       execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs);
     } catch (stdinErr) {
+      if (stdinErr.code === "ETIMEDOUT") {
+        throw new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+      }
       const promptBytes = Buffer.byteLength(fullPrompt);
       const argvLimit = maxArgvPromptBytes();
       if (promptBytes > argvLimit) {
@@ -339,6 +342,9 @@ function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000) {
       try {
         execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs);
       } catch (argvErr) {
+        if (argvErr.code === "ETIMEDOUT") {
+          throw new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+        }
         if (isE2BigError(argvErr)) {
           throw new Error(argvTooLargeMessage("Codex", promptBytes, argvLimit));
         }
@@ -381,6 +387,9 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
   try {
     return execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs);
   } catch (err) {
+    if (err.code === "ETIMEDOUT") {
+      throw new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+    }
     const stderr = err.stderr?.toString("utf8") || "";
     // Unknown-flag rejections must surface clearly — not as a prompt-size / argv error.
     // Retrying argv would pass the same bad flag and fail the same way.
@@ -400,6 +409,9 @@ function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutM
       log.substep(`Stdin piping not supported by ${cliCmd}, retrying as argument...`);
       return execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs);
     } catch (err2) {
+      if (err2.code === "ETIMEDOUT") {
+        throw new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+      }
       if (isE2BigError(err2)) {
         throw new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit));
       }
@@ -627,7 +639,7 @@ export function configureLLM(args) {
 
   const timeoutMs = Number.isSafeInteger(args.timeout) && args.timeout > 0
     ? args.timeout * 1000
-    : DEFAULT_TIMEOUT_MS;
+    : (provider === "cli" ? 2400 * 1000 : DEFAULT_TIMEOUT_MS);
 
   if (provider === "cli") {
     log.info(`Using local CLI agent: ${cliCmd} (active subscription/session)`);
