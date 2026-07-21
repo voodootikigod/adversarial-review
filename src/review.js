@@ -28,20 +28,26 @@ export function loadSchema() {
 const UNTRUSTED_OPEN_TOKEN = "<<<UNTRUSTED:";
 const UNTRUSTED_CLOSE_TOKEN = "<<<END:";
 
-// Remove every fence sentinel from a value so it cannot forge an opening or a
+// What a neutralized sentinel becomes. Visible on purpose: a reviewer reading
+// the prompt should be able to tell that something was defanged rather than
+// silently altered.
+const REDACTED_FENCE_TOKEN = "[redacted-fence-token]";
+
+// Neutralize every fence sentinel in a value so it cannot forge an opening or a
 // closing marker. Matching is label- AND nonce-agnostic on purpose: any
 // sentinel-shaped token is a breakout risk regardless of what it carries.
+//
+// This replaces the sentinel TOKEN in place and never deletes a span. Deleting
+// whole `<<<…>>>` markers with a regex looks tidier but is destructive: the
+// character class also matches newlines, so a forged marker opened on one line
+// and closed further down silently removed every line in between — dropping
+// real code out of the diff under review while the fence still looked intact.
+// Without its `<<<UNTRUSTED:` / `<<<END:` prefix a marker cannot be forged, so
+// neutralizing the prefix alone is sufficient, and it is content-preserving.
 function stripFenceSentinels(value) {
   return value
-    // A full marker: `<<<UNTRUSTED:` / `<<<END:` up to the closing `>>>`. The
-    // `[^>]*` keeps each match anchored to a single marker so an unrelated
-    // `>>>` run elsewhere in the diff is never swallowed.
-    .replace(/<<<UNTRUSTED:[^>]*>>>/g, "")
-    .replace(/<<<END:[^>]*>>>/g, "")
-    // Defense in depth: drop any bare sentinel prefix left without a closing
-    // `>>>`, so a truncated or half-formed marker cannot linger in the body.
-    .split(UNTRUSTED_OPEN_TOKEN).join("")
-    .split(UNTRUSTED_CLOSE_TOKEN).join("");
+    .split(UNTRUSTED_OPEN_TOKEN).join(REDACTED_FENCE_TOKEN)
+    .split(UNTRUSTED_CLOSE_TOKEN).join(REDACTED_FENCE_TOKEN);
 }
 
 // Wrap untrusted content in clearly-labeled, data-only fences. Content that
@@ -569,8 +575,10 @@ export function buildVerifyPrompt(finding, context) {
     "contradictory evidence that the described failure cannot occur as stated.",
     "</role>",
     "",
+    // The finding is model-derived from an untrusted diff, so its free-text
+    // fields carry attacker-influenced content into this prompt too.
     "<finding>",
-    JSON.stringify(finding, null, 2),
+    fenceUntrusted("FINDING", JSON.stringify(finding, null, 2)),
     "</finding>",
     "",
     "<grounding_rules>",
@@ -580,7 +588,7 @@ export function buildVerifyPrompt(finding, context) {
     "</grounding_rules>",
     "",
     "<repository_context>",
-    context.content,
+    fenceUntrusted("REVIEW_INPUT", context.content),
     "</repository_context>"
   ].join("\n");
 }
