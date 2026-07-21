@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resolveCommand, isPidAlive, terminateProcessTree, buildSpawnTarget } from "../src/spawn-safe.js";
+import { cliReviewArgs } from "../src/llm.js";
 
 // ─── resolveCommand ─────────────────────────────────────────────────────────
 // Resolving to an absolute path is what lets every spawn site use shell:false.
@@ -158,7 +159,8 @@ test("T12: Windows .cmd/.bat shims are run through the interpreter, not spawned 
   // npm-installed shims unless the interpreter is invoked explicitly.
   const t = buildSpawnTarget("C:\\npm\\claude.cmd", [], {
     platform: "win32",
-    env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }
+    env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    argsContainUntrusted: false
   });
   assert.equal(t.viaInterpreter, true);
   assert.equal(t.command, "C:\\Windows\\System32\\cmd.exe");
@@ -250,5 +252,35 @@ test("T12: a Windows batch shim REFUSES extra argv rather than building an unsaf
       env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }
     }),
     (e) => e.code === "EWINARGV" && /not argument-safe/.test(e.message)
+  );
+});
+
+test("T12: every supported CLI's PRIMARY invocation still works on a Windows shim", () => {
+  // Regression: refusing all arguments rejected our own constant flags too, so
+  // every npm-installed CLI on Windows failed before spawn — strictly worse
+  // than the unsafe-but-working behaviour it replaced. The prompt travels over
+  // stdin on this path; only the flags are argv, and those are ours.
+  for (const cli of ["claude", "agy", "agent"]) {
+    const flags = cliReviewArgs(cli, {});
+    assert.ok(flags.length > 0, `${cli} is expected to pass flags`);
+    const t = buildSpawnTarget(`C:\\npm\\${cli}.cmd`, flags, {
+      platform: "win32",
+      env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+      argsContainUntrusted: false
+    });
+    assert.equal(t.viaInterpreter, true);
+    assert.deepEqual(t.args.slice(0, 3), ["/d", "/s", "/c"]);
+    assert.ok(t.args.includes(`C:\\npm\\${cli}.cmd`));
+  }
+});
+
+test("T12: trusted flags are still rejected if they ever gain cmd metacharacters", () => {
+  // Defence in depth: a future edit to the flag builders must not be able to
+  // reintroduce the hole just by declaring its arguments trusted.
+  assert.throws(
+    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["--flag", "a&b"], {
+      platform: "win32", env: {}, argsContainUntrusted: false
+    }),
+    (e) => e.code === "EWINARGV" && /metacharacters/.test(e.message)
   );
 });

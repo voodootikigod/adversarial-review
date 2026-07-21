@@ -70,11 +70,15 @@ export function resolveCommand(cmd, { platform = process.platform, env = process
 // not cmd.exe's parsing.
 //
 // So callers MUST NOT pass attacker-influenceable data as argv on this path.
-// The primary invocation pipes the prompt over stdin, which is not parsed;
-// buildSpawnTarget refuses to build an interpreter invocation carrying extra
-// arguments, and the caller falls back to a clear error rather than a
-// silently-unsafe command line. Full Windows handling — including verifying any
-// of this on an actual Windows runner — is tracked in T19.
+// The distinction is authorship, not quantity: our own invocation flags are
+// constants authored in this repository, while the reviewed prompt is untrusted
+// and travels over stdin on the primary path. Callers declare which they are
+// passing via `argsContainUntrusted`, and only the untrusted case is refused.
+//
+// An earlier revision refused ALL arguments, which rejected our own flags too
+// and broke every npm-installed CLI on Windows — worse than the unsafe
+// behaviour it replaced. Full Windows handling, including verifying any of this
+// on an actual Windows runner, is tracked in T19.
 //
 // `/d` skips AutoRun registry commands, `/s` fixes quote handling, `/c` runs and
 // exits. ComSpec is the documented interpreter location; SHELL is never used.
@@ -88,17 +92,40 @@ export class WindowsArgvUnsafeError extends Error {
   }
 }
 
-export function buildSpawnTarget(resolvedPath, args = [], { platform = process.platform, env = process.env } = {}) {
+// What may cross a cmd.exe command line. Our own invocation flags are authored
+// here and contain none of it; the reviewed prompt is the untrusted value, and
+// on the primary path it travels over stdin, which cmd.exe never parses.
+const CMD_METACHARACTERS = /[&|<>^"%!()]/;
+
+export function buildSpawnTarget(
+  resolvedPath,
+  args = [],
+  { platform = process.platform, env = process.env, argsContainUntrusted = true } = {}
+) {
   if (platform === "win32" && BATCH_EXTENSIONS.has(path.extname(resolvedPath).toLowerCase())) {
-    if (args.length > 0) {
+    // Refuse only when a caller wants to put ATTACKER-INFLUENCEABLE data on the
+    // command line — that is the argv fallback, which embeds the whole prompt.
+    // Refusing every argument instead would reject our own constant flags and
+    // break every npm-installed CLI on Windows, which is worse than the unsafe
+    // behaviour it replaced.
+    if (argsContainUntrusted && args.length > 0) {
       throw new WindowsArgvUnsafeError(
-        `Cannot safely pass arguments to the Windows batch shim "${resolvedPath}": ` +
+        `Cannot safely pass untrusted arguments to the Windows batch shim "${resolvedPath}": ` +
         `cmd.exe re-parses them and this path is not argument-safe. ` +
-        `Use the stdin invocation, or install a native executable. Tracked in T19.`
+        `The prompt must travel over stdin. Tracked in T19.`
+      );
+    }
+    // Belt and braces: even "trusted" flags must be metacharacter-free, so a
+    // future edit to the flag builders cannot quietly reintroduce the hole.
+    const offender = args.find((a) => CMD_METACHARACTERS.test(String(a)));
+    if (offender !== undefined) {
+      throw new WindowsArgvUnsafeError(
+        `Refusing to pass argument ${JSON.stringify(offender)} to the Windows batch shim ` +
+        `"${resolvedPath}": it contains cmd.exe metacharacters. Tracked in T19.`
       );
     }
     const comspec = env.ComSpec || env.COMSPEC || "cmd.exe";
-    return { command: comspec, args: ["/d", "/s", "/c", resolvedPath], viaInterpreter: true };
+    return { command: comspec, args: ["/d", "/s", "/c", resolvedPath, ...args], viaInterpreter: true };
   }
   return { command: resolvedPath, args, viaInterpreter: false };
 }
@@ -167,6 +194,8 @@ function looksLikeMissingProcess(text) {
 export function terminateProcessTree(pid, options = {}) {
   const platform = options.platform ?? process.platform;
   const killImpl = options.killImpl ?? process.kill.bind(process);
+  // SIGTERM by default; callers escalate to SIGKILL for a process that ignored it.
+  const signal = options.signal ?? "SIGTERM";
   const runCommandImpl = options.runCommandImpl ?? runCommand;
 
   if (!isPidAlive(pid, killImpl)) {
@@ -184,7 +213,7 @@ export function terminateProcessTree(pid, options = {}) {
     }
     if (result.error?.code === "ENOENT") {
       try {
-        killImpl(pid, "SIGTERM");
+        killImpl(pid, signal);
         return { attempted: true, delivered: true, method: "kill" };
       } catch (error) {
         if (error?.code === "ESRCH") return { attempted: true, delivered: false, method: "kill" };
@@ -196,7 +225,7 @@ export function terminateProcessTree(pid, options = {}) {
   }
 
   try {
-    killImpl(-pid, "SIGTERM");
+    killImpl(-pid, signal);
     return { attempted: true, delivered: true, method: "process-group" };
   } catch (error) {
     if (error?.code === "ESRCH") {
@@ -204,7 +233,7 @@ export function terminateProcessTree(pid, options = {}) {
     }
     // No process group (or not permitted to signal it) — fall back to the child.
     try {
-      killImpl(pid, "SIGTERM");
+      killImpl(pid, signal);
       return { attempted: true, delivered: true, method: "process" };
     } catch (innerError) {
       if (innerError?.code === "ESRCH") return { attempted: true, delivered: false, method: "process" };

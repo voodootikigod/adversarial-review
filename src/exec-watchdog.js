@@ -107,6 +107,9 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
     idleTimeoutMs,
     maxBuffer = DEFAULT_MAX_BUFFER,
     streamStdout = false,
+    // Explicit, never inferred: the caller knows whether argv carries the
+    // reviewed prompt (argv fallback) or only our own constant flags.
+    argsContainUntrusted = true,
     setTimeoutImpl = setTimeout,
     clearTimeoutImpl = clearTimeout,
     spawnImpl = spawn,
@@ -144,7 +147,7 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
     let hardTimer = null;
 
     // Route Windows .cmd/.bat shims through the interpreter explicitly.
-    const target = buildSpawnTarget(resolved, args);
+    const target = buildSpawnTarget(resolved, args, { argsContainUntrusted });
     const child = spawnImpl(target.command, target.args, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
@@ -166,8 +169,18 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
       fn(value);
     };
 
+    const KILL_GRACE_MS = 5000;
     const kill = () => {
-      try { terminateImpl(child.pid); } catch { /* already gone */ }
+      const pid = child.pid;
+      try { terminateImpl(pid); } catch { /* already gone */ }
+      // SIGTERM is a REQUEST. A process that traps or ignores it keeps running
+      // after we have rejected, and it is detached, so it outlives this process.
+      // Escalate once after a grace period; harmless if it already exited,
+      // because terminateProcessTree is gated on liveness.
+      const escalation = setTimeoutImpl(() => {
+        try { terminateImpl(pid, { signal: "SIGKILL" }); } catch { /* gone */ }
+      }, KILL_GRACE_MS);
+      escalation?.unref?.();
     };
 
     const failWith = (ErrCls, message, extra) => {

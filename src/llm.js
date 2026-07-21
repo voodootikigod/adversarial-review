@@ -175,7 +175,7 @@ export function isCmdInstalled(cmd) {
   return resolveCommand(cmd) !== null;
 }
 
-async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false } = {}) {
+async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true } = {}) {
   // SECURITY: shell:false on every platform. This previously passed
   // `shell: process.platform === "win32"`, which handed every argument to
   // cmd.exe for re-parsing on Windows and lost argv metacharacter safety.
@@ -193,7 +193,8 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
   return spawnWithWatchdog(resolved, args, {
     input,
     timeoutMs,
-    streamStdout: stream
+    streamStdout: stream,
+    argsContainUntrusted
   });
 }
 
@@ -317,7 +318,7 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
       // "If not provided as an argument (or if `-` is used), instructions are read from
       // stdin"). We rely on execFileSync's `input` option to wire the full prompt payload
       // to that stdin pipe, so the review content is never truncated by argv size limits.
-      await execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs, { stream });
+      await execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs, { stream, argsContainUntrusted: false });
     } catch (stdinErr) {
       if (stdinErr.code === "ETIMEDOUT") {
         throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: stdinErr.stdout, stderr: stdinErr.stderr, cause: stdinErr });
@@ -378,7 +379,7 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
   const fallbackOpts = { allowUnsandboxedCli, model };
 
   try {
-    return await execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs, { stream });
+    return await execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs, { stream, argsContainUntrusted: false });
   } catch (err) {
     if (err.code === "ETIMEDOUT") {
       throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: err.stdout, stderr: err.stderr, cause: err });

@@ -21,6 +21,7 @@ import {
   renderReport
 } from "../src/review.js";
 import { runLoop } from "../src/loop.js";
+import { resumeHintForError } from "../src/resume-hint.js";
 
 // Multi-provider review: fan the same prompt out to each selected provider
 // independently, merge with cross-provider corroboration, and derive a
@@ -315,6 +316,13 @@ async function main() {
     }
   } catch (err) {
     log.error(err.message);
+    // A failed local-CLI run often leaves a resumable session behind, and losing
+    // it means losing the work already done. The watchdog attaches the captured
+    // stderr to every rejection precisely so it can be read here, and the
+    // timeout wrappers preserve it when they re-wrap. Best effort — never
+    // changes the exit code.
+    const hint = resumeHintForError(err);
+    if (hint) log.info(`Resume here: ${hint.command}`);
     process.exit(1);
   }
 
