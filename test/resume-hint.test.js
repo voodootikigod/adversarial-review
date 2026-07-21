@@ -68,3 +68,17 @@ test("T14: a null error yields no hint", () => {
   assert.equal(resumeHintForError(null), null);
   assert.equal(resumeHintForError(undefined), null);
 });
+
+test("T14: the scan bound is pinned to its specified value", () => {
+  // AC6 asserts against MAX_SCAN_BYTES itself, which is mutation-invariant.
+  // The bound is what keeps a hostile multi-megabyte diff from becoming a
+  // pathological scan, so pin the literal.
+  assert.equal(MAX_SCAN_BYTES, 8 * 1024);
+});
+
+test("T14: the minimum id length boundary is 6 characters", () => {
+  // Pins {6,128}. At {7,…} a legitimate 6-character session id is silently
+  // dropped and the user loses a resumable session for no reason.
+  assert.equal(extractResumeHint("codex resume abc123").id, "abc123", "6 chars is a valid id");
+  assert.equal(extractResumeHint("codex resume abc12"), null, "5 chars is below the floor");
+});
