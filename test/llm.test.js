@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, maxArgvPromptBytes, parseRetryAfterMs } from "../src/llm.js";
+import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, maxArgvPromptBytes, parseRetryAfterMs, isCmdInstalled } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
@@ -815,5 +815,37 @@ exit 2
     process.env.PATH = oldPath;
     try { fs.unlinkSync(binPath); } catch {}
     try { fs.rmdirSync(tmpDir); } catch {}
+  }
+});
+
+// ─── T12: spawn safety ──────────────────────────────────────────────────────
+
+test("T12 AC1: no spawn site derives `shell` from the platform or the environment", () => {
+  // Regression guard for the Windows argument-injection defect: execCli used
+  // `shell: process.platform === "win32"`, handing every argument to cmd.exe.
+  const raw = fs.readFileSync(new URL("../src/llm.js", import.meta.url), "utf8");
+  // Scan CODE, not prose: the fix is documented in a comment that necessarily
+  // quotes the old `shell: process.platform === "win32"` construct, and a naive
+  // grep would flag that explanation as the defect it describes.
+  const code = raw
+    .split("\n")
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join("\n");
+
+  const shellLines = code.split("\n").filter((l) => /^\s*shell:/.test(l));
+  assert.ok(shellLines.length > 0, "expected at least one explicit shell option");
+  for (const line of shellLines) {
+    assert.match(line, /shell:\s*false/, `spawn must not enable a shell: ${line.trim()}`);
+  }
+  assert.ok(!/shell:\s*process\.(platform|env)/.test(code), "shell must never come from platform/env");
+  assert.ok(!/process\.env\.SHELL/.test(code), "SHELL is attacker-influenceable and must not select a shell");
+});
+
+test("T12: isCmdInstalled still answers correctly via resolveCommand", () => {
+  assert.equal(isCmdInstalled("node"), true);
+  assert.equal(isCmdInstalled("definitely-not-a-real-binary-xyz"), false);
+  // Paths and metacharacters are not bare commands and must not resolve.
+  for (const bad of ["/bin/sh", "../evil", "a;b"]) {
+    assert.equal(isCmdInstalled(bad), false, `${bad} must not be treated as installed`);
   }
 });

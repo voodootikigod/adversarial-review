@@ -1,4 +1,5 @@
 import { execFileSync } from "child_process";
+import { resolveCommand } from "./spawn-safe.js";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -166,41 +167,36 @@ export function cleanJsonResponse(text) {
   return cleaned;
 }
 
-// Check if a shell command is installed and executable.
+// Check if a shell command is installed and executable. Thin boolean wrapper
+// over resolveCommand, which does the PATH/PATHEXT walk and returns the path
+// the spawn sites actually need.
 export function isCmdInstalled(cmd) {
-  if (!/^[A-Za-z0-9._-]+$/.test(cmd)) {
-    return false;
-  }
-  const pathDirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
-  const extensions = process.platform === "win32"
-    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").map(ext => ext.toLowerCase())
-    : [""];
-
-  return pathDirs.some((dir) => {
-    for (const ext of extensions) {
-      const file = ext && cmd.toLowerCase().endsWith(ext) ? cmd : `${cmd}${ext}`;
-      const candidate = path.join(dir, file);
-      try {
-        fs.accessSync(candidate, fs.constants.X_OK);
-        if (fs.statSync(candidate).isFile()) {
-          return true;
-        }
-      } catch {
-        // Continue
-      }
-    }
-    return false;
-  });
+  return resolveCommand(cmd) !== null;
 }
 
 function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000) {
-  return execFileSync(cliCmd, args, {
+  // SECURITY: shell:false on every platform. This previously passed
+  // `shell: process.platform === "win32"`, which handed every argument to
+  // cmd.exe for re-parsing on Windows and lost argv metacharacter safety.
+  //
+  // That flag was not gratuitous — it was how npm-installed `.cmd` shims got
+  // resolved. So it cannot simply be removed: resolveCommand performs that
+  // lookup explicitly (PATH + PATHEXT) and we spawn the resolved absolute path,
+  // which removes the only reason the shell was needed.
+  const resolved = resolveCommand(cliCmd);
+  if (!resolved) {
+    throw new Error(
+      `Local CLI agent "${cliCmd}" was not found on PATH. Install it, or pass --provider <other>.`
+    );
+  }
+  return execFileSync(resolved, args, {
     input,
     encoding: "utf8",
     stdio: ["pipe", "pipe", "pipe"],
     maxBuffer: 10 * 1024 * 1024,
     timeout: timeoutMs,
-    shell: process.platform === "win32"
+    shell: false,
+    windowsHide: true
   }).trim();
 }
 
