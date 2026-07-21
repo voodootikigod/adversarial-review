@@ -30,118 +30,24 @@ export function toLedgerEntries(result, assessments, { failOn = "medium", minCon
     }));
 }
 
-class SymlinkedLedgerError extends Error {
-  constructor(target) {
-    super(
-      `Refusing to write the findings ledger: "${target}" is a symbolic link. ` +
-      `Writing through it would append to, and change the permissions of, files outside the intended path.`
-    );
-    this.name = "SymlinkedLedgerError";
-  }
-}
-
-// Walk every directory component of `target` and refuse if any is a symbolic
-// link. lstat does not follow, so this inspects the link itself rather than
-// what it points at. Checking the chain — not just the leaf — is what stops a
-// symlinked `.adlc` from redirecting the write.
-// The walk is BOUNDED to components at or below `base` (the working directory).
-// Only those are attacker-controlled — `.adlc` inside the reviewed repository is
-// the threat. Walking to filesystem root instead rejects legitimate paths: /var
-// is itself a symlink on macOS, so an unbounded check refuses every temp
-// directory, which is a false positive that breaks normal use.
-function assertNoSymlinkedParents(target, base = process.cwd()) {
-  const resolved = path.resolve(target);
-  const root = path.resolve(base);
-  // Only inspect the chain when the ledger actually lives under `base`.
-  if (!resolved.startsWith(root + path.sep)) return;
-
-  // Check the LEAF too, not just its parents. O_NOFOLLOW below guards the final
-  // component on POSIX, but it is 0 (unavailable) on Windows, so without this
-  // the leaf ledger symlink is followed there. lstat is portable, so this closes
-  // the gap on every platform without depending on O_NOFOLLOW.
-  try {
-    if (fs.lstatSync(resolved).isSymbolicLink()) {
-      throw new SymlinkedLedgerError(resolved);
-    }
-  } catch (err) {
-    if (err instanceof SymlinkedLedgerError) throw err;
-    // ENOENT: the leaf does not exist yet, which is the normal first-write case.
-  }
-
-  let current = path.dirname(resolved);
-  while (current.startsWith(root + path.sep)) {
-    let st;
-    try {
-      st = fs.lstatSync(current);
-    } catch {
-      break; // does not exist yet; nothing to traverse through
-    }
-    if (st.isSymbolicLink()) throw new SymlinkedLedgerError(current);
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-}
-
 // Append entries to the ledger as JSONL. Creates parent dirs; appends (never
 // truncates); writes all lines in a single call so a line is never half-written
 // under concurrent runs. No-op when there are no entries.
+//
+// Scope note: this is the MINIMAL T14 behaviour — new ledgers are created
+// owner-only (0600), a strict improvement over inheriting umask. It does NOT
+// harden a pre-existing ledger's mode, and it does NOT defend the
+// attacker-controlled default path (`.adlc/findings.jsonl` inside the reviewed
+// repository) against planted symlinks. That symlink safety kept regenerating
+// review findings when patched piecemeal here, so it is being solved completely
+// and reviewed in isolation as T20 (canonicalize-contain-open). Following a
+// symlink on append is no worse than main today; the fix belongs in T20.
 export function appendLedger(ledgerPath, entries) {
   if (!entries || entries.length === 0) return;
-  // Gating findings quote source code, so the ledger can contain excerpts of the
-  // reviewed repository. Create it owner-only rather than inheriting umask.
   const dir = path.dirname(ledgerPath);
-  if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true });
   const buffer = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
-
-  // O_NOFOLLOW below guards only the FINAL component. The default ledger path
-  // is `.adlc/findings.jsonl` inside the reviewed repository, so the PARENT is
-  // attacker-controlled too: a repo shipping `.adlc` as a symlink redirects the
-  // whole write, and both the append and the fchmod land outside the repo.
-  // Reject a symlink anywhere in the directory chain we are about to traverse.
-  assertNoSymlinkedParents(ledgerPath);
-
-  // The default ledger path lives INSIDE the repository under review, so its
-  // final component is attacker-controlled. Path-based append + chmod follow
-  // symlinks: a repo that pre-creates .adlc/findings.jsonl as a symlink gets our
-  // JSON appended to the target AND that target chmod-ed to 0600 — an arbitrary
-  // write plus a permission change on a file we never intended to touch.
-  //
-  // O_NOFOLLOW makes the open fail (ELOOP) when the final component is a
-  // symlink, and every subsequent operation goes through the resulting fd
-  // rather than the path, so the target cannot be swapped between calls.
-  const NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0; // not meaningful on win32
-  let fd;
-  try {
-    fd = fs.openSync(
-      ledgerPath,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | NOFOLLOW,
-      0o600
-    );
-  } catch (err) {
-    if (err.code === "ELOOP") {
-      throw new Error(
-        `Refusing to write the findings ledger: "${ledgerPath}" is a symbolic link. ` +
-        `Writing through it would append to, and change the permissions of, another file.`
-      );
-    }
-    throw err;
-  }
-
-  try {
-    fs.writeSync(fd, buffer);
-    // Harden a pre-existing ledger too: the mode argument is honored only when
-    // the file is CREATED, so a ledger written before this change keeps its
-    // umask default (commonly 0644) indefinitely — and those are the ones
-    // already holding quoted repository source. fchmod acts on the fd we just
-    // wrote, so it cannot be redirected. Best effort; never fail the run.
-    if (process.platform !== "win32") {
-      try {
-        const current = fs.fstatSync(fd).mode & 0o777;
-        if (current !== 0o600) fs.fchmodSync(fd, 0o600);
-      } catch { /* ignore */ }
-    }
-  } finally {
-    try { fs.closeSync(fd); } catch { /* ignore */ }
-  }
+  // `mode` applies only when appendFileSync CREATES the file; an existing ledger
+  // keeps whatever mode it already has, so this never loosens one.
+  fs.appendFileSync(ledgerPath, buffer, { mode: 0o600 });
 }

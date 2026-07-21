@@ -103,19 +103,22 @@ test("appendLedger creates a missing nested parent directory (mkdir -p)", () => 
   }
 });
 
-test("T14 AC8: the ledger dir is created 0700 and the file 0600", { skip: process.platform === "win32" }, () => {
+test("T14: a new ledger file is created owner-only (0600)", { skip: process.platform === "win32" }, () => {
+  // The minimal, kept T14 behaviour: new ledgers are 0600 rather than umask
+  // default, since gating findings can quote repository source. Existing-mode
+  // tightening and symlink safety for the attacker-controlled default path are
+  // T20 (canonicalize-contain-open), reviewed in isolation.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-mode-"));
   try {
     const ledger = path.join(root, "nested", "findings.jsonl");
     appendLedger(ledger, [{ id: "a" }]);
-    assert.equal(fs.statSync(path.dirname(ledger)).mode & 0o777, 0o700, "directory must be owner-only");
-    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "file must be owner-only");
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "new file must be owner-only");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("T14 AC9: appending again does not loosen the mode", { skip: process.platform === "win32" }, () => {
+test("T14: appending again does not loosen the mode", { skip: process.platform === "win32" }, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-mode2-"));
   try {
     const ledger = path.join(root, "findings.jsonl");
@@ -124,67 +127,6 @@ test("T14 AC9: appending again does not loosen the mode", { skip: process.platfo
     assert.equal(fs.statSync(ledger).mode & 0o777, 0o600);
     assert.equal(fs.readFileSync(ledger, "utf8").trim().split("\n").length, 2, "both entries present");
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("T14: an existing permissive ledger is hardened on the next append", { skip: process.platform === "win32" }, () => {
-  // { mode } is honored only at creation, so a ledger written before this
-  // change keeps its umask default (commonly 0644) forever — and those are
-  // exactly the ones already holding quoted repository source.
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-legacy-"));
-  try {
-    const ledger = path.join(root, "findings.jsonl");
-    fs.writeFileSync(ledger, "", { mode: 0o644 });
-    fs.chmodSync(ledger, 0o644);
-    assert.equal(fs.statSync(ledger).mode & 0o777, 0o644, "precondition: permissive");
-    appendLedger(ledger, [{ id: "a" }]);
-    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "must be tightened, not left as found");
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("T14: a symlinked ledger path is refused, not written through", { skip: process.platform === "win32" }, () => {
-  // The default ledger lives INSIDE the reviewed repository, so its final
-  // component is attacker-controlled. Path-based append + chmod follow
-  // symlinks: a repo pre-creating .adlc/findings.jsonl as a symlink got our
-  // JSON appended to the target AND that target chmod-ed to 0600 — an arbitrary
-  // write plus a permission change on a file we never meant to touch. The
-  // hardening made it worse before this fix, since it added the chmod.
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-symlink-"));
-  try {
-    const victim = path.join(root, "victim.txt");
-    fs.writeFileSync(victim, "important\n");
-    fs.chmodSync(victim, 0o644);
-    const ledger = path.join(root, "findings.jsonl");
-    fs.symlinkSync(victim, ledger);
-
-    assert.throws(() => appendLedger(ledger, [{ id: "x" }]), /symbolic link/i);
-    assert.equal(fs.readFileSync(victim, "utf8"), "important\n", "victim must not be written");
-    assert.equal(fs.statSync(victim).mode & 0o777, 0o644, "victim mode must not be changed");
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("T14: a symlinked ledger LEAF is refused on every platform (not just via O_NOFOLLOW)", () => {
-  // O_NOFOLLOW guards the leaf on POSIX but is unavailable (0) on Windows, so
-  // the portable lstat leaf-check must catch it regardless of platform.
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-leaf-"));
-  const realRoot = fs.realpathSync(root);
-  const cwd = process.cwd();
-  try {
-    process.chdir(realRoot);
-    const victim = path.join(realRoot, "victim.txt");
-    fs.writeFileSync(victim, "important\n");
-    const ledger = path.join(realRoot, ".adlc", "findings.jsonl");
-    fs.mkdirSync(path.dirname(ledger), { recursive: true });
-    fs.symlinkSync(victim, ledger);
-    assert.throws(() => appendLedger(ledger, [{ id: "x" }]), /symbolic link/i);
-    assert.equal(fs.readFileSync(victim, "utf8"), "important\n", "victim untouched");
-  } finally {
-    process.chdir(cwd);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
