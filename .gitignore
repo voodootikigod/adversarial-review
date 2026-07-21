@@ -8,3 +8,4 @@ blog/
 .adlc/*
 !.adlc/tickets.json
 .worktrees/
+.omo/
