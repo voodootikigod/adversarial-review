@@ -127,3 +127,20 @@ test("T14 AC9: appending again does not loosen the mode", { skip: process.platfo
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("T14: an existing permissive ledger is hardened on the next append", { skip: process.platform === "win32" }, () => {
+  // { mode } is honored only at creation, so a ledger written before this
+  // change keeps its umask default (commonly 0644) forever — and those are
+  // exactly the ones already holding quoted repository source.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-legacy-"));
+  try {
+    const ledger = path.join(root, "findings.jsonl");
+    fs.writeFileSync(ledger, "", { mode: 0o644 });
+    fs.chmodSync(ledger, 0o644);
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o644, "precondition: permissive");
+    appendLedger(ledger, [{ id: "a" }]);
+    assert.equal(fs.statSync(ledger).mode & 0o777, 0o600, "must be tightened, not left as found");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

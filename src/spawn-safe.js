@@ -58,21 +58,47 @@ export function resolveCommand(cmd, { platform = process.platform, env = process
 }
 
 // Windows batch shims (.cmd/.bat) are NOT executable images: CreateProcess
-// cannot run them, they require the command interpreter. Resolving the shim
-// path and spawning it with shell:false therefore fails outright — which is how
-// npm installs codex/claude/agy on Windows.
+// cannot run them, they require the command interpreter. npm installs
+// codex/claude/agy exactly that way, so the shim must be routed through
+// cmd.exe.
 //
-// The interpreter is invoked EXPLICITLY with an argv array, never via
-// `shell: true`. shell:true re-parses the whole command line as a string, which
-// is the metacharacter-injection hole this module exists to close. `/d` skips
-// AutoRun registry commands, `/s` fixes quote handling, `/c` runs and exits.
-// ComSpec is the documented interpreter location; SHELL is never consulted.
+// IMPORTANT — THIS IS NOT ARGUMENT-SAFE, AND DOES NOT CLAIM TO BE.
+// An earlier revision asserted that passing an explicit argv array (rather than
+// shell:true) restored metacharacter safety. That is false: Node serializes
+// these args into a command line and cmd.exe re-parses everything after /c
+// under its own quoting rules. Using shell:false avoids Node's string-building,
+// not cmd.exe's parsing.
+//
+// So callers MUST NOT pass attacker-influenceable data as argv on this path.
+// The primary invocation pipes the prompt over stdin, which is not parsed;
+// buildSpawnTarget refuses to build an interpreter invocation carrying extra
+// arguments, and the caller falls back to a clear error rather than a
+// silently-unsafe command line. Full Windows handling — including verifying any
+// of this on an actual Windows runner — is tracked in T19.
+//
+// `/d` skips AutoRun registry commands, `/s` fixes quote handling, `/c` runs and
+// exits. ComSpec is the documented interpreter location; SHELL is never used.
 const BATCH_EXTENSIONS = new Set([".cmd", ".bat"]);
+
+export class WindowsArgvUnsafeError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "WindowsArgvUnsafeError";
+    this.code = "EWINARGV";
+  }
+}
 
 export function buildSpawnTarget(resolvedPath, args = [], { platform = process.platform, env = process.env } = {}) {
   if (platform === "win32" && BATCH_EXTENSIONS.has(path.extname(resolvedPath).toLowerCase())) {
+    if (args.length > 0) {
+      throw new WindowsArgvUnsafeError(
+        `Cannot safely pass arguments to the Windows batch shim "${resolvedPath}": ` +
+        `cmd.exe re-parses them and this path is not argument-safe. ` +
+        `Use the stdin invocation, or install a native executable. Tracked in T19.`
+      );
+    }
     const comspec = env.ComSpec || env.COMSPEC || "cmd.exe";
-    return { command: comspec, args: ["/d", "/s", "/c", resolvedPath, ...args], viaInterpreter: true };
+    return { command: comspec, args: ["/d", "/s", "/c", resolvedPath], viaInterpreter: true };
   }
   return { command: resolvedPath, args, viaInterpreter: false };
 }

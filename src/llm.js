@@ -336,7 +336,7 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
         await execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs, { stream });
       } catch (argvErr) {
         if (argvErr.code === "ETIMEDOUT") {
-          throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: stdinErr.stdout, stderr: stdinErr.stderr, cause: stdinErr });
+          throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
         }
         if (isE2BigError(argvErr)) {
           throw new Error(argvTooLargeMessage("Codex", promptBytes, argvLimit));
@@ -403,7 +403,10 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
       return await execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs, { stream });
     } catch (err2) {
       if (err2.code === "ETIMEDOUT") {
-        throw new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`);
+        throw Object.assign(
+          new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`),
+          { stdout: err2.stdout, stderr: err2.stderr, cause: err2 }
+        );
       }
       if (isE2BigError(err2)) {
         throw new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit));

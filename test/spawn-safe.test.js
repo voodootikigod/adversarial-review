@@ -156,14 +156,13 @@ test("T12: Windows .cmd/.bat shims are run through the interpreter, not spawned 
   // .cmd/.bat are not executable images — CreateProcess cannot run them. The
   // resolve-the-path approach that lets us drop shell:true breaks outright for
   // npm-installed shims unless the interpreter is invoked explicitly.
-  const t = buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "-"], {
+  const t = buildSpawnTarget("C:\\npm\\claude.cmd", [], {
     platform: "win32",
     env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }
   });
   assert.equal(t.viaInterpreter, true);
   assert.equal(t.command, "C:\\Windows\\System32\\cmd.exe");
-  // Explicit argv — never shell:true, which re-parses the whole command line.
-  assert.deepEqual(t.args, ["/d", "/s", "/c", "C:\\npm\\claude.cmd", "-p", "-"]);
+  assert.deepEqual(t.args, ["/d", "/s", "/c", "C:\\npm\\claude.cmd"]);
 });
 
 test("T12: a real .exe and any POSIX binary are spawned directly", () => {
@@ -238,4 +237,18 @@ test("T12: isPidAlive accepts pid 1 — the boundary is 0, not 1", () => {
   // it as dead would silently skip terminating a legitimate target.
   assert.equal(isPidAlive(1, () => {}), true);
   assert.equal(isPidAlive(0, () => { throw new Error("must not signal"); }), false);
+});
+
+test("T12: a Windows batch shim REFUSES extra argv rather than building an unsafe command line", () => {
+  // shell:false avoids Node's string-building, NOT cmd.exe's parsing: cmd.exe
+  // re-parses everything after /c under its own quoting rules. Passing the
+  // attacker-influenceable prompt as argv here would recreate the injection
+  // this module exists to close, so the path refuses instead of pretending.
+  assert.throws(
+    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "untrusted & whoami"], {
+      platform: "win32",
+      env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }
+    }),
+    (e) => e.code === "EWINARGV" && /not argument-safe/.test(e.message)
+  );
 });

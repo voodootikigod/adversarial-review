@@ -43,4 +43,14 @@ export function appendLedger(ledgerPath, entries) {
   // `mode` applies only when appendFileSync creates the file; an existing
   // ledger keeps whatever mode it already has, so this never loosens one.
   fs.appendFileSync(ledgerPath, buffer, { mode: 0o600 });
+  // Harden a pre-existing ledger too: { mode } is honored only when the file is
+  // created, so a ledger written before this change keeps its umask default
+  // (commonly 0644) indefinitely — and those are the ones already holding
+  // quoted repository source. Best effort; never fail the run over it.
+  if (process.platform !== "win32") {
+    try {
+      const current = fs.statSync(ledgerPath).mode & 0o777;
+      if (current !== 0o600) fs.chmodSync(ledgerPath, 0o600);
+    } catch { /* ignore */ }
+  }
 }

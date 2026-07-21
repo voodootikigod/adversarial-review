@@ -3,6 +3,13 @@ import path from "path";
 import { log, colors } from "./utils.js";
 import { scanForSecrets } from "./secrets.js";
 import { extractResumeHint } from "./resume-hint.js";
+
+// Keep the END of a bounded stderr excerpt. CLI failures put the reason — and
+// any resume command — last, so truncating from the front throws away exactly
+// what both a human and extractResumeHint need.
+export function tailOf(text, limit) {
+  return text.length > limit ? text.slice(-limit) : text;
+}
 import { collectReviewContext } from "./git-context.js";
 import {
   buildPrompt,
@@ -473,7 +480,7 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
       if (done) return;
       done = true;
       try { process.kill(-child.pid, "SIGKILL"); } catch {}
-      const stderr = Buffer.concat(stderrChunks).toString("utf8").slice(0, 2048);
+      const stderr = tailOf(Buffer.concat(stderrChunks).toString("utf8"), 2048);
       resolve({ timedOut: true, stderr });
     }, timeoutMs);
 
@@ -481,7 +488,7 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      const stderr = Buffer.concat(stderrChunks).toString("utf8").slice(0, 2048);
+      const stderr = tailOf(Buffer.concat(stderrChunks).toString("utf8"), 2048);
       resolve(code === 0 ? { success: true, stderr } : { error: true, code, stderr });
     });
 
@@ -1235,9 +1242,9 @@ export async function runBranchLoop(cwd, args) {
   let lastResult = null;
 
   // Terminal exit: emit loop_end + the consolidated loop_summary, then exit.
-  const finish = (exitReason, exitCode, survivingCount) => {
+  const finish = (exitReason, exitCode, survivingCount, resumeHint = null) => {
     emitEvent(args.json, { type: "loop_end", exitReason, iterations: fixCount, originalHead });
-    emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason, survivingCount }));
+    emitEvent(args.json, buildLoopSummary({ providers: providerLabels, iterations: fixCount, exitReason, survivingCount, resumeHint }));
     process.exit(exitCode);
   };
 
@@ -1419,7 +1426,7 @@ export async function runBranchLoop(cwd, args) {
       if (resumeHint && !args.json) log.info(`Resume here: ${resumeHint.command}`);
       emitEvent(args.json, { type: "review_result", result: lastResult, iteration: fixCount + 1 });
       log.warn(`Earlier fix commit(s) (if any) left on '${branch}'. To undo all: ${recoveryLine}`);
-      finish(fixerResult.timedOut ? "fixer-timeout" : "fixer-error", 2, gatings.length);
+      finish(fixerResult.timedOut ? "fixer-timeout" : "fixer-error", 2, gatings.length, resumeHint);
     }
 
     // No-diff → the fixer changed nothing; nothing to commit.
