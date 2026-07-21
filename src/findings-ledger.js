@@ -30,6 +30,16 @@ export function toLedgerEntries(result, assessments, { failOn = "medium", minCon
     }));
 }
 
+class SymlinkedLedgerError extends Error {
+  constructor(target) {
+    super(
+      `Refusing to write the findings ledger: "${target}" is a symbolic link. ` +
+      `Writing through it would append to, and change the permissions of, files outside the intended path.`
+    );
+    this.name = "SymlinkedLedgerError";
+  }
+}
+
 // Walk every directory component of `target` and refuse if any is a symbolic
 // link. lstat does not follow, so this inspects the link itself rather than
 // what it points at. Checking the chain — not just the leaf — is what stops a
@@ -45,6 +55,19 @@ function assertNoSymlinkedParents(target, base = process.cwd()) {
   // Only inspect the chain when the ledger actually lives under `base`.
   if (!resolved.startsWith(root + path.sep)) return;
 
+  // Check the LEAF too, not just its parents. O_NOFOLLOW below guards the final
+  // component on POSIX, but it is 0 (unavailable) on Windows, so without this
+  // the leaf ledger symlink is followed there. lstat is portable, so this closes
+  // the gap on every platform without depending on O_NOFOLLOW.
+  try {
+    if (fs.lstatSync(resolved).isSymbolicLink()) {
+      throw new SymlinkedLedgerError(resolved);
+    }
+  } catch (err) {
+    if (err instanceof SymlinkedLedgerError) throw err;
+    // ENOENT: the leaf does not exist yet, which is the normal first-write case.
+  }
+
   let current = path.dirname(resolved);
   while (current.startsWith(root + path.sep)) {
     let st;
@@ -53,12 +76,7 @@ function assertNoSymlinkedParents(target, base = process.cwd()) {
     } catch {
       break; // does not exist yet; nothing to traverse through
     }
-    if (st.isSymbolicLink()) {
-      throw new Error(
-        `Refusing to write the findings ledger: "${current}" is a symbolic link. ` +
-        `Writing through it would append to, and change the permissions of, files outside the intended path.`
-      );
-    }
+    if (st.isSymbolicLink()) throw new SymlinkedLedgerError(current);
     const parent = path.dirname(current);
     if (parent === current) break;
     current = parent;

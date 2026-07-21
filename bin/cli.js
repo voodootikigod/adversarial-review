@@ -321,7 +321,10 @@ async function main() {
     // stderr to every rejection precisely so it can be read here, and the
     // timeout wrappers preserve it when they re-wrap. Best effort — never
     // changes the exit code.
-    const hint = resumeHintForError(err);
+    // Scope to the CLI that actually ran: the scanned streams are
+    // attacker-influenceable, and searching every provider pattern lets a diff
+    // forge a hint for a CLI that never executed.
+    const hint = resumeHintForError(err, { cli: config?.cliCmd ?? null });
     if (hint) log.info(`Resume here: ${hint.command}`);
     process.exit(1);
   }

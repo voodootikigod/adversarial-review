@@ -167,3 +167,24 @@ test("T14: a symlinked ledger path is refused, not written through", { skip: pro
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("T14: a symlinked ledger LEAF is refused on every platform (not just via O_NOFOLLOW)", () => {
+  // O_NOFOLLOW guards the leaf on POSIX but is unavailable (0) on Windows, so
+  // the portable lstat leaf-check must catch it regardless of platform.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-leaf-"));
+  const realRoot = fs.realpathSync(root);
+  const cwd = process.cwd();
+  try {
+    process.chdir(realRoot);
+    const victim = path.join(realRoot, "victim.txt");
+    fs.writeFileSync(victim, "important\n");
+    const ledger = path.join(realRoot, ".adlc", "findings.jsonl");
+    fs.mkdirSync(path.dirname(ledger), { recursive: true });
+    fs.symlinkSync(victim, ledger);
+    assert.throws(() => appendLedger(ledger, [{ id: "x" }]), /symbolic link/i);
+    assert.equal(fs.readFileSync(victim, "utf8"), "important\n", "victim untouched");
+  } finally {
+    process.chdir(cwd);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

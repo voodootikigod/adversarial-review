@@ -191,12 +191,10 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
   // fallback is resolvable from the reviewed repository. None of it has ever
   // executed on Windows, because CI is Ubuntu-only.
   //
-  // Rather than ship a fifth guess, Windows keeps exactly the behaviour it has
-  // in main: execFileSync with shell:true. That is KNOWN-UNSAFE (arguments are
-  // re-parsed by cmd.exe) and is the original defect — but it works, and
-  // shipping a broken-but-differently-unsafe path is worse than shipping the
-  // status quo with the fix scoped to the platform we can actually verify.
-  // T19 owns Windows, with windows-latest CI as its first acceptance criterion.
+  // Windows here keeps the exact behaviour it has in main: execFileSync with
+  // shell:true. This path is KNOWN-UNSAFE — arguments are re-parsed by cmd.exe —
+  // and remains the original defect; it is unchanged, not fixed. T19 tracks the
+  // correct Windows implementation, gated on windows-latest CI.
   if (process.platform === "win32") {
     return execFileSync(cliCmd, args, {
       input,
