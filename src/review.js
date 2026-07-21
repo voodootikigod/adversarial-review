@@ -1,3 +1,4 @@
+import { randomBytes } from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -19,14 +20,62 @@ export function loadSchema() {
   return JSON.parse(loadAsset("schema.json"));
 }
 
+// Sentinel tokens that delimit an untrusted data block. They are deliberately
+// distinctive so the model can be told, once, to treat everything between them
+// as data and never as instructions. stripFenceSentinels below removes ANY
+// occurrence of these tokens from a value before fencing, so injected content
+// cannot forge a marker and break out of (or spoof) the fence.
+const UNTRUSTED_OPEN_TOKEN = "<<<UNTRUSTED:";
+const UNTRUSTED_CLOSE_TOKEN = "<<<END:";
+
+// Remove every fence sentinel from a value so it cannot forge an opening or a
+// closing marker. Matching is label- AND nonce-agnostic on purpose: any
+// sentinel-shaped token is a breakout risk regardless of what it carries.
+function stripFenceSentinels(value) {
+  return value
+    // A full marker: `<<<UNTRUSTED:` / `<<<END:` up to the closing `>>>`. The
+    // `[^>]*` keeps each match anchored to a single marker so an unrelated
+    // `>>>` run elsewhere in the diff is never swallowed.
+    .replace(/<<<UNTRUSTED:[^>]*>>>/g, "")
+    .replace(/<<<END:[^>]*>>>/g, "")
+    // Defense in depth: drop any bare sentinel prefix left without a closing
+    // `>>>`, so a truncated or half-formed marker cannot linger in the body.
+    .split(UNTRUSTED_OPEN_TOKEN).join("")
+    .split(UNTRUSTED_CLOSE_TOKEN).join("");
+}
+
+// Wrap untrusted content in clearly-labeled, data-only fences. Content that
+// tries to forge a sentinel is neutralized first, so the only real markers in
+// the emitted block are the ones this function writes.
+//
+// The nonce makes the live sentinel unguessable: the token format is public
+// (this file is open source), so a static delimiter would tell an attacker
+// exactly what to forge. `nonce` is injectable only so tests can pin it.
+//
+// Pure: does not mutate its inputs.
+export function fenceUntrusted(label, value, { nonce } = {}) {
+  const tag = `${label}:${nonce ?? randomBytes(9).toString("base64url")}`;
+  return [
+    `${UNTRUSTED_OPEN_TOKEN}${tag}>>>`,
+    stripFenceSentinels(String(value ?? "")),
+    `${UNTRUSTED_CLOSE_TOKEN}${tag}>>>`
+  ].join("\n");
+}
+
 // Fill a review template's {{PLACEHOLDER}} slots from the collected context.
+// REVIEW_INPUT (the reviewed diff/artifact) and USER_FOCUS are attacker
+// -influenceable and are fenced; the remaining slots are trusted scaffolding we
+// author ourselves and are interpolated as-is.
 function fillTemplate(templateName, context, focus) {
   const template = loadAsset(templateName);
   const vars = {
     TARGET_LABEL: context.label,
-    USER_FOCUS: focus && focus.trim() ? focus.trim() : "No extra focus provided.",
+    USER_FOCUS: fenceUntrusted(
+      "USER_FOCUS",
+      focus && focus.trim() ? focus.trim() : "No extra focus provided."
+    ),
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
-    REVIEW_INPUT: context.content
+    REVIEW_INPUT: fenceUntrusted("REVIEW_INPUT", context.content)
   };
   return template.replace(/\{\{(\w+)\}\}/g, (match, key) =>
     key in vars ? vars[key] : match
