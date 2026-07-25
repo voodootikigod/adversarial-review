@@ -246,6 +246,25 @@ test("cliReviewArgs / cliFallbackArgs use per-CLI plan flags for claude and agy"
   assert.deepEqual(cliFallbackArgs("somecli", "PROMPT-BODY"), ["PROMPT-BODY"]);
 });
 
+test("cliReviewArgs / cliFallbackArgs forward a resolved model to claude and agy", () => {
+  // A configured cli:<cmd> model pin must actually reach the process, not be
+  // silently dropped (both claude and agy accept --model <model>).
+  assert.deepEqual(
+    cliReviewArgs("agy", { model: "gemini-3.1-pro-high" }),
+    ["--mode", "plan", "--model", "gemini-3.1-pro-high", "-p", "-"]
+  );
+  assert.deepEqual(
+    cliReviewArgs("claude", { model: "claude-sonnet-4-6" }),
+    ["--permission-mode", "plan", "--model", "claude-sonnet-4-6", "-p", "-"]
+  );
+  assert.deepEqual(
+    cliFallbackArgs("agy", "PROMPT-BODY", { model: "gemini-3.1-pro-high" }),
+    ["--mode", "plan", "--model", "gemini-3.1-pro-high", "-p", "PROMPT-BODY"]
+  );
+  // No model → unchanged (no stray --model flag).
+  assert.deepEqual(cliReviewArgs("agy"), ["--mode", "plan", "-p", "-"]);
+});
+
 test("describeUnknownFlagRejection parses Go flag and common unknown-flag stderr", () => {
   assert.equal(
     describeUnknownFlagRejection("agy", "flags provided but not defined: -permission-mode\nUsage of agy:\n"),

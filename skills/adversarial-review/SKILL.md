@@ -152,6 +152,17 @@ Force with `--provider <name>`; override the model with `--model <name>`. Gate q
 tracks model tier — defaults are the strong tier of each provider; use `--model` to trade
 quality for cost deliberately.
 
+Provider and model resolution is handled by the CLI: it auto-detects the provider, caches
+the resolution in a global config (`$XDG_CONFIG_HOME/adversarial-review/config.json`),
+re-validates it cheaply, and reuses it on subsequent runs, so a batch of reviews doesn't
+re-learn the environment each time. To pin a model per provider across runs, add it to that
+file under `defaults.models`
+(e.g. `{ "defaults": { "models": { "cli:agy": "gemini-3.1-pro-high" } } }`); precedence is
+`--model` > config pin > built-in default. The file is read only from an absolute path
+outside the git worktree under review (default: your home/XDG dir); an explicit
+`ADVERSARIAL_REVIEW_CONFIG` that is relative or inside the repo disables config rather than
+supplying it, so a reviewed repository can't influence the reviewer.
+
 ## Large changes
 
 The CLI inlines the **full diff** only when the change is small (≤ `--max-files` files **and**

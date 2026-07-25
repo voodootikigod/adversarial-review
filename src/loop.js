@@ -26,6 +26,7 @@ import {
   SEVERITY_RANK
 } from "./review.js";
 import { configureLLM, isCmdInstalled, selectProviders, underSatisfiedNotice } from "./llm.js";
+import { persistAutoResolution, withProviderFallback } from "./resolution-lifecycle.js";
 
 // ─── Git helpers ──────────────────────────────────────────────────────────────
 
@@ -655,9 +656,13 @@ export async function runLoop(cwd, args) {
   // Provider labels for the consolidated loop_summary (GitHub #11): the multi
   // set's ids, or the single reviewer's concrete identity (cli command name for
   // local agents, provider name for APIs).
-  const providerLabels = providerSet
+  let providerLabels = providerSet
     ? providerSet.providers.map((p) => p.id)
     : [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
+
+  // Run the resolution lifecycle (auth-failure recovery + success persistence)
+  // once, on the first single-provider review of the loop (F6).
+  let lifecyclePrimed = false;
 
   // Validate --loop-unsafe-allow-fix-secrets provider match for known fixers.
   if (args.loopUnsafeAllowFixSecrets) {
@@ -844,7 +849,23 @@ export async function runLoop(cwd, args) {
         : [];
     } else {
       try {
-        result = await runReview(reviewConfig, prompt, { passes: args.passes });
+        if (!lifecyclePrimed) {
+          // First review: a cache-sourced provider that fails auth is invalidated
+          // and re-detected once (T21), and a successful resolution is persisted —
+          // loop mode shares the same lifecycle as the normal path (F6).
+          ({ result, config: reviewConfig } = await withProviderFallback(
+            args, reviewConfig, (cfg) => runReview(cfg, prompt, { passes: args.passes })
+          ));
+          persistAutoResolution(reviewConfig);
+          lifecyclePrimed = true;
+          // If the fallback swapped the provider, the loop_summary evidence must
+          // name the provider that ACTUALLY reviewed, not the failed cached one (F5).
+          if (!providerSet) {
+            providerLabels = [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
+          }
+        } else {
+          result = await runReview(reviewConfig, prompt, { passes: args.passes });
+        }
       } catch (err) {
         log.error(`Review failed: ${err.message}`);
         if (stashRef) log.warn(buildRecoveryCmd(stashName));
@@ -1191,6 +1212,9 @@ export async function runBranchLoop(cwd, args) {
     }
   }
 
+  // Run the resolution lifecycle once, on the first single-provider review (F6).
+  let lifecyclePrimed = false;
+
   // Same cross-provider secret-bypass guard as the working-tree loop.
   if (args.loopUnsafeAllowFixSecrets) {
     if (providerSet) {
@@ -1215,7 +1239,7 @@ export async function runBranchLoop(cwd, args) {
     }
   }
 
-  const providerLabels = providerSet
+  let providerLabels = providerSet
     ? providerSet.providers.map((p) => p.id)
     : [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
 
@@ -1333,7 +1357,22 @@ export async function runBranchLoop(cwd, args) {
       gatings = round.derived.verdict === "needs-attention" ? getGatingFindings(result, round.assessments, args) : [];
     } else {
       try {
-        result = await runReview(reviewConfig, prompt, { passes: args.passes });
+        if (!lifecyclePrimed) {
+          // First review: shared resolution lifecycle (auth-failure recovery +
+          // success persistence), identical to the normal path (F6).
+          ({ result, config: reviewConfig } = await withProviderFallback(
+            args, reviewConfig, (cfg) => runReview(cfg, prompt, { passes: args.passes })
+          ));
+          persistAutoResolution(reviewConfig);
+          lifecyclePrimed = true;
+          // If the fallback swapped the provider, the loop_summary evidence must
+          // name the provider that ACTUALLY reviewed, not the failed cached one (F5).
+          if (!providerSet) {
+            providerLabels = [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
+          }
+        } else {
+          result = await runReview(reviewConfig, prompt, { passes: args.passes });
+        }
       } catch (err) {
         log.error(`Review failed: ${err.message}`);
         log.warn(`Recovery: ${recoveryLine}`);

@@ -34,7 +34,10 @@ function runCli(args, { mocks = {}, artifact = "# Spec\n\nBuild the widget.\n" }
     const r = spawnSync(process.execPath, [cli, ...args], {
       cwd: workDir,
       encoding: "utf8",
-      env: { HOME: process.env.HOME, PATH }
+      // Isolate the global config to a dir OUTSIDE the reviewed tree (cwd=workDir)
+      // so the CLI never touches the real ~/.config AND the config isn't rejected
+      // by the repo-containment guard (T23). mocksDir is a sibling temp dir.
+      env: { HOME: process.env.HOME, PATH, ADVERSARIAL_REVIEW_CONFIG: path.join(mocksDir, "adv-config.json") }
     });
     return { status: r.status, stdout: r.stdout || "", stderr: r.stderr || "" };
   } finally {
