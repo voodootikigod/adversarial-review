@@ -229,10 +229,11 @@ test("configureLLM auto-detects agy CLI when only agy is installed and no API ke
 });
 
 test("cliReviewArgs / cliFallbackArgs use per-CLI plan flags for claude and agy", () => {
-  // agy uses --mode plan (not Claude's --permission-mode)
-  assert.deepEqual(cliReviewArgs("agy"), ["--mode", "plan", "-p", "-"]);
+  // agy has NO stdin `-` review form — its -p takes the prompt as a value, so it
+  // is delivered via cliFallbackArgs (argv), never `-p -`. cliReviewArgs returns [].
+  assert.deepEqual(cliReviewArgs("agy"), []);
   assert.deepEqual(cliReviewArgs("claude"), ["--permission-mode", "plan", "-p", "-"]);
-  assert.deepEqual(cliReviewArgs("agy", { allowUnsandboxedCli: true }), ["-p", "-"]);
+  assert.deepEqual(cliReviewArgs("agy", { allowUnsandboxedCli: true }), []);
   assert.deepEqual(cliFallbackArgs("agy", "PROMPT-BODY"), ["--mode", "plan", "-p", "PROMPT-BODY"]);
   assert.deepEqual(cliFallbackArgs("claude", "PROMPT-BODY"), ["--permission-mode", "plan", "-p", "PROMPT-BODY"]);
   assert.deepEqual(
@@ -248,11 +249,8 @@ test("cliReviewArgs / cliFallbackArgs use per-CLI plan flags for claude and agy"
 
 test("cliReviewArgs / cliFallbackArgs forward a resolved model to claude and agy", () => {
   // A configured cli:<cmd> model pin must actually reach the process, not be
-  // silently dropped (both claude and agy accept --model <model>).
-  assert.deepEqual(
-    cliReviewArgs("agy", { model: "gemini-3.1-pro-high" }),
-    ["--mode", "plan", "--model", "gemini-3.1-pro-high", "-p", "-"]
-  );
+  // silently dropped (both claude and agy accept --model <model>). agy's pin rides
+  // its argv (cliFallbackArgs) form since it has no stdin review form.
   assert.deepEqual(
     cliReviewArgs("claude", { model: "claude-sonnet-4-6" }),
     ["--permission-mode", "plan", "--model", "claude-sonnet-4-6", "-p", "-"]
@@ -261,8 +259,6 @@ test("cliReviewArgs / cliFallbackArgs forward a resolved model to claude and agy
     cliFallbackArgs("agy", "PROMPT-BODY", { model: "gemini-3.1-pro-high" }),
     ["--mode", "plan", "--model", "gemini-3.1-pro-high", "-p", "PROMPT-BODY"]
   );
-  // No model → unchanged (no stray --model flag).
-  assert.deepEqual(cliReviewArgs("agy"), ["--mode", "plan", "-p", "-"]);
 });
 
 test("describeUnknownFlagRejection parses Go flag and common unknown-flag stderr", () => {
@@ -370,7 +366,7 @@ test("parseRetryAfterMs parses seconds and HTTP-date, capped", () => {
   assert.equal(parseRetryAfterMs(null), null);
 });
 
-test("agy CLI review path invokes -p print mode and delivers the prompt via stdin", async () => {
+test("agy CLI review path delivers the prompt as the -p argument (no stdin sentinel)", async () => {
   const { llmCall } = await import("../src/llm.js");
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-"));
@@ -380,31 +376,32 @@ test("agy CLI review path invokes -p print mode and delivers the prompt via stdi
   const sentinelPrompt = "review this sentinel";
   const expectedResponse = '{"verdict":"approve","summary":"ok"}';
 
-  // Mock agy binary enforcing the print-mode contract:
-  //   1. `-p` (print/non-interactive) must be present — bare agy would hang.
-  //   2. `-` must be present as the stdin sentinel.
-  //   3. Stdin must carry both the system instruction and the user prompt.
-  // Exits non-zero on any violation so the test fails if the contract breaks.
+  // Mock agy enforcing the CORRECT contract (agy's -p takes the prompt as a VALUE):
+  //   1. `-p`/`--print` must be present — bare agy would hang.
+  //   2. `--mode plan` must be present (review isolation).
+  //   3. `--permission-mode` (a claude flag) must NOT be passed.
+  //   4. The bare `-` stdin sentinel must NOT be passed (agy would read it as the
+  //      prompt "-" and ignore stdin, returning prose — the bug this guards).
+  //   5. The `-p` VALUE must carry both the system instruction and the user prompt.
   fs.writeFileSync(
     binPath,
     `#!/bin/sh
 has_print=false
-read_stdin=false
 has_plan=false
 has_bad_flag=false
+has_stdin_dash=false
+prompt_arg=""
 prev=""
 for arg in "$@"; do
-  if [ "$arg" = "-p" ] || [ "$arg" = "--print" ]; then has_print=true; fi
-  if [ "$arg" = "-" ]; then read_stdin=true; fi
+  if [ "$arg" = "-p" ] || [ "$arg" = "--print" ] || [ "$arg" = "--prompt" ]; then has_print=true; fi
+  if [ "$arg" = "-" ]; then has_stdin_dash=true; fi
   if [ "$arg" = "--permission-mode" ]; then has_bad_flag=true; fi
   if [ "$prev" = "--mode" ] && [ "$arg" = "plan" ]; then has_plan=true; fi
+  if [ "$prev" = "-p" ] || [ "$prev" = "--print" ] || [ "$prev" = "--prompt" ]; then prompt_arg="$arg"; fi
   prev="$arg"
 done
 if [ "$has_print" = "false" ]; then
   echo "FAIL: -p/--print not passed (would hang interactively)" >&2; exit 1
-fi
-if [ "$read_stdin" = "false" ]; then
-  echo "FAIL: stdin indicator (-) not passed" >&2; exit 1
 fi
 if [ "$has_plan" = "false" ]; then
   echo "FAIL: --mode plan not passed (review isolation required)" >&2; exit 1
@@ -412,9 +409,17 @@ fi
 if [ "$has_bad_flag" = "true" ]; then
   echo "FAIL: --permission-mode must not be passed to agy" >&2; exit 1
 fi
-stdin_content=$(cat)
-echo "$stdin_content" | grep -q "${sentinelSystem}" || { echo "FAIL: system instruction missing from stdin" >&2; exit 1; }
-echo "$stdin_content" | grep -q "${sentinelPrompt}" || { echo "FAIL: prompt content missing from stdin" >&2; exit 1; }
+if [ "$has_stdin_dash" = "true" ]; then
+  echo "FAIL: agy must NOT be passed the stdin sentinel '-' (it reads it as the prompt)" >&2; exit 1
+fi
+case "$prompt_arg" in
+  *"${sentinelSystem}"*) : ;;
+  *) echo "FAIL: system instruction missing from the -p argument value" >&2; exit 1 ;;
+esac
+case "$prompt_arg" in
+  *"${sentinelPrompt}"*) : ;;
+  *) echo "FAIL: prompt content missing from the -p argument value" >&2; exit 1 ;;
+esac
 printf '%s' '${expectedResponse}'
 `
   );

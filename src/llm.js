@@ -278,6 +278,15 @@ export function isCursorAgentCli(cliCmd) {
   return cliCmd === "agent" || cliCmd === "cursor-agent";
 }
 
+// agy's `-p`/`--print`/`--prompt` takes the prompt as its VALUE — it has NO stdin
+// `-` sentinel (that is a claude/codex convention). Invoked as `agy -p -` with the
+// prompt piped to stdin, agy answers the literal "-" and ignores stdin, returning
+// conversational prose ("Hello! How can I help you today?") instead of the review
+// JSON. So agy must always receive the prompt as the `-p` argument value.
+export function cliRequiresArgvPrompt(cliCmd) {
+  return cliCmd === "agy";
+}
+
 /** Plan/read-only sandbox flags for a local CLI (empty when unsandboxed or unknown). */
 export function cliSandboxArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
   if (allowUnsandboxedCli) return [];
@@ -332,9 +341,10 @@ export function cliReviewArgs(cliCmd, { allowUnsandboxedCli = false, model = nul
     args.push("-");
     return args;
   }
-  if (cliCmd !== "claude" && cliCmd !== "agy") return [];
-  // claude and agy both accept `--model <model>`; pass a resolved pin through so
-  // a configured cli:<cmd> model actually reaches the process (not silently dropped).
+  // Only claude uses the stdin `-` review form here. agy has no stdin sentinel
+  // (see cliRequiresArgvPrompt) and is invoked with the prompt as the -p value via
+  // cliFallbackArgs; it must NOT get a `-p -` form, which agy reads as the prompt "-".
+  if (cliCmd !== "claude") return [];
   const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
   if (model) args.push("--model", model);
   args.push("-p", "-");
@@ -451,12 +461,39 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
     return callCodexCli(fullPrompt, schema, timeoutMs, { stream, model });
   }
 
+  const fallbackOpts = { allowUnsandboxedCli, model };
+
+  // agy: the prompt MUST be the `-p` value (no stdin sentinel). Deliver it via
+  // argv directly — there is no stdin path to try first. Guard the argv size.
+  if (cliRequiresArgvPrompt(cliCmd)) {
+    const promptBytes = Buffer.byteLength(fullPrompt);
+    const argvLimit = maxArgvPromptBytes();
+    if (promptBytes > argvLimit) {
+      throw new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit));
+    }
+    try {
+      return await execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs, { stream, argsContainUntrusted: true });
+    } catch (err) {
+      if (err.code === "ETIMEDOUT") {
+        throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      }
+      if (isE2BigError(err)) {
+        throw Object.assign(new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit)), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      }
+      const stderr = err.stderr?.toString("utf8") || "";
+      const flagRejection = describeUnknownFlagRejection(cliCmd, stderr);
+      if (flagRejection) {
+        throw Object.assign(new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : "")), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      }
+      const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
+      throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": ${err.message}${suffix}`), { stdout: err.stdout, stderr: err.stderr, cause: err });
+    }
+  }
+
   // claude: -p + stdin `-` + --permission-mode plan.
-  // agy: -p + stdin `-` + --mode plan.
   // agent/cursor-agent: -p + stdin `-` + --mode plan + --trust (Cursor CLI).
   // A bare invocation launches interactively and hangs until timeout.
   const primaryArgs = cliReviewArgs(cliCmd, { allowUnsandboxedCli, model });
-  const fallbackOpts = { allowUnsandboxedCli, model };
 
   try {
     return await execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs, { stream, argsContainUntrusted: false });

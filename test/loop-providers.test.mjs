@@ -44,7 +44,8 @@ function smartMock() {
     `let input = '';\n` +
     `process.stdin.on('data', (d) => { input += d; });\n` +
     `process.stdin.on('end', () => {\n` +
-    `  process.stdout.write(input.includes('FIXED_MARKER') ? ${JSON.stringify(APPROVE + "\n")} : ${JSON.stringify(FLAG + "\n")});\n` +
+    `  const seen = input + process.argv.slice(2).join(' ');\n` +
+    `  process.stdout.write(seen.includes('FIXED_MARKER') ? ${JSON.stringify(APPROVE + "\n")} : ${JSON.stringify(FLAG + "\n")});\n` +
     `});\n`
   );
 }

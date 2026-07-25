@@ -260,7 +260,9 @@ test("T12: every supported CLI's PRIMARY invocation still works on a Windows shi
   // every npm-installed CLI on Windows failed before spawn — strictly worse
   // than the unsafe-but-working behaviour it replaced. The prompt travels over
   // stdin on this path; only the flags are argv, and those are ours.
-  for (const cli of ["claude", "agy", "agent"]) {
+  // agy is excluded: it has no stdin review form (its -p takes the prompt as a
+  // value), so it uses the argv path (cliFallbackArgs), not cliReviewArgs.
+  for (const cli of ["claude", "agent"]) {
     const flags = cliReviewArgs(cli, {});
     assert.ok(flags.length > 0, `${cli} is expected to pass flags`);
     const t = buildSpawnTarget(`C:\\npm\\${cli}.cmd`, flags, {
