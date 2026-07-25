@@ -26,7 +26,29 @@ import {
   SEVERITY_RANK
 } from "./review.js";
 import { configureLLM, isCmdInstalled, selectProviders, underSatisfiedNotice } from "./llm.js";
-import { persistAutoResolution, withProviderFallback } from "./resolution-lifecycle.js";
+import { persistAutoResolution, withProviderFallback, isStaleResolutionFailure } from "./resolution-lifecycle.js";
+
+// Build the per-round review operation (review + optional --verify) as a single
+// unit for the resolution lifecycle. A NON-stale verify failure is tolerated
+// (warn + use unverified findings); a stale-resolution verify failure on a
+// cache-sourced config propagates so withProviderFallback can recover (T25).
+function buildReviewRound(args, context, prompt) {
+  return async (cfg) => {
+    let res = await runReview(cfg, prompt, { passes: args.passes });
+    if (args.verify && res.findings.length) {
+      log.step(`Verification pass: refuting ${res.findings.length} finding(s)...`);
+      try {
+        const verified = await verifyFindings(cfg, context, res);
+        res = verified.result;
+        if (verified.dropped) log.info(`Verification dropped ${verified.dropped} finding(s).`);
+      } catch (verr) {
+        if (cfg._fromCache && isStaleResolutionFailure(verr)) throw verr;
+        log.warn(`Verification pass failed: ${verr.message} — using unverified findings.`);
+      }
+    }
+    return res;
+  };
+}
 
 // ─── Git helpers ──────────────────────────────────────────────────────────────
 
@@ -660,10 +682,6 @@ export async function runLoop(cwd, args) {
     ? providerSet.providers.map((p) => p.id)
     : [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
 
-  // Run the resolution lifecycle (auth-failure recovery + success persistence)
-  // once, on the first single-provider review of the loop (F6).
-  let lifecyclePrimed = false;
-
   // Validate --loop-unsafe-allow-fix-secrets provider match for known fixers.
   if (args.loopUnsafeAllowFixSecrets) {
     if (providerSet) {
@@ -848,40 +866,26 @@ export async function runLoop(cwd, args) {
         ? getGatingFindings(result, round.assessments, args)
         : [];
     } else {
+      // Full per-round operation (review + optional verify) through the shared
+      // lifecycle EACH round while the resolution is still cache-sourced: a stale
+      // credential/model failure in ANY round invalidates and re-detects once, and
+      // the resolution is persisted only AFTER the whole round succeeds (T25).
+      const reviewRound = buildReviewRound(args, context, prompt);
       try {
-        if (!lifecyclePrimed) {
-          // First review: a cache-sourced provider that fails auth is invalidated
-          // and re-detected once (T21), and a successful resolution is persisted —
-          // loop mode shares the same lifecycle as the normal path (F6).
-          ({ result, config: reviewConfig } = await withProviderFallback(
-            args, reviewConfig, (cfg) => runReview(cfg, prompt, { passes: args.passes })
-          ));
-          persistAutoResolution(reviewConfig);
-          lifecyclePrimed = true;
-          // If the fallback swapped the provider, the loop_summary evidence must
-          // name the provider that ACTUALLY reviewed, not the failed cached one (F5).
-          if (!providerSet) {
-            providerLabels = [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
-          }
+        if (reviewConfig._fromCache) {
+          ({ result, config: reviewConfig } = await withProviderFallback(args, reviewConfig, reviewRound));
         } else {
-          result = await runReview(reviewConfig, prompt, { passes: args.passes });
+          result = await reviewRound(reviewConfig);
         }
       } catch (err) {
         log.error(`Review failed: ${err.message}`);
         if (stashRef) log.warn(buildRecoveryCmd(stashName));
         process.exit(1);
       }
-
-      // Verification pass
-      if (args.verify && result.findings.length) {
-        log.step(`Verification pass: refuting ${result.findings.length} finding(s)...`);
-        try {
-          const verified = await verifyFindings(reviewConfig, context, result);
-          result = verified.result;
-          if (verified.dropped) log.info(`Verification dropped ${verified.dropped} finding(s).`);
-        } catch (err) {
-          log.warn(`Verification pass failed: ${err.message} — using unverified findings.`);
-        }
+      persistAutoResolution(reviewConfig);
+      // Reflect a fallback provider swap in the loop_summary evidence (F5).
+      if (!providerSet) {
+        providerLabels = [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
       }
 
       lastResult = result;
@@ -1212,9 +1216,6 @@ export async function runBranchLoop(cwd, args) {
     }
   }
 
-  // Run the resolution lifecycle once, on the first single-provider review (F6).
-  let lifecyclePrimed = false;
-
   // Same cross-provider secret-bypass guard as the working-tree loop.
   if (args.loopUnsafeAllowFixSecrets) {
     if (providerSet) {
@@ -1356,37 +1357,24 @@ export async function runBranchLoop(cwd, args) {
       if (!args.json) console.log(renderReport(result, context, round.assessments, round.derived));
       gatings = round.derived.verdict === "needs-attention" ? getGatingFindings(result, round.assessments, args) : [];
     } else {
+      // Full per-round operation through the shared lifecycle each round while the
+      // resolution is still cache-sourced; persist only after the round succeeds (T25).
+      const reviewRound = buildReviewRound(args, context, prompt);
       try {
-        if (!lifecyclePrimed) {
-          // First review: shared resolution lifecycle (auth-failure recovery +
-          // success persistence), identical to the normal path (F6).
-          ({ result, config: reviewConfig } = await withProviderFallback(
-            args, reviewConfig, (cfg) => runReview(cfg, prompt, { passes: args.passes })
-          ));
-          persistAutoResolution(reviewConfig);
-          lifecyclePrimed = true;
-          // If the fallback swapped the provider, the loop_summary evidence must
-          // name the provider that ACTUALLY reviewed, not the failed cached one (F5).
-          if (!providerSet) {
-            providerLabels = [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
-          }
+        if (reviewConfig._fromCache) {
+          ({ result, config: reviewConfig } = await withProviderFallback(args, reviewConfig, reviewRound));
         } else {
-          result = await runReview(reviewConfig, prompt, { passes: args.passes });
+          result = await reviewRound(reviewConfig);
         }
       } catch (err) {
         log.error(`Review failed: ${err.message}`);
         log.warn(`Recovery: ${recoveryLine}`);
         process.exit(1);
       }
-      if (args.verify && result.findings.length) {
-        log.step(`Verification pass: refuting ${result.findings.length} finding(s)...`);
-        try {
-          const verified = await verifyFindings(reviewConfig, context, result);
-          result = verified.result;
-          if (verified.dropped) log.info(`Verification dropped ${verified.dropped} finding(s).`);
-        } catch (err) {
-          log.warn(`Verification pass failed: ${err.message} — using unverified findings.`);
-        }
+      persistAutoResolution(reviewConfig);
+      // Reflect a fallback provider swap in the loop_summary evidence (F5).
+      if (!providerSet) {
+        providerLabels = [reviewConfig.provider === "cli" ? reviewConfig.cliCmd : reviewConfig.provider];
       }
       lastResult = result;
       emitEvent(args.json, { type: "review", iteration: fixCount + 1, findingCount: result.findings.length });

@@ -8,14 +8,23 @@ import { log } from "./utils.js";
 
 const label = (c) => `${c.provider}${c.cliCmd ? `:${c.cliCmd}` : ""}`;
 
-// A failure that plausibly means the cached resolution's CREDENTIAL is dead
-// (revoked/expired key, logged-out CLI session) rather than a transient network/
-// 5xx or a content/parse error — which must NOT invalidate the cache. API auth
-// surfaces as a preserved 401/403; a CLI session failure only as text.
-export function isProviderAuthFailure(err) {
-  if (typeof err?.status === "number") return err.status === 401 || err.status === 403;
+const AUTH_RE = /\b(401|403)\b|unauthorized|forbidden|authentication|not logged in|invalid api key|api key.*(invalid|expired)|please (run )?login|session (has )?expired|log ?in to/;
+// Invalid / retired / unsupported model — the cached resolution's model is dead.
+const MODEL_RE = /\b404\b|model[^.]*\b(not found|does not exist|is invalid|unknown|unsupported|retired|deprecated|decommissioned|unavailable)\b|(unknown|invalid|unsupported|unavailable|nonexistent) model|no such model/;
+
+// A failure meaning the cached RESOLUTION is dead — its credential is revoked/
+// expired (auth) or its model is retired/invalid — as opposed to a transient
+// network/5xx or a content/parse error, which must NOT invalidate the cache.
+// API errors surface as a preserved status (401/403 auth, 404 not-found, or 400
+// whose body names a model problem); a CLI session/model failure only as text.
+export function isStaleResolutionFailure(err) {
   const text = `${err?.message || ""}\n${err?.stderr ? String(err.stderr) : ""}`.toLowerCase();
-  return /\b(401|403)\b|unauthorized|forbidden|authentication|not logged in|invalid api key|api key.*(invalid|expired)|please (run )?login|session (has )?expired|log ?in to/.test(text);
+  if (typeof err?.status === "number") {
+    if (err.status === 401 || err.status === 403 || err.status === 404) return true;
+    if (err.status === 400) return MODEL_RE.test(text); // 400 only when it names a model issue
+    return false; // 429 / 5xx / other → transient, keep the cache
+  }
+  return AUTH_RE.test(text) || MODEL_RE.test(text);
 }
 
 // Persist the resolution ONLY after a fully successful review — a resolution that
@@ -41,7 +50,7 @@ export async function withProviderFallback(args, config, reviewOnce) {
   try {
     return { result: await reviewOnce(config), config };
   } catch (err) {
-    if (!config._fromCache || !isProviderAuthFailure(err)) throw err;
+    if (!config._fromCache || !isStaleResolutionFailure(err)) throw err;
     const key = builderContextKey();
     const pruned = withoutCacheEntry(args.config, key);
     mutateConfigFile((cur) => withoutCacheEntry(cur, key));
@@ -54,10 +63,10 @@ export async function withProviderFallback(args, config, reviewOnce) {
     try {
       fresh = configureLLM({ ...args, config: pruned, exclude });
     } catch {
-      log.warn(`Cached provider "${label(config)}" failed authentication; removed the stale cache entry (next run re-detects). No alternative provider is available.`);
+      log.warn(`Cached provider "${label(config)}" failed (stale credential or model); removed the stale cache entry (next run re-detects). No alternative provider is available.`);
       throw err;
     }
-    log.warn(`Cached provider "${label(config)}" failed authentication; re-detected "${label(fresh)}" and retrying once.`);
+    log.warn(`Cached provider "${label(config)}" failed (stale credential or model); re-detected "${label(fresh)}" and retrying once.`);
     return { result: await reviewOnce(fresh), config: fresh };
   }
 }
