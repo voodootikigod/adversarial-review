@@ -108,6 +108,17 @@ ${colors.bold("LLM selection (when not --prompt-only):")}
   AI_GATEWAY_API_KEY, then a local CLI agent (claude, codex, agy, agent).
   Override with --provider. With only AI_GATEWAY_API_KEY, --providers auto can
   fan across openai/anthropic/gemini families through the Gateway.
+  The auto-detected provider is cached (per builder context) in the global config
+  and reused on later runs — re-validated first, and re-detected if stale.
+
+${colors.bold("Global config (optional):")}
+  $ADVERSARIAL_REVIEW_CONFIG, else $XDG_CONFIG_HOME/adversarial-review/config.json,
+  else ~/.config/adversarial-review/config.json. Written after the first
+  successful review; the resolved provider is cached and reused (re-validated).
+  { "defaults": { "models": { "gemini": "gemini-2.5-pro", "cli:agy": "..." } } }
+  pins the model per provider (below --model, above the built-in default).
+  Honored only from an absolute path OUTSIDE the git worktree under review; an
+  explicit path that is relative or inside the repo disables config.
 
 ${colors.bold("Environment Variables:")}
   ANTHROPIC_API_KEY     Use the Anthropic API.

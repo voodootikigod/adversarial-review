@@ -6,6 +6,7 @@ import os from "os";
 import path from "path";
 import { log } from "./utils.js";
 import { sanitizeSchemaForProvider } from "./schema-validate.js";
+import { isInsideTrustRoot } from "./trust-root.js";
 
 const DEFAULT_TIMEOUT_MS = 120 * 1000;
 
@@ -175,6 +176,33 @@ export function isCmdInstalled(cmd) {
   return resolveCommand(cmd) !== null;
 }
 
+// Resolve a CLI command to a canonical, absolute, TRUSTED executable path, or null.
+// "Trusted" means: it resolves on PATH AND does not live inside the git worktree
+// under review (the trust root — NOT merely process.cwd(), so a monorepo-root
+// node_modules/.bin shim is still refused when the tool runs from a nested
+// package). npm/npx prepend ./node_modules/.bin to PATH, so a repository can
+// otherwise expose a shim named claude/codex/agy that gets selected and spawned
+// with the reviewer's privileges. Symlinks are resolved, so a link outside the
+// tree whose target is inside is still refused. This is the SINGLE resolver used
+// by fresh detection, cache reuse, and the spawn site (T22).
+export function resolveTrustedCli(cmd) {
+  const resolved = resolveCommand(cmd);
+  if (!resolved) return null;
+  let real;
+  try {
+    real = fs.realpathSync(resolved);
+  } catch {
+    real = path.resolve(resolved);
+  }
+  if (isInsideTrustRoot(real)) return null;
+  return real;
+}
+
+// Boolean form for the detection ladder: a repo-local CLI is NOT available.
+export function isTrustedCliInstalled(cmd) {
+  return resolveTrustedCli(cmd) !== null;
+}
+
 async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true } = {}) {
   // SECURITY: shell:false on every platform. This previously passed
   // `shell: process.platform === "win32"`, which handed every argument to
@@ -195,7 +223,34 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
   // shell:true. This path is KNOWN-UNSAFE — arguments are re-parsed by cmd.exe —
   // and remains the original defect; it is unchanged, not fixed. T19 tracks the
   // correct Windows implementation, gated on windows-latest CI.
+  // TRUST GUARD (T22) — runs on EVERY platform, BEFORE the Windows branch. Spawn
+  // only a TRUSTED, canonical path: refuse to execute a CLI that resolves inside
+  // the git worktree under review — npm/npx put ./node_modules/.bin on PATH, so a
+  // reviewed repo could otherwise ship a shim that runs as the reviewer. Detection
+  // already avoids selecting such a binary; this makes execution impossible even
+  // if one slipped through.
+  const resolved = resolveCommand(cliCmd);
+  if (!resolved) {
+    throw new Error(
+      `Local CLI agent "${cliCmd}" was not found on PATH. Install it, or pass --provider <other>.`
+    );
+  }
+  const trusted = resolveTrustedCli(cliCmd);
+  if (!trusted) {
+    throw new Error(
+      `Refusing to run local CLI agent "${cliCmd}": it resolves to an executable inside the ` +
+        `working tree (${resolved}). A review provider must not be a repository-local binary — ` +
+        `install it outside the repo, or pass --provider with a trusted provider.`
+    );
+  }
+
   if (process.platform === "win32") {
+    // Windows keeps shell:true so npm-installed `.cmd` shims still run. NOTE: it
+    // still passes the BARE command (not `trusted`) to cmd.exe, which re-resolves
+    // it against the live directory — the known-unsafe re-resolution that T19
+    // tracks. The repo-local REFUSAL above now runs on Windows too, so a codex
+    // that resolveCommand itself finds inside the tree is rejected pre-spawn; the
+    // residual cmd.exe re-resolution is unchanged and remains T19's scope.
     return execFileSync(cliCmd, args, {
       input,
       encoding: "utf8",
@@ -206,13 +261,7 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
     }).trim();
   }
 
-  const resolved = resolveCommand(cliCmd);
-  if (!resolved) {
-    throw new Error(
-      `Local CLI agent "${cliCmd}" was not found on PATH. Install it, or pass --provider <other>.`
-    );
-  }
-  return spawnWithWatchdog(resolved, args, {
+  return spawnWithWatchdog(trusted, args, {
     input,
     timeoutMs,
     streamStdout: stream,
@@ -268,8 +317,8 @@ function gatewayCredential() {
 }
 
 function resolveCursorAgentCmd() {
-  if (isCmdInstalled("agent")) return "agent";
-  if (isCmdInstalled("cursor-agent")) return "cursor-agent";
+  if (isTrustedCliInstalled("agent")) return "agent";
+  if (isTrustedCliInstalled("cursor-agent")) return "cursor-agent";
   return null;
 }
 
@@ -284,7 +333,11 @@ export function cliReviewArgs(cliCmd, { allowUnsandboxedCli = false, model = nul
     return args;
   }
   if (cliCmd !== "claude" && cliCmd !== "agy") return [];
-  const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli }), "-p", "-"];
+  // claude and agy both accept `--model <model>`; pass a resolved pin through so
+  // a configured cli:<cmd> model actually reaches the process (not silently dropped).
+  const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
+  if (model) args.push("--model", model);
+  args.push("-p", "-");
   return args;
 }
 
@@ -299,7 +352,10 @@ export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = fals
   // claude and agy are Claude-Code-compatible: they need -p (print mode) when
   // the prompt is passed as a command-line argument.
   if (cliCmd === "claude" || cliCmd === "agy") {
-    return [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli }), "-p", fullPrompt];
+    const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
+    if (model) args.push("--model", model);
+    args.push("-p", fullPrompt);
+    return args;
   }
   return [fullPrompt];
 }
@@ -310,7 +366,7 @@ export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = fals
 // so Codex enforces the output shape natively rather than relying on scraping.
 // The prompt is piped via stdin (`-`) to avoid argv size limits on large diffs;
 // the argv path is used as a fallback if stdin is rejected.
-async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { stream = false } = {}) {
+async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { stream = false, model = null } = {}) {
   // Create a private temp directory so path prediction / symlink race attacks
   // against shared /tmp are not possible; the directory is owned by this process.
   const privateDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-review-codex-"));
@@ -332,6 +388,8 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
       "--ephemeral",
       "--output-last-message", outFile,
     ];
+    // `codex exec` accepts `-m/--model`; forward a resolved cli:codex pin.
+    if (model) baseArgs.push("--model", model);
     if (schemaFile) baseArgs.push("--output-schema", schemaFile);
 
     try {
@@ -390,7 +448,7 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
   log.step(`Invoking local subscription agent via command: "${cliCmd}"...`);
 
   if (cliCmd === "codex") {
-    return callCodexCli(fullPrompt, schema, timeoutMs, { stream });
+    return callCodexCli(fullPrompt, schema, timeoutMs, { stream, model });
   }
 
   // claude: -p + stdin `-` + --permission-mode plan.
@@ -454,11 +512,118 @@ const NO_LLM_CONFIG_MSG =
   "or install a local CLI agent (claude, codex, agy, or agent).\n" +
   "Or run with --prompt-only to just print the prompt.";
 
+// The detection ladder branches on the builder environment (Claude Code / Cursor /
+// Antigravity / plain shell), and the reviewer-diversity constraint is derived from
+// it. The resolution cache is keyed on this same context so a resolution is only
+// ever reused in the environment it was resolved in — a resolution cached inside
+// Claude Code can never be served to a plain-shell run (or vice versa), which is
+// the primary defense against the cache silently picking the builder's own family.
+export function builderContextKey(env = process.env) {
+  if (env.CLAUDECODE || env.CLAUDE_CODE) return "claudecode";
+  if (env.TERM_PROGRAM === "cursor") return "cursor";
+  if (env.ANTIGRAVITY_AGENT || env.ANTIGRAVITY_CONVERSATION_ID) return "antigravity";
+  return "default";
+}
+
+// The canonical, absolute, TRUSTED path a CLI command resolves to (or null if it
+// is not found or is repo-local). Recorded in the cache so reuse can verify the
+// SAME binary still resolves (identity), not merely that SOME binary of that name
+// exists — and so a repo-local binary is never cached.
+export function resolvedCliPath(cliCmd) {
+  return cliCmd ? resolveTrustedCli(cliCmd) : null;
+}
+
+// The diversity family of a concrete resolution. API providers map to their own
+// family; a local CLI maps via TOKEN_FAMILY (codex→openai, claude→anthropic,
+// agy→gemini). `vercel` (a transport) and the routing Cursor Agent CLI have no
+// fixed family — diversity for those is handled by gatewayPreferModel / the
+// context key, so null here just means "no family-level guard applies".
+export function familyForResolution(provider, cliCmd) {
+  if (provider === "cli") return TOKEN_FAMILY[cliCmd] || null;
+  if (provider === "anthropic" || provider === "openai" || provider === "gemini") return provider;
+  return null;
+}
+
+// A cached resolution is reusable only if it is still REACHABLE and still
+// preserves reviewer diversity. Any miss falls through to a full re-detection —
+// this is the "unless the right path doesn't work, reprobe" fallback. The check
+// is one PATH stat / env read, far cheaper than the full ladder.
+export function cachedResolutionUsable(entry) {
+  if (!entry || typeof entry !== "object") return false;
+  const { provider, cliCmd } = entry;
+  // Diversity guard (defense in depth on top of the context-keyed cache): never
+  // serve a resolution whose family is the builder's own family. Recompute the
+  // family from provider/cliCmd — the stored `family` field is advisory only, so
+  // a forged or stale entry (e.g. family:null on an anthropic provider) cannot
+  // slip a same-family critic past this guard.
+  const family = familyForResolution(provider, cliCmd);
+  if (family && family === builderFamily()) return false;
+  if (provider === "cli") {
+    if (typeof cliCmd !== "string") return false;
+    // Supply-chain guard: do NOT trust a cached CLI by bare name. Re-resolve it
+    // through the SAME trusted resolver used by fresh detection and the spawn site
+    // (canonicalizes, rejects repo-local), and require it to still resolve to the
+    // exact canonical path recorded when it was cached. A mismatch means the binary
+    // was swapped or a higher-priority PATH entry now shadows it → fall back to
+    // fresh detection. A cached entry without a recorded path is not reusable.
+    if (typeof entry.cliPath !== "string" || entry.cliPath.length === 0) return false;
+    const trusted = resolveTrustedCli(cliCmd);
+    if (!trusted) return false;
+    if (trusted !== entry.cliPath) return false;
+    return true;
+  }
+  if (provider === "anthropic") return !!envNonEmpty("ANTHROPIC_API_KEY");
+  if (provider === "gemini") return !!envNonEmpty("GEMINI_API_KEY");
+  if (provider === "openai") return !!envNonEmpty("OPENAI_API_KEY");
+  if (provider === "vercel") return !!gatewayCredential();
+  return false;
+}
+
+// True when an API/gateway credential that OUTRANKS a local CLI in this builder
+// context is now reachable. Used to stop a *cached CLI* resolution from shadowing
+// a safe API provider that became available after the CLI was cached — a cached
+// bare CLI name is re-resolved through the live PATH at spawn, so preferring a
+// now-available API (which the fresh ladder would pick anyway) avoids that path.
+// Cheap: env reads only, no PATH probing. Order mirrors the ladders in
+// configureLLM — note ANTHROPIC ranks BELOW the CLIs inside Claude Code, so an
+// ANTHROPIC key there must NOT preempt a cached codex/agy.
+export function apiOutranksCliInContext(contextKey, { env = process.env } = {}) {
+  const has = (n) => {
+    const v = env[n];
+    return v != null && String(v).trim() !== "";
+  };
+  const gw = has("AI_GATEWAY_API_KEY") || has("VERCEL_OIDC_TOKEN");
+  const gem = has("GEMINI_API_KEY");
+  const oai = has("OPENAI_API_KEY");
+  const anth = has("ANTHROPIC_API_KEY");
+  if (contextKey === "claudecode") return gem || oai || gw; // ANTHROPIC is below the CLIs here
+  if (contextKey === "cursor") return gem || anth || oai || gw;
+  return anth || gem || oai || gw; // default / antigravity: all APIs rank above local CLIs
+}
+
+// Look up a user-pinned model for a resolved provider from config.defaults.models.
+// A local CLI is keyed as `cli:<cmd>` (falling back to the bare command name).
+function configuredModelFor(config, provider, cliCmd) {
+  const models = config?.defaults?.models;
+  if (!models || typeof models !== "object") return null;
+  if (provider === "cli") {
+    return (cliCmd && (models[`cli:${cliCmd}`] || models[cliCmd])) || null;
+  }
+  return models[provider] || null;
+}
+
 // Resolve the LLM provider from flags, environment variables, or an installed local CLI agent.
 export function configureLLM(args) {
+  // Auto-detection (no explicit --provider) is the only path that may read/write
+  // the resolution cache. An explicit provider — including every call made by the
+  // --providers fan-out — is authoritative and never cached.
+  const autoDetected = !args.provider;
   let provider = args.provider;
   let apiKey = null;
   let cliCmd = null;
+  // Whether the resolution was served from the persisted cache (vs a fresh ladder
+  // walk). Only a cache-sourced resolution is invalidated-and-retried on failure.
+  let fromCache = false;
   // When auto-detect picks the Gateway inside a builder IDE, prefer a model
   // family that is NOT the builder's (transport ≠ diversity family).
   let gatewayPreferModel = null;
@@ -468,29 +633,57 @@ export function configureLLM(args) {
     const isCursorEnv = process.env.TERM_PROGRAM === "cursor";
     const gw = gatewayCredential();
 
-    if (isClaudeCodeEnv) {
+    // Exclusion set (populated by the fallback path after a provider fails): skip
+    // the failed provider/CLI so the ladder ADVANCES to the next candidate instead
+    // of reselecting the same one (e.g. an expired key still present in the env).
+    const exP = new Set(args.exclude?.providers || []);
+    const exC = new Set(args.exclude?.clis || []);
+    const canGemini = () => !exP.has("gemini") && envNonEmpty("GEMINI_API_KEY");
+    const canOpenai = () => !exP.has("openai") && envNonEmpty("OPENAI_API_KEY");
+    const canAnthropic = () => !exP.has("anthropic") && envNonEmpty("ANTHROPIC_API_KEY");
+    const canGw = () => !exP.has("vercel") && !!gw;
+    const canCli = (c) => !exC.has(c) && isTrustedCliInstalled(c);
+    const cursorAgent = resolveCursorAgentCmd();
+    const canCursorAgent = () => (cursorAgent && !exC.has(cursorAgent)) ? cursorAgent : null;
+
+    // Fast path: reuse a previously resolved provider for this exact builder
+    // context if it is still reachable and still diverse. Falls through to the
+    // full ladder on any miss (stale CLI, rotated key, family collision, or the
+    // cached provider being in the exclusion set). A cached CLI additionally defers
+    // to any API/gateway provider that now outranks local CLIs in this context — so
+    // a stale CLI name can't shadow a safe API that became available since caching.
+    const ctxKey = builderContextKey();
+    const cached = args.config?.cache?.[ctxKey];
+    const cliShadowedByApi = cached?.provider === "cli" && apiOutranksCliInContext(ctxKey);
+    const cacheExcluded = cached && (exP.has(cached.provider) || (cached.cliCmd && exC.has(cached.cliCmd)));
+    if (cached && cachedResolutionUsable(cached) && !cliShadowedByApi && !cacheExcluded) {
+      provider = cached.provider;
+      cliCmd = cached.cliCmd || null;
+      gatewayPreferModel = cached.gatewayPreferModel || null;
+      fromCache = true;
+    } else if (isClaudeCodeEnv) {
       // Builder is Claude. Prefer a non-Anthropic critic.
-      if (envNonEmpty("GEMINI_API_KEY")) {
+      if (canGemini()) {
         provider = "gemini";
-      } else if (envNonEmpty("OPENAI_API_KEY")) {
+      } else if (canOpenai()) {
         provider = "openai";
-      } else if (gw) {
+      } else if (canGw()) {
         provider = "vercel";
         gatewayPreferModel = "openai/gpt-5";
-      } else if (isCmdInstalled("codex")) {
+      } else if (canCli("codex")) {
         provider = "cli";
         cliCmd = "codex";
-      } else if (isCmdInstalled("agy")) {
+      } else if (canCli("agy")) {
         provider = "cli";
         cliCmd = "agy";
-      } else if (resolveCursorAgentCmd()) {
+      } else if (canCursorAgent()) {
         provider = "cli";
-        cliCmd = resolveCursorAgentCmd();
-      } else if (envNonEmpty("ANTHROPIC_API_KEY")) {
+        cliCmd = canCursorAgent();
+      } else if (canAnthropic()) {
         provider = "anthropic";
         log.warn("Running in Claude Code, but fell back to Claude for review.");
         log.info("This review is not a pure adversarial review (same provider). To minimize bias, we will execute it in a fresh, isolated context window.");
-      } else if (isCmdInstalled("claude")) {
+      } else if (canCli("claude")) {
         provider = "cli";
         cliCmd = "claude";
         log.warn("Running in Claude Code, but fell back to Claude for review.");
@@ -500,27 +693,27 @@ export function configureLLM(args) {
       }
     } else if (isCursorEnv) {
       // Builder is Cursor. Prefer an independent critic, then the official agent CLI.
-      if (envNonEmpty("GEMINI_API_KEY")) {
+      if (canGemini()) {
         provider = "gemini";
-      } else if (envNonEmpty("ANTHROPIC_API_KEY")) {
+      } else if (canAnthropic()) {
         provider = "anthropic";
-      } else if (envNonEmpty("OPENAI_API_KEY")) {
+      } else if (canOpenai()) {
         provider = "openai";
-      } else if (gw) {
+      } else if (canGw()) {
         provider = "vercel";
         gatewayPreferModel = "anthropic/claude-sonnet-4.6";
-      } else if (isCmdInstalled("agy")) {
+      } else if (canCli("agy")) {
         provider = "cli";
         cliCmd = "agy";
-      } else if (isCmdInstalled("claude")) {
+      } else if (canCli("claude")) {
         provider = "cli";
         cliCmd = "claude";
-      } else if (isCmdInstalled("codex")) {
+      } else if (canCli("codex")) {
         provider = "cli";
         cliCmd = "codex";
-      } else if (resolveCursorAgentCmd()) {
+      } else if (canCursorAgent()) {
         provider = "cli";
-        cliCmd = resolveCursorAgentCmd();
+        cliCmd = canCursorAgent();
         log.warn("Running in Cursor, but fell back to the Cursor Agent CLI for review.");
         log.info("This review is not a pure adversarial review (same provider). To minimize bias, we will execute it in a fresh, isolated context window.");
       } else {
@@ -528,26 +721,26 @@ export function configureLLM(args) {
       }
     } else {
       // Default auto-detection order (Anthropic > Gemini > OpenAI > Gateway > Local CLIs)
-      if (envNonEmpty("ANTHROPIC_API_KEY")) {
+      if (canAnthropic()) {
         provider = "anthropic";
-      } else if (envNonEmpty("GEMINI_API_KEY")) {
+      } else if (canGemini()) {
         provider = "gemini";
-      } else if (envNonEmpty("OPENAI_API_KEY")) {
+      } else if (canOpenai()) {
         provider = "openai";
-      } else if (gw) {
+      } else if (canGw()) {
         provider = "vercel";
-      } else if (isCmdInstalled("claude")) {
+      } else if (canCli("claude")) {
         provider = "cli";
         cliCmd = "claude";
-      } else if (isCmdInstalled("codex")) {
+      } else if (canCli("codex")) {
         provider = "cli";
         cliCmd = "codex";
-      } else if (isCmdInstalled("agy")) {
+      } else if (canCli("agy")) {
         provider = "cli";
         cliCmd = "agy";
-      } else if (resolveCursorAgentCmd()) {
+      } else if (canCursorAgent()) {
         provider = "cli";
-        cliCmd = resolveCursorAgentCmd();
+        cliCmd = canCursorAgent();
       } else {
         throw new Error(NO_LLM_CONFIG_MSG);
       }
@@ -561,7 +754,7 @@ export function configureLLM(args) {
       if (provider === "cursor") {
         cliCmd = resolveCursorAgentCmd();
       } else {
-        cliCmd = isCmdInstalled(provider) ? provider : null;
+        cliCmd = isTrustedCliInstalled(provider) ? provider : null;
       }
       if (!cliCmd) {
         throw new Error(
@@ -574,7 +767,7 @@ export function configureLLM(args) {
     } else {
       const knownApis = ["gemini", "openai", "anthropic", "vercel"];
       if (!knownApis.includes(provider)) {
-        if (isCmdInstalled(provider)) {
+        if (isTrustedCliInstalled(provider)) {
           cliCmd = provider;
           provider = "cli";
         } else {
@@ -627,19 +820,27 @@ export function configureLLM(args) {
   }
 
   let model = args.model;
+  // Model precedence: --model flag > diversity choice (gatewayPreferModel, vercel
+  // only) > user-pinned config default > hardcoded strong-tier default. The
+  // diversity choice stays supreme so a config pin can never reintroduce the
+  // builder's own family inside a builder IDE.
+  const cfgModel = configuredModelFor(args.config, provider, cliCmd);
   if (!model && provider !== "cli") {
     // Gate quality tracks model tier — default to the strong tier of each
     // provider, not the cheap one. Override with --model for cost control.
     // Gateway models use provider/model ids.
     if (provider === "gemini") {
-      model = "gemini-2.5-pro";
+      model = cfgModel || "gemini-2.5-pro";
     } else if (provider === "openai") {
-      model = "gpt-5";
+      model = cfgModel || "gpt-5";
     } else if (provider === "anthropic") {
-      model = "claude-sonnet-4-6";
+      model = cfgModel || "claude-sonnet-4-6";
     } else if (provider === "vercel") {
-      model = gatewayPreferModel || "anthropic/claude-sonnet-4.6";
+      model = gatewayPreferModel || cfgModel || "anthropic/claude-sonnet-4.6";
     }
+  } else if (!model && provider === "cli" && cfgModel) {
+    // A local CLI has no hardcoded default model; honor a config pin if present.
+    model = cfgModel;
   }
 
   // Resolve custom headers
@@ -671,7 +872,24 @@ export function configureLLM(args) {
 
   const allowUnsandboxedCli = !!args.allowUnsandboxedCli;
 
-  return { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli, stream: !!args.stream };
+  // When the provider was auto-detected, hand back the concrete resolution so the
+  // CLI can persist it to the global config cache and skip the detection ladder on
+  // subsequent runs. `_autoResolution` is intentionally absent for explicit
+  // providers (incl. the --providers fan-out), which must never be cached.
+  const result = { provider, model, apiKey, cliCmd, apiBase, customHeaders, timeoutMs, allowUnsandboxedCli, stream: !!args.stream, _fromCache: fromCache };
+  if (autoDetected) {
+    result._autoResolution = {
+      provider,
+      cliCmd: cliCmd || null,
+      // Record the canonical absolute path a CLI resolved to, so reuse can verify
+      // the identical binary still resolves (PATH-hijack / binary-swap defense).
+      cliPath: provider === "cli" ? resolvedCliPath(cliCmd) : null,
+      family: familyForResolution(provider, cliCmd),
+      model: model || null,
+      gatewayPreferModel: gatewayPreferModel || null
+    };
+  }
+  return result;
 }
 
 // ─── Multi-provider selection (--providers) ─────────────────────────────────
@@ -750,7 +968,7 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
 
   // Explicit local-CLI token: resolve to that CLI only, never the family API.
   if (CLI_ONLY_TOKENS.has(id)) {
-    return isCmdInstalled(id) ? build(id) : { id, family, config: null };
+    return isTrustedCliInstalled(id) ? build(id) : { id, family, config: null };
   }
 
   if (family) {
@@ -780,7 +998,7 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
           };
         }
       }
-      if (cand.kind === "cli" && isCmdInstalled(cand.cliCmd)) {
+      if (cand.kind === "cli" && isTrustedCliInstalled(cand.cliCmd)) {
         return build(cand.cliCmd);
       }
     }
@@ -798,7 +1016,7 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
     };
   }
   // Unknown token: treat as a raw local CLI command if installed.
-  if (isCmdInstalled(id)) return build(id);
+  if (isTrustedCliInstalled(id)) return build(id);
   return { id, family: null, config: null };
 }
 
@@ -809,7 +1027,7 @@ const FAMILY_CLI = { openai: "codex", anthropic: "claude", gemini: "agy" };
 // Return a CLI provider entry for `family` if its local CLI is installed, else null.
 export function cliFallbackForFamily(family, args = {}) {
   const cliCmd = FAMILY_CLI[family];
-  if (cliCmd && isCmdInstalled(cliCmd)) {
+  if (cliCmd && isTrustedCliInstalled(cliCmd)) {
     return { id: cliCmd, family, config: { ...configureLLM({ ...args, provider: cliCmd, providers: undefined, apiKey: null }), id: cliCmd } };
   }
   return null;
@@ -1091,7 +1309,11 @@ export async function llmCall(config, prompt, systemInstruction = "", schema = n
       const isTimeout = err.name === "AbortError";
       const errorMsg = isTimeout ? `request timed out after ${(timeoutMs ?? DEFAULT_TIMEOUT_MS) / 1000}s` : err.message;
       if (!isRetryable(err)) {
-        throw new Error(errorMsg);
+        // Preserve the HTTP status so the caller can classify an auth failure
+        // (401/403) and invalidate a stale cache-sourced resolution (T21).
+        const rethrown = new Error(errorMsg);
+        if (typeof err.status === "number") rethrown.status = err.status;
+        throw rethrown;
       }
       retries--;
       if (retries === 0) throw new Error(`LLM call failed: ${errorMsg}`);

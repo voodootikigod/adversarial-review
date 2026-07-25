@@ -268,6 +268,71 @@ the strong tier of each provider — gate quality tracks model tier; downgrade w
 No key and no CLI agent? Use `--prompt-only` to emit the prompt and feed it to a model
 yourself.
 
+### Global config & resolution caching
+
+Running the review repeatedly (a batch, a CI matrix, a loop) shouldn't re-walk the
+detection ladder — re-probing every CLI on `PATH` — each time. On the first auto-detect
+the resolved provider is cached in a **global** config file and reused on later runs:
+
+```
+$ADVERSARIAL_REVIEW_CONFIG                              # explicit override, else…
+$XDG_CONFIG_HOME/adversarial-review/config.json         # else…
+~/.config/adversarial-review/config.json
+```
+
+```json
+{
+  "defaults": {
+    "models": { "gemini": "gemini-2.5-pro", "openai": "gpt-5", "cli:agy": "gemini-3.1-pro-high" }
+  },
+  "cache": {
+    "default": { "provider": "cli", "cliCmd": "agy", "family": "gemini", "model": null }
+  }
+}
+```
+
+This is **strict JSON** — no comments, no trailing commas (a syntax error makes the
+whole file ignored, though never overwritten). `defaults.models` pins the model per
+provider (precedence `--model` > pin > built-in default); a local CLI is keyed as
+`cli:<cmd>`. `cache` is auto-written, keyed on the builder context
+(claudecode/cursor/antigravity/default); its `family` is advisory — the diversity guard
+recomputes it from `provider`/`cliCmd`, so editing it by hand can't weaken the review.
+
+Reuse is **safe by construction**, not blind trust:
+
+- **Re-validated every run.** A cached CLI must still be on `PATH`; a cached API provider
+  must still have its key. Any miss falls through to a full re-detection (one `PATH`
+  stat / env read — far cheaper than the ladder). This is the "unless the right path
+  doesn't work, reprobe" fallback. A cached **CLI** additionally defers to any API/gateway
+  provider that outranks local CLIs in the current context, so a stale CLI name can't
+  shadow a safe API key that became available since the resolution was cached.
+- **Diversity-preserving.** The cache is keyed on the builder context, so a resolution
+  made inside Claude Code can never be served to a Cursor or plain-shell run, and a
+  resolution is never reused if its family is the builder's own family — the review stays
+  adversarial.
+- **No repository-local reviewer binary.** A single trusted resolver is used by fresh
+  detection, cache reuse, and the spawn itself: it canonicalizes the executable (resolving
+  symlinks) and refuses any CLI that resolves inside the working tree — so a repo shipping a
+  `node_modules/.bin/claude` shim (npm/npx put that dir on `PATH`) can be selected or
+  executed by none of them. A cached CLI also records its canonical path and must still
+  resolve to it, so a swapped/shadowed binary isn't reused.
+- **Config can't come from the repo.** The trust root is the whole **git worktree** (not
+  just the cwd, so a repo-root config is refused even from a nested package). A config path
+  is honored only when it is **absolute** *and* **outside** the worktree (symlinks resolved).
+  An explicit `ADVERSARIAL_REVIEW_CONFIG` that is relative or inside the tree **disables**
+  config (no read, no write) rather than silently falling back to your personal `~/.config`;
+  a relative `XDG_CONFIG_HOME` falls back to the home default. A repository you review can't
+  supply model pins or cache entries.
+- **Cached only after success — everywhere.** A resolution is persisted only after a review
+  completes successfully (in normal *and* `--loop` modes); a cache-sourced provider that
+  fails authentication (e.g. a revoked key still in the env) is invalidated and re-detected
+  once with that provider excluded, so a stale entry can't stick.
+- **Concurrency-safe.** Cache writes reread-and-merge under a lock, so parallel batch/matrix
+  runs sharing one config don't clobber each other's entries or a model-pin edit.
+
+`defaults.models` is yours to author; `cache` is written automatically after the first
+successful run (silently). Delete the file to force a fresh detection.
+
 ## Multi-provider review (`--providers`)
 
 `--passes` samples **one** model N times; `--providers` fans the **same** review out to

@@ -106,7 +106,7 @@ function runLoopCli(args, { mocks = {}, dirty = true } = {}) {
     const r = spawnSync(process.execPath, [cli, ...args], {
       cwd: repoDir,
       encoding: "utf8",
-      env: { HOME: process.env.HOME, PATH }
+      env: { HOME: process.env.HOME, PATH, ADVERSARIAL_REVIEW_CONFIG: path.join(repoDir, "adv-config.json") }
     });
     return { status: r.status, stdout: r.stdout || "", stderr: r.stderr || "" };
   } finally {

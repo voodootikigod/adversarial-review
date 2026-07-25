@@ -132,7 +132,9 @@ function runBranchLoopCli(args, { mocks = {}, dirty = false, fixer = "myfixer", 
     const r = spawnSync(process.execPath, [cli, ...args, "--loop-fixer", fixer], {
       cwd: repoDir,
       encoding: "utf8",
-      env: { HOME: process.env.HOME, PATH }
+      // Isolate the global config OUTSIDE the reviewed repo (cwd=repoDir) so it's
+      // hermetic AND not rejected by the repo-containment guard (T23).
+      env: { HOME: process.env.HOME, PATH, ADVERSARIAL_REVIEW_CONFIG: path.join(mocksDir, "adv-config.json") }
     });
     const baseShaAfter = git(["rev-parse", "main"]).stdout.trim();
     const headAfter = git(["rev-parse", "HEAD"]).stdout.trim();

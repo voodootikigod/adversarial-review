@@ -46,7 +46,11 @@ function runCli(args, { mocks = {}, env = {}, afterRun } = {}) {
     const r = spawnSync(process.execPath, [cli, ...args], {
       cwd: repoDir,
       encoding: "utf8",
-      env: { HOME: process.env.HOME, PATH, ...env }
+      // Isolate the global config to a dir OUTSIDE the reviewed repo (cwd=repoDir)
+      // so the CLI never touches the developer's real ~/.config AND the config
+      // isn't rejected by the repo-containment guard (T23). mocksDir is a sibling
+      // temp dir, not inside repoDir.
+      env: { HOME: process.env.HOME, PATH, ...env, ADVERSARIAL_REVIEW_CONFIG: path.join(mocksDir, "adv-config.json") }
     });
     const out = { status: r.status, stdout: r.stdout || "", stderr: r.stderr || "" };
     if (afterRun) afterRun(repoDir, out);

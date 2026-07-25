@@ -4,6 +4,8 @@ import { parseArgs, log, HELP_TEXT } from "../src/utils.js";
 import { collectReviewContext } from "../src/git-context.js";
 import { collectArtifactContext } from "../src/artifact-context.js";
 import { configureLLM, selectProviders, underSatisfiedNotice } from "../src/llm.js";
+import { loadConfig, defaultConfigPath } from "../src/config-store.js";
+import { persistAutoResolution, withProviderFallback } from "../src/resolution-lifecycle.js";
 import { scanForSecrets } from "../src/secrets.js";
 import { toLedgerEntries, appendLedger } from "../src/findings-ledger.js";
 import {
@@ -185,12 +187,62 @@ function recordFindings(args, result, assessments) {
   }
 }
 
+// Fail-closed guard: an API provider cannot inspect a diff too large to inline.
+// Returns an Error (to throw) when the given config would perform a summary-only
+// API review without --allow-summary-review, else null. Checked for the config
+// ACTUALLY USED — including one substituted by the provider fallback — so a
+// cached-CLI→API fallback can't silently downgrade to a summary-only approval.
+function summaryOnlyGuardError(config, context, args) {
+  if (!context.includeDiff && config.provider !== "cli" && !args.allowSummaryReview) {
+    return new Error(
+      "The target diff is too large to inline, and API providers cannot inspect the repository themselves.\n" +
+        "Use a local CLI provider, raise --max-files/--max-bytes, narrow the review scope, or pass --allow-summary-review to explicitly accept a summary-only API review."
+    );
+  }
+  return null;
+}
+
+// One review pass (+ optional --verify refute pass). Throws on provider failure
+// or when the resolved provider can't legitimately review this diff.
+async function runOneReview(config, context, prompt, args) {
+  const guard = summaryOnlyGuardError(config, context, args);
+  if (guard) throw guard;
+  let result = await runReview(config, prompt, { passes: args.passes });
+  if (args.verify && result.findings.length) {
+    log.step(`Verification pass: trying to refute ${result.findings.length} finding(s)...`);
+    const verified = await verifyFindings(config, context, result);
+    result = verified.result;
+    if (verified.dropped) {
+      log.info(`Verification dropped ${verified.dropped} finding(s) that could not be defended.`);
+    }
+  }
+  return result;
+}
+
 async function main() {
   const args = parseArgs(process.argv);
 
   if (args.help) {
     console.log(HELP_TEXT);
     process.exit(0);
+  }
+
+  // Load the global config (model pins + resolution cache) once and thread it
+  // through provider resolution. A missing/corrupt config yields an empty object
+  // and changes nothing. Only an absolute config path is honored (default:
+  // home/XDG); see the trust-boundary note and tracked gaps in config-store.js.
+  args.config = loadConfig();
+  if (args.config.malformed) {
+    log.warn(
+      `Config at ${defaultConfigPath()} is unreadable or not valid JSON — ignoring it ` +
+        `(and NOT overwriting it, so your model pins are preserved). ` +
+        `JSON does not allow comments or trailing commas; fix the syntax to restore it.`
+    );
+  } else if (args.config.readOnly) {
+    log.warn(
+      `Config at ${defaultConfigPath()} was written by a newer version — using it read-only ` +
+        `(not rewriting it, so its newer settings are preserved).`
+    );
   }
 
   if (args.errors.length) {
@@ -285,7 +337,7 @@ async function main() {
     return;
   }
 
-  // 3. Configure the LLM and run the review.
+  // 3. Configure the LLM.
   let config;
   try {
     config = configureLLM(args);
@@ -294,26 +346,11 @@ async function main() {
     process.exit(1);
   }
 
-  if (!context.includeDiff && config.provider !== "cli" && !args.allowSummaryReview) {
-    log.error(
-      "The target diff is too large to inline, and API providers cannot inspect the repository themselves.\n" +
-        "Use a local CLI provider, raise --max-files/--max-bytes, narrow the review scope, or pass --allow-summary-review to explicitly accept a summary-only API review."
-    );
-    process.exit(1);
-  }
-
   let result;
   try {
-    result = await runReview(config, prompt, { passes: args.passes });
-
-    if (args.verify && result.findings.length) {
-      log.step(`Verification pass: trying to refute ${result.findings.length} finding(s)...`);
-      const verified = await verifyFindings(config, context, result);
-      result = verified.result;
-      if (verified.dropped) {
-        log.info(`Verification dropped ${verified.dropped} finding(s) that could not be defended.`);
-      }
-    }
+    // The summary-only fail-closed guard is enforced inside runOneReview for the
+    // config actually used, so a cached-CLI→API fallback is guarded too (F2).
+    ({ result, config } = await withProviderFallback(args, config, (cfg) => runOneReview(cfg, context, prompt, args)));
   } catch (err) {
     log.error(err.message);
     // A failed local-CLI run often leaves a resumable session behind, and losing
@@ -328,6 +365,11 @@ async function main() {
     if (hint) log.info(`Resume here: ${hint.command}`);
     process.exit(1);
   }
+
+  // Persist the resolution ONLY after a fully successful review (T21) — a
+  // resolution that never produced a review must not be cached. Best-effort;
+  // records the provider that actually succeeded (post-fallback if one ran).
+  persistAutoResolution(config);
 
   // 4. Ground findings against what we know for certain, then derive the
   // verdict deterministically from the surviving findings.
