@@ -324,9 +324,10 @@ Reuse is **safe by construction**, not blind trust:
   a relative `XDG_CONFIG_HOME` falls back to the home default. A repository you review can't
   supply model pins or cache entries.
 - **Cached only after success — everywhere.** A resolution is persisted only after a review
-  completes successfully (in normal *and* `--loop` modes); a cache-sourced provider that
-  fails authentication (e.g. a revoked key still in the env) is invalidated and re-detected
-  once with that provider excluded, so a stale entry can't stick.
+  completes successfully (in normal *and* `--loop` modes, per round); a cache-sourced
+  provider that fails because its resolution is dead — a revoked/expired credential or a
+  retired/invalid model — is invalidated and re-detected once with that provider excluded,
+  so a stale entry can't stick. Transient failures (timeouts, 5xx) keep the cache.
 - **Concurrency-safe.** Cache writes reread-and-merge under a lock, so parallel batch/matrix
   runs sharing one config don't clobber each other's entries or a model-pin edit.
 

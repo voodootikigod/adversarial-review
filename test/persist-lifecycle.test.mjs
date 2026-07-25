@@ -33,6 +33,9 @@ function runCli(args, { mocks = {}, seedConfig = null, env = {} } = {}) {
       } else if (kind === "AUTHFAIL") {
         // Simulate a logged-out CLI session: non-zero exit + an auth-ish stderr.
         body = `#!/bin/sh\ncat >/dev/null\necho 'error: not logged in; run: login' >&2\nexit 1\n`;
+      } else if (kind === "MODELFAIL") {
+        // Simulate a retired/invalid model: non-zero exit + a model-error stderr.
+        body = `#!/bin/sh\ncat >/dev/null\necho 'error: the model does not exist or is retired' >&2\nexit 1\n`;
       } else {
         body = `#!/bin/sh\ncat >/dev/null\necho 'not json at all'\n`; // BAD: parse failure
       }
@@ -134,6 +137,16 @@ test("F5: after an auth-failure fallback, loop_summary names the provider that a
   const summary = events.find((o) => o.type === "loop_summary");
   assert.ok(summary, "a loop_summary event should be emitted");
   assert.deepEqual(summary.providers, ["claude"], "summary names the recovered provider, not the failed cached one");
+});
+
+test("T24: a cache-sourced provider with a RETIRED-MODEL failure is invalidated and recovers", () => {
+  const r = runCli(BASE, {
+    mocks: { agy: "MODELFAIL", claude: "APPROVE" },
+    seedConfig: { version: 1, defaults: { models: {} }, cache: { default: { provider: "cli", cliCmd: "agy", family: "gemini" } } }
+  });
+  assert.equal(r.status, 0, `expected recovery to succeed, got ${r.status}: ${r.stderr}`);
+  assert.match(r.stderr, /re-detected/, "a retired-model failure should trigger the same recovery as auth");
+  assert.equal(r.config.cache.default.cliCmd, "claude");
 });
 
 test("AC2b: a NON-auth failure (parse error) does NOT invalidate the cache or retry", () => {
