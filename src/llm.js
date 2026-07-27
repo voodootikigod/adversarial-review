@@ -88,9 +88,14 @@ export function maxArgvPromptBytes({
 // Rounds UP so a sub-second budget still names a positive duration; both the flag
 // we forward to the agent and the message we report on overrun read it from here,
 // so the two can never disagree about what the budget was.
+// A numeric string is coerced rather than rejected: every way this can be wrong
+// fails SILENTLY — agy drops back to its own 5m default while the overrun message
+// claims no budget was set — so a config or env value that arrives as "600000"
+// must not quietly discard the user's timeout.
 export function budgetSeconds(timeoutMs) {
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return null;
-  return Math.max(1, Math.ceil(timeoutMs / 1000));
+  const ms = typeof timeoutMs === "string" ? Number(timeoutMs.trim()) : timeoutMs;
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  return Math.max(1, Math.ceil(ms / 1000));
 }
 
 // Single wording for "the review ran out of time", whether the watchdog killed the

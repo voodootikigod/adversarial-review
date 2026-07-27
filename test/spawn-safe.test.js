@@ -255,6 +255,63 @@ test("T12: a Windows batch shim REFUSES extra argv rather than building an unsaf
   );
 });
 
+test("the Windows interpreter is never a bare name, whatever ComSpec says", () => {
+  // Windows resolves an unqualified executable name against the CURRENT
+  // DIRECTORY before the system directories, and the current directory is the
+  // repository under review. A bare "cmd.exe" would run a repo-supplied
+  // cmd.exe as the reviewer, BEFORE the trusted CLI it was meant to launch.
+  const shim = "C:\\npm\\claude.cmd";
+  const flags = ["-p", "-"];
+  const opts = { platform: "win32", argsContainUntrusted: false };
+
+  // ComSpec absent entirely — the case a sanitized launcher or CI env produces.
+  const bare = buildSpawnTarget(shim, flags, { ...opts, env: {} });
+  assert.ok(path.win32.isAbsolute(bare.command), `interpreter must be absolute, got ${bare.command}`);
+  assert.match(bare.command, /System32[\\/]cmd\.exe$/i);
+
+  // SystemRoot is honoured for the system path.
+  const rooted = buildSpawnTarget(shim, flags, { ...opts, env: { SystemRoot: "D:\\Win" } });
+  assert.equal(rooted.command, path.win32.join("D:\\Win", "System32", "cmd.exe"));
+
+  // A RELATIVE ComSpec is exactly the hijack vector; it must be ignored.
+  for (const bad of ["cmd.exe", ".\\cmd.exe", "tools\\cmd.exe"]) {
+    const t = buildSpawnTarget(shim, flags, { ...opts, env: { ComSpec: bad } });
+    assert.ok(path.win32.isAbsolute(t.command), `relative ComSpec ${bad} must not be used`);
+    assert.match(t.command, /System32[\\/]cmd\.exe$/i);
+  }
+
+  // An absolute ComSpec outside the trust root is legitimate and honoured.
+  // isInsideRoot is injected: the real check resolves a Windows path against the
+  // POSIX cwd on this host, which would place it inside the repo spuriously.
+  const custom = buildSpawnTarget(shim, flags, {
+    ...opts, env: { ComSpec: "C:\\Windows\\SysWOW64\\cmd.exe" }, isInsideRoot: () => false
+  });
+  assert.equal(custom.command, "C:\\Windows\\SysWOW64\\cmd.exe");
+});
+
+test("an absolute ComSpec INSIDE the reviewed repository is refused", () => {
+  // A repo cannot be allowed to point the interpreter at itself just by being
+  // absolute — trust is about location, not path shape.
+  const insideRepo = "C:\\repo\\node_modules\\.bin\\cmd.exe";
+  const t = buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "-"], {
+    platform: "win32",
+    env: { ComSpec: insideRepo, SystemRoot: "C:\\Windows" },
+    argsContainUntrusted: false,
+    isInsideRoot: (p) => p === insideRepo
+  });
+  assert.equal(t.command, "C:\\Windows\\System32\\cmd.exe");
+
+  // And if the trust root cannot be established, the value is treated as
+  // untrusted rather than waved through.
+  const throwing = buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "-"], {
+    platform: "win32",
+    env: { ComSpec: "C:\\anywhere\\cmd.exe", SystemRoot: "C:\\Windows" },
+    argsContainUntrusted: false,
+    isInsideRoot: () => { throw new Error("no trust root"); }
+  });
+  assert.equal(throwing.command, "C:\\Windows\\System32\\cmd.exe");
+});
+
 test("T12: every supported CLI's PRIMARY invocation still works on a Windows shim", () => {
   // Regression: refusing all arguments rejected our own constant flags too, so
   // every npm-installed CLI on Windows failed before spawn — strictly worse

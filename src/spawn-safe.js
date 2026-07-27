@@ -16,6 +16,7 @@
 import { spawnSync } from "child_process";
 import fs from "fs";
 import path from "path";
+import { isInsideTrustRoot } from "./trust-root.js";
 
 // Only bare command tokens are resolvable. A path separator or shell
 // metacharacter reaching a spawn site is a bug in the caller, not a lookup to
@@ -74,8 +75,37 @@ export function resolveCommand(cmd, { platform = process.platform, env = process
 // untrusted case is refused, so our own flags still reach npm-installed CLIs.
 //
 // `/d` skips AutoRun registry commands, `/s` fixes quote handling, `/c` runs and
-// exits. ComSpec is the documented interpreter location; SHELL is never used.
+// exits. The interpreter itself is chosen by interpreterPath below, which never
+// returns a bare name; SHELL is never used.
 const BATCH_EXTENSIONS = new Set([".cmd", ".bat"]);
+
+// The command interpreter must be an ABSOLUTE, trusted path, for exactly the
+// reason taskkillPath below is: Windows resolves an unqualified executable name
+// against the CURRENT DIRECTORY before the system directories, and our current
+// directory is the untrusted repository under review. A bare "cmd.exe" would let
+// a repo that ships cmd.exe run as the reviewer — and it would run BEFORE the
+// trusted CLI it was supposed to launch, so resolving the CLI safely buys
+// nothing. ComSpec is honoured only when it is itself absolute and outside the
+// trust root; anything else falls back to the System32 path.
+// Reached only from the win32 branch, so Windows path semantics apply even when
+// this runs on a POSIX host under the `platform` test seam — path.join would
+// otherwise emit "C:\Windows/System32/cmd.exe", which path.isAbsolute rejects.
+export function interpreterPath(env = process.env, { isInsideRoot = isInsideTrustRoot } = {}) {
+  const configured = env.ComSpec || env.COMSPEC;
+  if (configured && path.win32.isAbsolute(configured)) {
+    let inside = false;
+    try {
+      inside = isInsideRoot(configured);
+    } catch {
+      // A trust root that cannot be established is not a licence to trust the
+      // value — treat it as untrusted and use the system interpreter.
+      inside = true;
+    }
+    if (!inside) return configured;
+  }
+  const root = env.SystemRoot || env.SYSTEMROOT || "C:\\Windows";
+  return path.win32.join(root, "System32", "cmd.exe");
+}
 
 export class WindowsArgvUnsafeError extends Error {
   constructor(message) {
@@ -93,7 +123,9 @@ const CMD_METACHARACTERS = /[&|<>^"%!()]/;
 export function buildSpawnTarget(
   resolvedPath,
   args = [],
-  { platform = process.platform, env = process.env, argsContainUntrusted = true } = {}
+  // isInsideRoot is a seam so the ComSpec trust decision is testable without a
+  // real Windows repository; production callers pass none of these.
+  { platform = process.platform, env = process.env, argsContainUntrusted = true, isInsideRoot = isInsideTrustRoot } = {}
 ) {
   if (platform === "win32" && BATCH_EXTENSIONS.has(path.extname(resolvedPath).toLowerCase())) {
     // Refuse only when a caller wants to put ATTACKER-INFLUENCEABLE data on the
@@ -117,8 +149,11 @@ export function buildSpawnTarget(
         `"${resolvedPath}": it contains cmd.exe metacharacters.`
       );
     }
-    const comspec = env.ComSpec || env.COMSPEC || "cmd.exe";
-    return { command: comspec, args: ["/d", "/s", "/c", resolvedPath, ...args], viaInterpreter: true };
+    return {
+      command: interpreterPath(env, { isInsideRoot }),
+      args: ["/d", "/s", "/c", resolvedPath, ...args],
+      viaInterpreter: true
+    };
   }
   return { command: resolvedPath, args, viaInterpreter: false };
 }

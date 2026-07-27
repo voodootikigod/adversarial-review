@@ -316,11 +316,20 @@ test("timeoutExceededMessage never renders a NaN or zero budget", () => {
   );
   // No budget known: cliPrintTimeoutArgs forwarded nothing, so the agent's OWN
   // default is what fired — say so rather than printing "NaNs" or "0s".
-  for (const bad of [undefined, null, NaN, 0, -1, "900"]) {
+  for (const bad of [undefined, null, NaN, 0, -1, "", "abc", {}]) {
     const msg = timeoutExceededMessage("codex", bad);
     assert.doesNotMatch(msg, /NaN|--timeout 0s|--timeout -/, `degenerate budget ${String(bad)} leaked into: ${msg}`);
     assert.match(msg, /timed out with no --timeout budget set/);
   }
+  // A numeric STRING is a budget too. Rejecting it would silently drop the
+  // user's timeout: agy would revert to its 5m default while this message
+  // insisted no budget was set.
+  assert.equal(budgetSeconds("600000"), 600);
+  assert.deepEqual(cliPrintTimeoutArgs("agy", "600000"), ["--print-timeout", "600s"]);
+  assert.equal(
+    timeoutExceededMessage("codex", " 900000 "),
+    "Failed to execute codex: exceeded --timeout 900s; retry with --timeout <larger>"
+  );
   // A sub-second budget IS a budget: it must report the same duration that was
   // forwarded to the agent (1s), not claim none was set.
   assert.equal(budgetSeconds(500), 1);
