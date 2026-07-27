@@ -5,6 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { budgetSeconds, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
+import { buildSpawnTarget } from "../src/spawn-safe.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
   const input = '{"verdict": "approve", "summary": "good"}';
@@ -960,7 +961,7 @@ test("T12 AC1: no spawn site derives `shell` from the platform or the environmen
   // would have silently stopped covering the thing it guards.
   const modules = ["../src/llm.js", "../src/exec-watchdog.js", "../src/spawn-safe.js"];
   let explicitFalse = 0;
-  let legacyWindowsShell = 0;
+  let shellTrue = 0;
 
   for (const mod of modules) {
     const raw = fs.readFileSync(new URL(mod, import.meta.url), "utf8");
@@ -974,24 +975,58 @@ test("T12 AC1: no spawn site derives `shell` from the platform or the environmen
 
     for (const line of code.split("\n").filter((l) => /^\s*shell:/.test(l))) {
       if (/shell:\s*false/.test(line)) { explicitFalse++; continue; }
-      // ONE deliberate exemption: the win32 legacy branch in llm.js keeps main's
-      // execFileSync(shell:true) behaviour verbatim. Four review rounds found
-      // four different defects in this branch's attempts to replace it, none
-      // verifiable because CI is Ubuntu-only. Shipping the known-unsafe status
-      // quo beat shipping a fifth guess. Owned by T19.
-      assert.match(line, /shell:\s*true/, `${mod}: unexpected shell option ${line.trim()}`);
-      assert.equal(mod, "../src/llm.js", "the only shell:true exemption lives in llm.js");
-      legacyWindowsShell++;
+      shellTrue++;
     }
-    // The ORIGINAL defect was a shell selected by an EXPRESSION over platform or
-    // env. That must still never appear: the exemption above is a literal inside
-    // an explicit, commented win32 branch, not a computed value.
+    // The original defect was a shell selected by an EXPRESSION over platform or
+    // env. Neither that nor a literal `shell: true` may reappear: a Windows .cmd
+    // shim reaches its interpreter through buildSpawnTarget, by resolved absolute
+    // path, with untrusted argv refused — no spawn site needs a shell.
     assert.ok(!/shell:\s*process\.(platform|env)/.test(code), `${mod}: shell must never be derived from platform/env`);
     assert.ok(!/process\.env\.SHELL/.test(code), `${mod}: SHELL must not select a shell`);
   }
 
   assert.ok(explicitFalse > 0, "at least one spawn site must set shell:false explicitly");
-  assert.equal(legacyWindowsShell, 1, "exactly one documented win32 exemption — no more may accumulate");
+  assert.equal(shellTrue, 0, "no spawn site may enable a shell — cmd.exe would re-parse argv");
+});
+
+test("a Windows .cmd shim never receives the reviewed prompt as an argument", () => {
+  // The agy provider delivers the prompt via argv (it has no stdin sentinel). On
+  // Windows that argv would reach cmd.exe through the shim interpreter, which
+  // re-parses it — so a diff containing cmd.exe metacharacters could execute as
+  // commands. This must fail closed rather than spawn.
+  const prompt = 'review this & calc.exe';
+  assert.throws(
+    () => buildSpawnTarget("C:\\npm\\agy.cmd", ["--mode", "plan", "-p", prompt], {
+      platform: "win32", env: {}, argsContainUntrusted: true
+    }),
+    (err) => {
+      assert.equal(err.code, "EWINARGV");
+      assert.doesNotMatch(err.message, /T19|tracked in/i, "error must name a remedy, not a ticket");
+      assert.match(err.message, /stdin|API provider|native executable/);
+      return true;
+    }
+  );
+
+  // A native executable has no interpreter in the path at all, so the same argv
+  // is spawned directly — no cmd.exe, nothing to re-parse.
+  const direct = buildSpawnTarget("C:\\tools\\agy.exe", ["-p", prompt], {
+    platform: "win32", env: {}, argsContainUntrusted: true
+  });
+  assert.equal(direct.viaInterpreter, false);
+  assert.equal(direct.command, "C:\\tools\\agy.exe");
+  assert.deepEqual(direct.args, ["-p", prompt]);
+});
+
+test("execCli has no platform-branched spawn: every OS takes the watchdog path", () => {
+  // Regression guard for the bypass this replaced — execCli used to short-circuit
+  // win32 into execFileSync(shell:true), skipping buildSpawnTarget entirely, so
+  // the untrusted-argv refusal and the resolved-path routing never ran there.
+  const raw = fs.readFileSync(new URL("../src/llm.js", import.meta.url), "utf8");
+  const code = raw.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  const execCliBody = code.slice(code.indexOf("async function execCli("));
+  const body = execCliBody.slice(0, execCliBody.indexOf("\n}"));
+  assert.ok(!/process\.platform/.test(body), "execCli must not branch on platform when spawning");
+  assert.ok(/spawnWithWatchdog\(/.test(body), "execCli must spawn through spawnWithWatchdog");
 });
 
 test("T12: isCmdInstalled still answers correctly via resolveCommand", () => {

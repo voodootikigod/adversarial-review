@@ -62,23 +62,16 @@ export function resolveCommand(cmd, { platform = process.platform, env = process
 // codex/claude/agy exactly that way, so the shim must be routed through
 // cmd.exe.
 //
-// IMPORTANT — THIS IS NOT ARGUMENT-SAFE, AND DOES NOT CLAIM TO BE.
-// An earlier revision asserted that passing an explicit argv array (rather than
-// shell:true) restored metacharacter safety. That is false: Node serializes
-// these args into a command line and cmd.exe re-parses everything after /c
-// under its own quoting rules. Using shell:false avoids Node's string-building,
-// not cmd.exe's parsing.
+// This interpreter route is NOT argument-safe. shell:false stops Node from
+// building a command string, but cmd.exe still re-parses everything after /c
+// under its own quoting rules, so an explicit argv array does not restore
+// metacharacter safety.
 //
-// So callers MUST NOT pass attacker-influenceable data as argv on this path.
-// The distinction is authorship, not quantity: our own invocation flags are
-// constants authored in this repository, while the reviewed prompt is untrusted
-// and travels over stdin on the primary path. Callers declare which they are
-// passing via `argsContainUntrusted`, and only the untrusted case is refused.
-//
-// An earlier revision refused ALL arguments, which rejected our own flags too
-// and broke every npm-installed CLI on Windows — worse than the unsafe
-// behaviour it replaced. Full Windows handling, including verifying any of this
-// on an actual Windows runner, is tracked in T19.
+// Callers therefore must not put attacker-influenceable data in argv on this
+// path. The distinction is authorship, not quantity: invocation flags are
+// constants authored in this repository, while the reviewed prompt is untrusted.
+// Callers declare which they are passing via `argsContainUntrusted`; only the
+// untrusted case is refused, so our own flags still reach npm-installed CLIs.
 //
 // `/d` skips AutoRun registry commands, `/s` fixes quote handling, `/c` runs and
 // exits. ComSpec is the documented interpreter location; SHELL is never used.
@@ -104,15 +97,15 @@ export function buildSpawnTarget(
 ) {
   if (platform === "win32" && BATCH_EXTENSIONS.has(path.extname(resolvedPath).toLowerCase())) {
     // Refuse only when a caller wants to put ATTACKER-INFLUENCEABLE data on the
-    // command line — that is the argv fallback, which embeds the whole prompt.
+    // command line — the argv prompt form, which embeds the whole reviewed diff.
     // Refusing every argument instead would reject our own constant flags and
-    // break every npm-installed CLI on Windows, which is worse than the unsafe
-    // behaviour it replaced.
+    // break every npm-installed CLI on Windows.
     if (argsContainUntrusted && args.length > 0) {
       throw new WindowsArgvUnsafeError(
         `Cannot safely pass untrusted arguments to the Windows batch shim "${resolvedPath}": ` +
-        `cmd.exe re-parses them and this path is not argument-safe. ` +
-        `The prompt must travel over stdin. Tracked in T19.`
+        `cmd.exe re-parses them, so the reviewed diff could execute as commands. ` +
+        `Use a provider whose prompt travels over stdin (claude, codex), an API provider, ` +
+        `or install this CLI as a native executable rather than an npm .cmd shim.`
       );
     }
     // Belt and braces: even "trusted" flags must be metacharacter-free, so a
@@ -121,7 +114,7 @@ export function buildSpawnTarget(
     if (offender !== undefined) {
       throw new WindowsArgvUnsafeError(
         `Refusing to pass argument ${JSON.stringify(offender)} to the Windows batch shim ` +
-        `"${resolvedPath}": it contains cmd.exe metacharacters. Tracked in T19.`
+        `"${resolvedPath}": it contains cmd.exe metacharacters.`
       );
     }
     const comspec = env.ComSpec || env.COMSPEC || "cmd.exe";

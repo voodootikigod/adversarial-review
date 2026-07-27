@@ -225,26 +225,17 @@ export function isTrustedCliInstalled(cmd) {
 }
 
 async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true } = {}) {
-  // SECURITY: shell:false on every platform. This previously passed
-  // `shell: process.platform === "win32"`, which handed every argument to
-  // cmd.exe for re-parsing on Windows and lost argv metacharacter safety.
+  // SECURITY: no spawn site here selects a shell. A shell was once needed on
+  // Windows so the interpreter would locate npm-installed `.cmd` shims, which are
+  // not executable images. resolveCommand performs that lookup explicitly (PATH +
+  // PATHEXT), and buildSpawnTarget routes a shim through the interpreter by its
+  // resolved absolute path, so no argument is ever handed to cmd.exe for
+  // re-parsing and no bare name is re-resolved against the current directory.
   //
-  // That flag was not gratuitous — it was how npm-installed `.cmd` shims got
-  // resolved. So it cannot simply be removed: resolveCommand performs that
-  // lookup explicitly (PATH + PATHEXT) and we spawn the resolved absolute path,
-  // which removes the only reason the shell was needed.
-  // WINDOWS IS DELIBERATELY UNCHANGED FROM main. Four successive review rounds
-  // found this branch's Windows handling wrong in a different way each time —
-  // .cmd shims are not executable images, cmd.exe re-parses argv after /c, a
-  // blanket argument refusal broke every npm-installed CLI, and a bare cmd.exe
-  // fallback is resolvable from the reviewed repository. None of it has ever
-  // executed on Windows, because CI is Ubuntu-only.
-  //
-  // Windows here keeps the exact behaviour it has in main: execFileSync with
-  // shell:true. This path is KNOWN-UNSAFE — arguments are re-parsed by cmd.exe —
-  // and remains the original defect; it is unchanged, not fixed. T19 tracks the
-  // correct Windows implementation, gated on windows-latest CI.
-  // TRUST GUARD (T22) — runs on EVERY platform, BEFORE the Windows branch. Spawn
+  // Every platform takes the same spawnWithWatchdog path below, which applies the
+  // `argsContainUntrusted` decision recorded by the caller: argv carrying the
+  // reviewed prompt is refused on a Windows shim rather than executed.
+  // TRUST GUARD — spawn
   // only a TRUSTED, canonical path: refuse to execute a CLI that resolves inside
   // the git worktree under review — npm/npx put ./node_modules/.bin on PATH, so a
   // reviewed repo could otherwise ship a shim that runs as the reviewer. Detection
@@ -263,23 +254,6 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
         `working tree (${resolved}). A review provider must not be a repository-local binary — ` +
         `install it outside the repo, or pass --provider with a trusted provider.`
     );
-  }
-
-  if (process.platform === "win32") {
-    // Windows keeps shell:true so npm-installed `.cmd` shims still run. NOTE: it
-    // still passes the BARE command (not `trusted`) to cmd.exe, which re-resolves
-    // it against the live directory — the known-unsafe re-resolution that T19
-    // tracks. The repo-local REFUSAL above now runs on Windows too, so a codex
-    // that resolveCommand itself finds inside the tree is rejected pre-spawn; the
-    // residual cmd.exe re-resolution is unchanged and remains T19's scope.
-    return execFileSync(cliCmd, args, {
-      input,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-      maxBuffer: 10 * 1024 * 1024,
-      timeout: timeoutMs,
-      shell: true
-    }).trim();
   }
 
   return spawnWithWatchdog(trusted, args, {

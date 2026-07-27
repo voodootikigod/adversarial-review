@@ -251,7 +251,7 @@ test("T12: a Windows batch shim REFUSES extra argv rather than building an unsaf
       platform: "win32",
       env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }
     }),
-    (e) => e.code === "EWINARGV" && /not argument-safe/.test(e.message)
+    (e) => e.code === "EWINARGV" && /cmd\.exe re-parses them/.test(e.message)
   );
 });
 
