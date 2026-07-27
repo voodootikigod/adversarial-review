@@ -384,6 +384,37 @@ test("cmd.exe command separators are rejected in trusted flags", () => {
   assert.equal(ok.viaInterpreter, true);
 });
 
+test("a shim PATH containing cmd.exe syntax is refused, not silently mangled", () => {
+  // The shim path lands on the command line right after /c, so it is parsed
+  // exactly like the flags are. Windows allows & ^ % ! ( ) in paths, so a global
+  // npm prefix under a username like "R&D" would otherwise split the command.
+  const base = {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    argsContainUntrusted: false,
+    isInsideRoot: () => false
+  };
+  for (const bad of [
+    "C:\\Users\\R&D\\AppData\\Roaming\\npm\\claude.cmd",
+    "C:\\Program Files (x86)\\npm\\claude.cmd",
+    "C:\\tools\\100%\\claude.cmd",
+    "C:\\tools\\a^b\\claude.cmd"
+  ]) {
+    assert.throws(
+      () => buildSpawnTarget(bad, ["-p", "-"], base),
+      (err) => {
+        assert.equal(err.code, "EWINARGV");
+        assert.match(err.message, /native executable|API provider/, "must name a remedy");
+        return true;
+      },
+      `${bad} must be refused rather than handed to cmd.exe`
+    );
+  }
+  // An ordinary path is unaffected.
+  const ok = buildSpawnTarget("C:\\Users\\dev\\AppData\\Roaming\\npm\\claude.cmd", ["-p", "-"], base);
+  assert.equal(ok.viaInterpreter, true);
+});
+
 test("T12: every supported CLI's PRIMARY invocation still works on a Windows shim", () => {
   // Regression: refusing all arguments rejected our own constant flags too, so
   // every npm-installed CLI on Windows failed before spawn — strictly worse

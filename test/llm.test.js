@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { budgetSeconds, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall } from "../src/llm.js";
+import { budgetSeconds, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 import { buildSpawnTarget } from "../src/spawn-safe.js";
 
@@ -348,6 +348,44 @@ test("the forwarded --print-timeout and the overrun message always name the same
     assert.equal(forwarded, `${budgetSeconds(ms)}s`);
     assert.match(timeoutExceededMessage('local CLI agent "agy"', ms), new RegExp(`exceeded --timeout ${budgetSeconds(ms)}s`));
   }
+});
+
+test("a numeric-string budget reaches the watchdog and the agent as the SAME number", () => {
+  // The divergence this prevents: budgetSeconds coerces "2400000" and tells agy
+  // 2400s, while the raw string reaches the watchdog, which cannot read it and
+  // substitutes its own default — killing the review early and then blaming a
+  // budget that was never enforced.
+  for (const raw of ["2400000", " 900000 ", 900 * 1000]) {
+    const ms = normalizeTimeoutMs(raw);
+    assert.equal(typeof ms, "number");
+    assert.equal(budgetSeconds(raw), Math.ceil(ms / 1000), "the agent flag must match the watchdog window");
+    assert.match(timeoutExceededMessage("codex", raw), new RegExp(`exceeded --timeout ${Math.ceil(ms / 1000)}s`));
+  }
+  for (const bad of [undefined, null, NaN, 0, -1, "", "abc", {}]) {
+    assert.equal(normalizeTimeoutMs(bad), null, `${String(bad)} is not a budget`);
+  }
+});
+
+test("an argv-prompt CLI installed as a Windows .cmd shim is not offered for review", () => {
+  // agy takes the prompt as an argument, and a .cmd shim can only be reached
+  // through cmd.exe, which re-parses it — so buildSpawnTarget refuses. Detection
+  // must skip such an install rather than pick it and fail at spawn time.
+  const shim = () => "C:\\npm\\agy.cmd";
+  const exe = () => "C:\\tools\\agy.exe";
+  assert.equal(cliUsableForReview("agy", { platform: "win32", resolve: shim }), false);
+  assert.equal(cliUsableForReview("agy", { platform: "win32", resolve: exe }), true);
+  assert.equal(cliUsableForReview("agy", { platform: "win32", resolve: () => null }), false);
+  // POSIX has no shim problem, and stdin-prompt CLIs are unaffected anywhere.
+  assert.equal(cliUsableForReview("agy", { platform: "linux", resolve: shim }), true);
+  assert.equal(cliUsableForReview("claude", { platform: "win32", resolve: () => "C:\\npm\\claude.cmd" }), true);
+  assert.equal(cliUsableForReview("codex", { platform: "win32", resolve: () => "C:\\npm\\codex.cmd" }), true);
+
+  // The explicit-selection error must distinguish "cannot work" from "not
+  // installed" and name what to do instead.
+  const msg = cliUnusableMessage("agy");
+  assert.match(msg, /\.cmd shim/);
+  assert.match(msg, /--provider claude|--provider codex/);
+  assert.doesNotMatch(msg, /not installed/);
 });
 
 test("isCliPrintTimeoutStderr recognizes agy giving up on its own wait", () => {

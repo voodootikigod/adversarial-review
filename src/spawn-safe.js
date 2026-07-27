@@ -79,6 +79,11 @@ export function resolveCommand(cmd, { platform = process.platform, env = process
 // returns a bare name; SHELL is never used.
 const BATCH_EXTENSIONS = new Set([".cmd", ".bat"]);
 
+/** Is `resolvedPath` a Windows batch shim, i.e. reachable only through cmd.exe? */
+export function isWindowsBatchShim(resolvedPath, { platform = process.platform } = {}) {
+  return platform === "win32" && BATCH_EXTENSIONS.has(path.extname(String(resolvedPath)).toLowerCase());
+}
+
 export class WindowsArgvUnsafeError extends Error {
   constructor(message) {
     super(message);
@@ -166,7 +171,7 @@ export function buildSpawnTarget(
   // real Windows repository; production callers pass none of these.
   { platform = process.platform, env = process.env, argsContainUntrusted = true, isInsideRoot = interpreterInsideTrustRoot } = {}
 ) {
-  if (platform === "win32" && BATCH_EXTENSIONS.has(path.extname(resolvedPath).toLowerCase())) {
+  if (isWindowsBatchShim(resolvedPath, { platform })) {
     // Refuse only when a caller wants to put ATTACKER-INFLUENCEABLE data on the
     // command line — the argv prompt form, which embeds the whole reviewed diff.
     // Refusing every argument instead would reject our own constant flags and
@@ -177,6 +182,19 @@ export function buildSpawnTarget(
         `cmd.exe re-parses them, so the reviewed diff could execute as commands. ` +
         `Use a provider whose prompt travels over stdin (claude, codex), an API provider, ` +
         `or install this CLI as a native executable rather than an npm .cmd shim.`
+      );
+    }
+    // The SHIM PATH itself lands on the command line after /c, so it is subject
+    // to exactly the same parsing as the flags. Windows permits &, ^, %, !, and
+    // parentheses in paths, so an npm prefix under a username like "R&D" would
+    // otherwise reach cmd.exe unchecked and split the command. Checked first: a
+    // bad path is a compatibility problem with a different remedy than a bad flag.
+    if (CMD_METACHARACTERS.test(resolvedPath)) {
+      throw new WindowsArgvUnsafeError(
+        `Cannot launch the Windows batch shim "${resolvedPath}" through cmd.exe: its path ` +
+        `contains characters cmd.exe treats as command syntax. Install this CLI under a path ` +
+        `without & ^ % ! ( ) or control characters, install it as a native executable rather ` +
+        `than an npm .cmd shim, or use an API provider.`
       );
     }
     // Belt and braces: even "trusted" flags must be metacharacter-free, so a

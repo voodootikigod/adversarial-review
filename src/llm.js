@@ -1,5 +1,5 @@
 import { execFileSync } from "child_process";
-import { resolveCommand } from "./spawn-safe.js";
+import { resolveCommand, isWindowsBatchShim } from "./spawn-safe.js";
 import { spawnWithWatchdog } from "./exec-watchdog.js";
 import fs from "fs";
 import os from "os";
@@ -84,18 +84,28 @@ export function maxArgvPromptBytes({
   return Math.max(0, totalBudget);
 }
 
+// The review budget in milliseconds as a finite positive NUMBER, or null.
+//
+// Normalizing here, once, is what keeps three consumers agreeing: the watchdog
+// that kills the process, the --print-timeout we hand the agent, and the message
+// we print on overrun. A numeric string is coerced rather than rejected because
+// every way this can diverge fails SILENTLY — the watchdog would substitute its
+// own default while the agent was told a different number and the error blamed a
+// third — so a config or env value arriving as "600000" must not be discarded.
+// Callers must pass the normalized value to ALL of them, never the raw input.
+export function normalizeTimeoutMs(timeoutMs) {
+  const ms = typeof timeoutMs === "string" ? Number(timeoutMs.trim()) : timeoutMs;
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  return ms;
+}
+
 // The review budget in whole seconds, or null when no usable budget is known.
 // Rounds UP so a sub-second budget still names a positive duration; both the flag
 // we forward to the agent and the message we report on overrun read it from here,
 // so the two can never disagree about what the budget was.
-// A numeric string is coerced rather than rejected: every way this can be wrong
-// fails SILENTLY — agy drops back to its own 5m default while the overrun message
-// claims no budget was set — so a config or env value that arrives as "600000"
-// must not quietly discard the user's timeout.
 export function budgetSeconds(timeoutMs) {
-  const ms = typeof timeoutMs === "string" ? Number(timeoutMs.trim()) : timeoutMs;
-  if (!Number.isFinite(ms) || ms <= 0) return null;
-  return Math.max(1, Math.ceil(ms / 1000));
+  const ms = normalizeTimeoutMs(timeoutMs);
+  return ms === null ? null : Math.max(1, Math.ceil(ms / 1000));
 }
 
 // Single wording for "the review ran out of time", whether the watchdog killed the
@@ -306,6 +316,28 @@ export function isCliPrintTimeoutStderr(stderr) {
   return /timeout waiting for response/i.test((stderr || "").toString());
 }
 
+// A CLI that must carry the prompt in argv cannot be launched from a Windows npm
+// `.cmd` shim: cmd.exe re-parses the command line, so buildSpawnTarget refuses
+// the untrusted argv rather than let a reviewed diff execute. Such an install can
+// never complete a review, so detection must skip it instead of selecting it and
+// failing at spawn time — and an explicit request for it must say why.
+export function cliUsableForReview(cliCmd, { platform = process.platform, resolve = resolveTrustedCli } = {}) {
+  if (platform !== "win32" || !cliRequiresArgvPrompt(cliCmd)) return true;
+  const resolved = resolve(cliCmd);
+  if (!resolved) return false;
+  return !isWindowsBatchShim(resolved, { platform });
+}
+
+export function cliUnusableMessage(cliCmd) {
+  return (
+    `Local CLI agent "${cliCmd}" is installed as a Windows .cmd shim, which cannot be used for ` +
+    `review: it can only be launched through cmd.exe, and ${cliCmd} takes the prompt as a ` +
+    `command-line argument, so the reviewed diff would be re-parsed as commands.\n` +
+    `Use a provider whose prompt travels over stdin (--provider claude or --provider codex), ` +
+    `an API provider, or install ${cliCmd} as a native executable.`
+  );
+}
+
 /** Plan/read-only sandbox flags for a local CLI (empty when unsandboxed or unknown). */
 export function cliSandboxArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
   if (allowUnsandboxedCli) return [];
@@ -473,7 +505,16 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
 }
 
 // Invoke a local CLI agent (claude, agy, ...) by piping the prompt to stdin.
-async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs = 10 * 60 * 1000, allowUnsandboxedCli = false, model = null, stream = false } = {}) {
+const DEFAULT_CLI_TIMEOUT_MS = 10 * 60 * 1000;
+
+async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs: rawTimeoutMs = DEFAULT_CLI_TIMEOUT_MS, allowUnsandboxedCli = false, model = null, stream = false } = {}) {
+  // Normalize ONCE, at the boundary. Everything downstream — the watchdog window,
+  // the agent's own --print-timeout, and the overrun message — must read the same
+  // number, or the process is killed at one budget while the agent was told
+  // another and the error reports a third.
+  // An unusable value resolves to the documented default rather than null, so no
+  // consumer downstream has to invent one of its own.
+  const timeoutMs = normalizeTimeoutMs(rawTimeoutMs) ?? DEFAULT_CLI_TIMEOUT_MS;
   let fullPrompt = "";
   if (systemInstruction) {
     fullPrompt += `System Instructions:\n${systemInstruction}\n\n`;
@@ -709,7 +750,7 @@ export function configureLLM(args) {
     const canOpenai = () => !exP.has("openai") && envNonEmpty("OPENAI_API_KEY");
     const canAnthropic = () => !exP.has("anthropic") && envNonEmpty("ANTHROPIC_API_KEY");
     const canGw = () => !exP.has("vercel") && !!gw;
-    const canCli = (c) => !exC.has(c) && isTrustedCliInstalled(c);
+    const canCli = (c) => !exC.has(c) && isTrustedCliInstalled(c) && cliUsableForReview(c);
     const cursorAgent = resolveCursorAgentCmd();
     const canCursorAgent = () => (cursorAgent && !exC.has(cursorAgent)) ? cursorAgent : null;
 
@@ -835,6 +876,10 @@ export function configureLLM(args) {
       const knownApis = ["gemini", "openai", "anthropic", "vercel"];
       if (!knownApis.includes(provider)) {
         if (isTrustedCliInstalled(provider)) {
+          // Installed but unable to complete a review is a DIFFERENT failure from
+          // not installed, and it has a different remedy — say which one it is
+          // here rather than letting it surface as a spawn refusal mid-review.
+          if (!cliUsableForReview(provider)) throw new Error(cliUnusableMessage(provider));
           cliCmd = provider;
           provider = "cli";
         } else {
