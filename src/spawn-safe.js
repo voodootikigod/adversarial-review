@@ -79,34 +79,6 @@ export function resolveCommand(cmd, { platform = process.platform, env = process
 // returns a bare name; SHELL is never used.
 const BATCH_EXTENSIONS = new Set([".cmd", ".bat"]);
 
-// The command interpreter must be an ABSOLUTE, trusted path, for exactly the
-// reason taskkillPath below is: Windows resolves an unqualified executable name
-// against the CURRENT DIRECTORY before the system directories, and our current
-// directory is the untrusted repository under review. A bare "cmd.exe" would let
-// a repo that ships cmd.exe run as the reviewer — and it would run BEFORE the
-// trusted CLI it was supposed to launch, so resolving the CLI safely buys
-// nothing. ComSpec is honoured only when it is itself absolute and outside the
-// trust root; anything else falls back to the System32 path.
-// Reached only from the win32 branch, so Windows path semantics apply even when
-// this runs on a POSIX host under the `platform` test seam — path.join would
-// otherwise emit "C:\Windows/System32/cmd.exe", which path.isAbsolute rejects.
-export function interpreterPath(env = process.env, { isInsideRoot = isInsideTrustRoot } = {}) {
-  const configured = env.ComSpec || env.COMSPEC;
-  if (configured && path.win32.isAbsolute(configured)) {
-    let inside = false;
-    try {
-      inside = isInsideRoot(configured);
-    } catch {
-      // A trust root that cannot be established is not a licence to trust the
-      // value — treat it as untrusted and use the system interpreter.
-      inside = true;
-    }
-    if (!inside) return configured;
-  }
-  const root = env.SystemRoot || env.SYSTEMROOT || "C:\\Windows";
-  return path.win32.join(root, "System32", "cmd.exe");
-}
-
 export class WindowsArgvUnsafeError extends Error {
   constructor(message) {
     super(message);
@@ -115,17 +87,84 @@ export class WindowsArgvUnsafeError extends Error {
   }
 }
 
+// Last-resort interpreter location, used when the environment supplies nothing
+// trustworthy. A literal, not a default parameter, so no env value can shadow it.
+const DEFAULT_SYSTEM_ROOT = "C:\\Windows";
+
+// The command interpreter must be an ABSOLUTE, trusted path, for exactly the
+// reason taskkillPath below is: Windows resolves an unqualified executable name
+// against the CURRENT DIRECTORY before the system directories, and our current
+// directory is the untrusted repository under review. A bare "cmd.exe" would let
+// a repo that ships cmd.exe run as the reviewer — and it would run BEFORE the
+// trusted CLI it was supposed to launch, so resolving the CLI safely buys
+// nothing.
+//
+// EVERY candidate is validated the same way, including the SystemRoot-derived
+// one: a relative SystemRoot ("." or "tools") yields a relative command that
+// Windows resolves from the repository, and an absolute SystemRoot can still
+// point INTO it. Validating only ComSpec would leave that path wide open.
+// Candidates are tried in order of specificity and the first trusted one wins;
+// if none is trustworthy we fail closed rather than guess.
+//
+// Reached only from the win32 branch, so Windows path semantics apply even when
+// this runs on a POSIX host under the `platform` test seam — path.join would
+// otherwise emit "C:\Windows/System32/cmd.exe", which path.isAbsolute rejects.
+// Default containment check for an interpreter candidate. On a non-Windows host
+// this is always false, and deliberately so: the trust root is a POSIX path, a
+// Windows path can never be inside it, and handing "C:\Windows\..." to the POSIX
+// resolver would treat it as a RELATIVE name and resolve it against the cwd —
+// the repository — refusing every interpreter on a false positive. The real
+// containment check runs where it means something, and the `isInsideRoot` seam
+// exercises the refusal path everywhere else.
+function interpreterInsideTrustRoot(candidate) {
+  if (process.platform !== "win32") return false;
+  return isInsideTrustRoot(candidate);
+}
+
+export function interpreterPath(env = process.env, { isInsideRoot = interpreterInsideTrustRoot } = {}) {
+  const configuredRoot = env.SystemRoot || env.SYSTEMROOT;
+  const candidates = [
+    env.ComSpec || env.COMSPEC,
+    configuredRoot ? path.win32.join(configuredRoot, "System32", "cmd.exe") : null,
+    path.win32.join(DEFAULT_SYSTEM_ROOT, "System32", "cmd.exe")
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate || !path.win32.isAbsolute(candidate)) continue;
+    let inside;
+    try {
+      inside = isInsideRoot(candidate);
+    } catch {
+      // A trust root that cannot be established is not a licence to trust the
+      // value — treat the candidate as untrusted and move on.
+      inside = true;
+    }
+    if (!inside) return candidate;
+  }
+
+  throw new WindowsArgvUnsafeError(
+    "Refusing to launch the Windows command interpreter: no absolute interpreter path outside " +
+    "the repository under review could be established. Check ComSpec and SystemRoot — a relative " +
+    "value, or one pointing inside the repository, lets the reviewed code run as the reviewer."
+  );
+}
+
 // What may cross a cmd.exe command line. Our own invocation flags are authored
 // here and contain none of it; the reviewed prompt is the untrusted value, and
 // on the primary path it travels over stdin, which cmd.exe never parses.
-const CMD_METACHARACTERS = /[&|<>^"%!()]/;
+// CR and LF are command SEPARATORS to cmd.exe, not merely punctuation: an
+// argument containing one ends the current command and starts another, so
+// omitting them from this set would let `--flag\ncalc.exe` execute. Every other
+// control character is rejected on the same principle — our flags are plain
+// printable ASCII, so nothing legitimate is lost by refusing the whole class.
+const CMD_METACHARACTERS = /[&|<>^"%!()]|[\x00-\x1f\x7f]/;
 
 export function buildSpawnTarget(
   resolvedPath,
   args = [],
   // isInsideRoot is a seam so the ComSpec trust decision is testable without a
   // real Windows repository; production callers pass none of these.
-  { platform = process.platform, env = process.env, argsContainUntrusted = true, isInsideRoot = isInsideTrustRoot } = {}
+  { platform = process.platform, env = process.env, argsContainUntrusted = true, isInsideRoot = interpreterInsideTrustRoot } = {}
 ) {
   if (platform === "win32" && BATCH_EXTENSIONS.has(path.extname(resolvedPath).toLowerCase())) {
     // Refuse only when a caller wants to put ATTACKER-INFLUENCEABLE data on the

@@ -17,10 +17,14 @@ import { spawnWithWatchdog } from "../src/exec-watchdog.js";
 // job that runs this file runs only this file.
 const windowsOnly = { skip: process.platform !== "win32" ? "windows-only" : false };
 
-function withShimDir(name, body) {
+// `return await` is load-bearing: returning the promise unawaited would run the
+// finally block the moment the callback first yields, deleting the shim while
+// cmd.exe is still starting. The tests would then fail on fixture lifecycle
+// rather than on the behaviour they exist to check.
+async function withShimDir(name, body) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-win-"));
   try {
-    return body(dir, path.join(dir, name));
+    return await body(dir, path.join(dir, name));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -63,8 +67,8 @@ test("a shim in a directory containing spaces still executes", windowsOnly, asyn
   }
 });
 
-test("untrusted argv is refused before any process starts", windowsOnly, () => {
-  withShimDir("advrefuse.cmd", (dir, shim) => {
+test("untrusted argv is refused before any process starts", windowsOnly, async () => {
+  await withShimDir("advrefuse.cmd", (dir, shim) => {
     // A marker the payload would create if cmd.exe ever re-parsed this argv.
     const marker = path.join(dir, "pwned.txt");
     fs.writeFileSync(shim, "@echo off\r\n");

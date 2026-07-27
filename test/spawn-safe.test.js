@@ -301,15 +301,87 @@ test("an absolute ComSpec INSIDE the reviewed repository is refused", () => {
   });
   assert.equal(t.command, "C:\\Windows\\System32\\cmd.exe");
 
-  // And if the trust root cannot be established, the value is treated as
-  // untrusted rather than waved through.
-  const throwing = buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "-"], {
-    platform: "win32",
-    env: { ComSpec: "C:\\anywhere\\cmd.exe", SystemRoot: "C:\\Windows" },
-    argsContainUntrusted: false,
-    isInsideRoot: () => { throw new Error("no trust root"); }
+  // And if the trust root cannot be established at all, EVERY candidate is
+  // untrusted — including the system fallback — so this fails closed rather than
+  // waving one through. A guess here would be the whole vulnerability.
+  assert.throws(
+    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "-"], {
+      platform: "win32",
+      env: { ComSpec: "C:\\anywhere\\cmd.exe", SystemRoot: "C:\\Windows" },
+      argsContainUntrusted: false,
+      isInsideRoot: () => { throw new Error("no trust root"); }
+    }),
+    (err) => err.code === "EWINARGV"
+  );
+});
+
+test("the SystemRoot fallback is validated exactly like ComSpec", () => {
+  // Validating only ComSpec leaves the fallback as the hijack vector: a relative
+  // SystemRoot yields a relative command that Windows resolves from the reviewed
+  // repository, and an absolute one can still point into it.
+  const shim = "C:\\npm\\claude.cmd";
+  const flags = ["-p", "-"];
+  const base = { platform: "win32", argsContainUntrusted: false, isInsideRoot: () => false };
+
+  for (const bad of [".", "tools", "..\\win"]) {
+    const t = buildSpawnTarget(shim, flags, { ...base, env: { SystemRoot: bad } });
+    assert.ok(path.win32.isAbsolute(t.command), `relative SystemRoot ${bad} must not be used`);
+    assert.equal(t.command, "C:\\Windows\\System32\\cmd.exe", "must fall back to the literal system root");
+  }
+
+  // An absolute SystemRoot pointing INSIDE the repository is refused too, and the
+  // literal default is used instead.
+  const repoRoot = "C:\\repo\\fake";
+  const inside = buildSpawnTarget(shim, flags, {
+    ...base,
+    env: { SystemRoot: repoRoot },
+    isInsideRoot: (p) => p.startsWith(repoRoot)
   });
-  assert.equal(throwing.command, "C:\\Windows\\System32\\cmd.exe");
+  assert.equal(inside.command, "C:\\Windows\\System32\\cmd.exe");
+});
+
+test("no trustworthy interpreter at all fails closed", () => {
+  // If even the literal system root is inside the trust root there is nothing
+  // safe left to launch, and guessing would be the whole vulnerability.
+  assert.throws(
+    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "-"], {
+      platform: "win32",
+      env: { ComSpec: "cmd.exe", SystemRoot: "." },
+      argsContainUntrusted: false,
+      isInsideRoot: () => true
+    }),
+    (err) => {
+      assert.equal(err.code, "EWINARGV");
+      assert.match(err.message, /ComSpec and SystemRoot/);
+      return true;
+    }
+  );
+});
+
+test("cmd.exe command separators are rejected in trusted flags", () => {
+  // CR/LF END a command to cmd.exe: `--flag\ncalc.exe` would run calc.exe. The
+  // metacharacter guard exists to stop a future flag-builder edit from doing
+  // exactly that, so the separator class must be part of it.
+  for (const payload of ["a\ncalc.exe", "a\r\ncalc.exe", "a\rb", "a\tb", "a\u0000b", "a&b"]) {
+    assert.throws(
+      () => buildSpawnTarget("C:\\npm\\claude.cmd", ["--flag", payload], {
+        platform: "win32",
+        env: { SystemRoot: "C:\\Windows" },
+        argsContainUntrusted: false,
+        isInsideRoot: () => false
+      }),
+      (err) => err.code === "EWINARGV",
+      `${JSON.stringify(payload)} must be refused`
+    );
+  }
+  // Ordinary flags still pass — the guard must not break real invocations.
+  const ok = buildSpawnTarget("C:\\npm\\claude.cmd", ["--permission-mode", "plan", "-p", "-"], {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    argsContainUntrusted: false,
+    isInsideRoot: () => false
+  });
+  assert.equal(ok.viaInterpreter, true);
 });
 
 test("T12: every supported CLI's PRIMARY invocation still works on a Windows shim", () => {
