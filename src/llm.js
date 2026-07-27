@@ -84,6 +84,27 @@ export function maxArgvPromptBytes({
   return Math.max(0, totalBudget);
 }
 
+// The review budget in whole seconds, or null when no usable budget is known.
+// Rounds UP so a sub-second budget still names a positive duration; both the flag
+// we forward to the agent and the message we report on overrun read it from here,
+// so the two can never disagree about what the budget was.
+export function budgetSeconds(timeoutMs) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return null;
+  return Math.max(1, Math.ceil(timeoutMs / 1000));
+}
+
+// Single wording for "the review ran out of time", whether the watchdog killed the
+// process or the agent abandoned its own wait. `subject` names the thing that timed
+// out, e.g. `codex` or `local CLI agent "agy"`. A missing/degenerate budget must not
+// render as "NaNs" or "0s" — with no budget known, no --print-timeout was forwarded
+// either, so the agent's own default is what actually fired.
+export function timeoutExceededMessage(subject, timeoutMs) {
+  const seconds = budgetSeconds(timeoutMs);
+  return seconds === null
+    ? `Failed to execute ${subject}: timed out with no --timeout budget set; retry with --timeout <seconds>`
+    : `Failed to execute ${subject}: exceeded --timeout ${seconds}s; retry with --timeout <larger>`;
+}
+
 function argvTooLargeMessage(cliLabel, promptBytes, limitBytes) {
   return (
     `${cliLabel} rejected the prompt on stdin, and the prompt (${promptBytes} bytes) ` +
@@ -287,6 +308,25 @@ export function cliRequiresArgvPrompt(cliCmd) {
   return cliCmd === "agy";
 }
 
+// agy's print mode has its OWN wait budget (`--print-timeout`, default 5m0s) that
+// is independent of our watchdog. Left unset, agy aborts a long review at 5 minutes
+// with "Error: timeout waiting for response" no matter how large a --timeout the
+// user asked for (the CLI default for a local agent is 2400s) — the user's timeout
+// silently does not apply. Pass the resolved budget through so agy honours it.
+// Returns [] for CLIs without the flag, and when no budget is known.
+export function cliPrintTimeoutArgs(cliCmd, timeoutMs) {
+  if (cliCmd !== "agy") return [];
+  const seconds = budgetSeconds(timeoutMs);
+  if (seconds === null) return [];
+  // Go duration literal; seconds granularity is enough for a review budget.
+  return ["--print-timeout", `${seconds}s`];
+}
+
+/** True when CLI stderr shows the agent gave up waiting on its own response. */
+export function isCliPrintTimeoutStderr(stderr) {
+  return /timeout waiting for response/i.test((stderr || "").toString());
+}
+
 /** Plan/read-only sandbox flags for a local CLI (empty when unsandboxed or unknown). */
 export function cliSandboxArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
   if (allowUnsandboxedCli) return [];
@@ -351,7 +391,12 @@ export function cliReviewArgs(cliCmd, { allowUnsandboxedCli = false, model = nul
   return args;
 }
 
-export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = false, model = null } = {}) {
+// INVARIANT: the prompt is always the LAST element, immediately preceded by the
+// flag that consumes it (`-p`). agy parses with Go's flag package, which stops at
+// the first non-flag argument — anything appended after the prompt is silently
+// dropped, and anything inserted between `-p` and the prompt is consumed AS the
+// prompt. New flags must be added before that trailing pair, never after it.
+export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = false, model = null, timeoutMs = null } = {}) {
   if (isCursorAgentCli(cliCmd)) {
     const args = ["-p", "--trust", "--output-format", "text"];
     args.push(...cliSandboxArgs(cliCmd, { allowUnsandboxedCli }));
@@ -364,6 +409,7 @@ export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = fals
   if (cliCmd === "claude" || cliCmd === "agy") {
     const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
     if (model) args.push("--model", model);
+    args.push(...cliPrintTimeoutArgs(cliCmd, timeoutMs));
     args.push("-p", fullPrompt);
     return args;
   }
@@ -411,7 +457,7 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
       await execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs, { stream, argsContainUntrusted: false });
     } catch (stdinErr) {
       if (stdinErr.code === "ETIMEDOUT") {
-        throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: stdinErr.stdout, stderr: stdinErr.stderr, cause: stdinErr });
+        throw Object.assign(new Error(timeoutExceededMessage("codex", timeoutMs)), { stdout: stdinErr.stdout, stderr: stdinErr.stderr, cause: stdinErr });
       }
       const promptBytes = Buffer.byteLength(fullPrompt);
       const argvLimit = maxArgvPromptBytes();
@@ -427,7 +473,7 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
         await execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs, { stream });
       } catch (argvErr) {
         if (argvErr.code === "ETIMEDOUT") {
-          throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
+          throw Object.assign(new Error(timeoutExceededMessage("codex", timeoutMs)), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
         }
         if (isE2BigError(argvErr)) {
           throw Object.assign(new Error(argvTooLargeMessage("Codex", promptBytes, argvLimit)), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
@@ -461,7 +507,7 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
     return callCodexCli(fullPrompt, schema, timeoutMs, { stream, model });
   }
 
-  const fallbackOpts = { allowUnsandboxedCli, model };
+  const fallbackOpts = { allowUnsandboxedCli, model, timeoutMs };
 
   // agy: the prompt MUST be the `-p` value (no stdin sentinel). Deliver it via
   // argv directly — there is no stdin path to try first. Guard the argv size.
@@ -475,12 +521,17 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
       return await execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs, { stream, argsContainUntrusted: true });
     } catch (err) {
       if (err.code === "ETIMEDOUT") {
-        throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: err.stdout, stderr: err.stderr, cause: err });
+        throw Object.assign(new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)), { stdout: err.stdout, stderr: err.stderr, cause: err });
       }
       if (isE2BigError(err)) {
         throw Object.assign(new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit)), { stdout: err.stdout, stderr: err.stderr, cause: err });
       }
       const stderr = err.stderr?.toString("utf8") || "";
+      // The agent aborted its own wait (agy --print-timeout). Report it as the
+      // budget overrun it is, not as an opaque exit-1, so the fix is obvious.
+      if (isCliPrintTimeoutStderr(stderr)) {
+        throw Object.assign(new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      }
       const flagRejection = describeUnknownFlagRejection(cliCmd, stderr);
       if (flagRejection) {
         throw Object.assign(new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : "")), { stdout: err.stdout, stderr: err.stderr, cause: err });
@@ -499,7 +550,7 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
     return await execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs, { stream, argsContainUntrusted: false });
   } catch (err) {
     if (err.code === "ETIMEDOUT") {
-      throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      throw Object.assign(new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)), { stdout: err.stdout, stderr: err.stderr, cause: err });
     }
     const stderr = err.stderr?.toString("utf8") || "";
     // Unknown-flag rejections must surface clearly — not as a prompt-size / argv error.
@@ -522,7 +573,7 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
     } catch (err2) {
       if (err2.code === "ETIMEDOUT") {
         throw Object.assign(
-          new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`),
+          new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)),
           { stdout: err2.stdout, stderr: err2.stderr, cause: err2 }
         );
       }

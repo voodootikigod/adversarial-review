@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, maxArgvPromptBytes, parseRetryAfterMs, isCmdInstalled, llmCall } from "../src/llm.js";
+import { budgetSeconds, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
@@ -259,6 +259,114 @@ test("cliReviewArgs / cliFallbackArgs forward a resolved model to claude and agy
     cliFallbackArgs("agy", "PROMPT-BODY", { model: "gemini-3.1-pro-high" }),
     ["--mode", "plan", "--model", "gemini-3.1-pro-high", "-p", "PROMPT-BODY"]
   );
+});
+
+test("cliFallbackArgs forwards the review budget to agy's own --print-timeout", () => {
+  // agy's print mode defaults to a 5m0s wait of its own. Without --print-timeout it
+  // aborts a long review at 5 minutes regardless of --timeout (2400s for a local
+  // CLI), so the user's budget silently does not apply.
+  assert.deepEqual(cliPrintTimeoutArgs("agy", 2400 * 1000), ["--print-timeout", "2400s"]);
+  assert.deepEqual(cliPrintTimeoutArgs("agy", 900 * 1000), ["--print-timeout", "900s"]);
+  // Sub-second budgets still have to name a positive duration Go can parse.
+  assert.deepEqual(cliPrintTimeoutArgs("agy", 250), ["--print-timeout", "1s"]);
+  // Unknown/absent budget, and CLIs without the flag, add nothing.
+  assert.deepEqual(cliPrintTimeoutArgs("agy", null), []);
+  assert.deepEqual(cliPrintTimeoutArgs("agy", 0), []);
+  assert.deepEqual(cliPrintTimeoutArgs("claude", 2400 * 1000), []);
+
+  assert.deepEqual(
+    cliFallbackArgs("agy", "PROMPT-BODY", { timeoutMs: 900 * 1000 }),
+    ["--mode", "plan", "--print-timeout", "900s", "-p", "PROMPT-BODY"]
+  );
+  // claude has no such flag — its argv form must not grow one.
+  assert.deepEqual(
+    cliFallbackArgs("claude", "PROMPT-BODY", { timeoutMs: 900 * 1000 }),
+    ["--permission-mode", "plan", "-p", "PROMPT-BODY"]
+  );
+});
+
+test("cliFallbackArgs keeps the prompt LAST, as the value of -p", () => {
+  // agy parses with Go's flag package: parsing stops at the first non-flag
+  // argument, so any flag appended after the prompt is silently dropped, and any
+  // flag inserted between -p and the prompt is consumed AS the prompt (agy then
+  // answers that flag name and the real review is never seen). Every argv form
+  // must therefore end with exactly [-p, prompt].
+  const forms = [
+    cliFallbackArgs("agy", "PROMPT-BODY", { timeoutMs: 900 * 1000, model: "gemini-3.1-pro-high" }),
+    cliFallbackArgs("agy", "PROMPT-BODY", { allowUnsandboxedCli: true, timeoutMs: 900 * 1000 }),
+    cliFallbackArgs("agy", "PROMPT-BODY"),
+    cliFallbackArgs("claude", "PROMPT-BODY", { model: "claude-sonnet-4-6" })
+  ];
+  for (const args of forms) {
+    assert.equal(args.at(-1), "PROMPT-BODY", `prompt must be the final argv element: ${JSON.stringify(args)}`);
+    assert.equal(args.at(-2), "-p", `prompt must be the value of -p: ${JSON.stringify(args)}`);
+    assert.equal(args.indexOf("PROMPT-BODY"), args.length - 1, "prompt must appear exactly once, at the end");
+  }
+});
+
+test("timeoutExceededMessage never renders a NaN or zero budget", () => {
+  assert.equal(
+    timeoutExceededMessage('local CLI agent "agy"', 900 * 1000),
+    'Failed to execute local CLI agent "agy": exceeded --timeout 900s; retry with --timeout <larger>'
+  );
+  assert.equal(
+    timeoutExceededMessage("codex", 2400 * 1000),
+    "Failed to execute codex: exceeded --timeout 2400s; retry with --timeout <larger>"
+  );
+  // No budget known: cliPrintTimeoutArgs forwarded nothing, so the agent's OWN
+  // default is what fired — say so rather than printing "NaNs" or "0s".
+  for (const bad of [undefined, null, NaN, 0, -1, "900"]) {
+    const msg = timeoutExceededMessage("codex", bad);
+    assert.doesNotMatch(msg, /NaN|--timeout 0s|--timeout -/, `degenerate budget ${String(bad)} leaked into: ${msg}`);
+    assert.match(msg, /timed out with no --timeout budget set/);
+  }
+  // A sub-second budget IS a budget: it must report the same duration that was
+  // forwarded to the agent (1s), not claim none was set.
+  assert.equal(budgetSeconds(500), 1);
+  assert.deepEqual(cliPrintTimeoutArgs("agy", 500), ["--print-timeout", "1s"]);
+  assert.equal(
+    timeoutExceededMessage("codex", 500),
+    "Failed to execute codex: exceeded --timeout 1s; retry with --timeout <larger>"
+  );
+});
+
+test("the forwarded --print-timeout and the overrun message always name the same budget", () => {
+  // Drift here is the whole failure mode: agy would be told one budget while the
+  // error blames another. Both must read the duration from budgetSeconds.
+  for (const ms of [500, 1000, 1500, 900 * 1000, 2400 * 1000, 900_499]) {
+    const [, forwarded] = cliPrintTimeoutArgs("agy", ms);
+    assert.equal(forwarded, `${budgetSeconds(ms)}s`);
+    assert.match(timeoutExceededMessage('local CLI agent "agy"', ms), new RegExp(`exceeded --timeout ${budgetSeconds(ms)}s`));
+  }
+});
+
+test("isCliPrintTimeoutStderr recognizes agy giving up on its own wait", () => {
+  assert.equal(isCliPrintTimeoutStderr("Error: timeout waiting for response\n"), true);
+  assert.equal(isCliPrintTimeoutStderr("some unrelated failure"), false);
+  assert.equal(isCliPrintTimeoutStderr(""), false);
+  assert.equal(isCliPrintTimeoutStderr(null), false);
+});
+
+test("agy's own print-timeout surfaces as a --timeout overrun, not an opaque exit 1", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-print-timeout-"));
+  const binPath = path.join(tmpDir, "agy");
+  fs.writeFileSync(binPath, '#!/bin/sh\necho "Error: timeout waiting for response" >&2\nexit 1\n');
+  fs.chmodSync(binPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+  try {
+    await assert.rejects(
+      () => llmCall({ provider: "cli", cliCmd: "agy", timeoutMs: 900 * 1000 }, "review this", "sys"),
+      (err) => {
+        assert.match(err.message, /exceeded --timeout 900s; retry with --timeout <larger>/);
+        return true;
+      }
+    );
+  } finally {
+    process.env.PATH = oldPath;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test("describeUnknownFlagRejection parses Go flag and common unknown-flag stderr", () => {
