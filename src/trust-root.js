@@ -11,6 +11,7 @@ import { isPathInside } from "./path-containment.js";
 // worktree top level; when not inside a git repo, it falls back to cwd.
 
 let cachedRoot; // undefined = not yet computed
+let cachedTrustError; // undefined = no refusal yet; set = replay it on every call
 
 // Canonicalize `p` by realpath-ing its longest existing prefix and re-appending
 // the not-yet-existing tail, so symlinks are resolved even for a path (config
@@ -61,6 +62,13 @@ export function findWorktreeBoundary(startDir) {
 }
 
 export function reviewTrustRoot({ cwd = process.cwd() } = {}) {
+  // A failed trust decision is POISONED, not forgotten. Caching only the success
+  // and leaving the failure uncached would re-run the bootstrap on every retry;
+  // caching the root and throwing separately was worse still — the next caller
+  // hit the cache, got the root, and never saw the refusal, so catching the error
+  // once silently disabled the check for the rest of the process. Replaying the
+  // error gives both: nothing re-executes, and nothing proceeds.
+  if (cachedTrustError !== undefined) throw cachedTrustError;
   if (cachedRoot !== undefined) return cachedRoot;
   // BOOTSTRAP: git must run before the root it reports exists, so the boundary is
   // established by the exec-free ancestor walk above and the WHOLE boundary is
@@ -97,22 +105,26 @@ export function reviewTrustRoot({ cwd = process.cwd() } = {}) {
       // not a git repo, or git failed → the filesystem boundary stands
     }
   }
-  cachedRoot = canonicalize(root);
+  const resolvedRoot = canonicalize(root);
   // The exec-free boundary is at or above the git toplevel in every normal
   // layout, so the bootstrap git should land outside the final root. If it did
   // not, the boundary was wrong and repository-supplied code has ALREADY run —
-  // say so loudly instead of continuing on a compromised assumption. cachedRoot
-  // stays assigned so a retry cannot execute it a second time.
-  if (git && isInsideTrustRoot(git, { root: cachedRoot })) {
-    throw Object.assign(
+  // say so loudly instead of continuing on a compromised assumption.
+  if (git && isInsideTrustRoot(git, { root: resolvedRoot })) {
+    // Poison rather than cache the root: assigning cachedRoot here and throwing
+    // separately meant the NEXT call hit the cache and returned the untrusted
+    // root without the check, so catching this error once disabled it process-wide.
+    cachedTrustError = Object.assign(
       new Error(
         `Refusing to continue: the git used to locate the repository (${git}) resolves INSIDE ` +
-        `the repository under review (${cachedRoot}). A repository must not supply the git that ` +
+        `the repository under review (${resolvedRoot}). A repository must not supply the git that ` +
         `inspects it. Install git system-wide and remove it from this worktree's PATH entries.`
       ),
       { code: "EUNTRUSTEDGIT" }
     );
+    throw cachedTrustError;
   }
+  cachedRoot = resolvedRoot;
   return cachedRoot;
 }
 
@@ -156,6 +168,7 @@ export function resolveTrustedGit() {
 export function _resetTrustRootCache() {
   cachedRoot = undefined;
   cachedGit = undefined;
+  cachedTrustError = undefined;
 }
 
 // True when `target` is contained within the trust root (symlink-resolved). An

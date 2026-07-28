@@ -1,5 +1,5 @@
 import { execFileSync } from "child_process";
-import { resolveCommand, resolveTrustedCommand, isWindowsBatchShim } from "./spawn-safe.js";
+import { resolveCommand, resolveTrustedCommand, sanitizedSpawnEnv, isWindowsBatchShim } from "./spawn-safe.js";
 import { spawnWithWatchdog } from "./exec-watchdog.js";
 import fs from "fs";
 import os from "os";
@@ -47,6 +47,7 @@ function probeArgMax() {
       encoding: "utf8",
       timeout: 2000,
       stdio: ["ignore", "pipe", "ignore"],
+      env: sanitizedSpawnEnv(),
     }).trim();
     const n = Number.parseInt(out, 10);
     cachedProbedArgMax = Number.isFinite(n) && n > 0 ? n : null;

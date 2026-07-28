@@ -87,6 +87,86 @@ test("a '..'-prefixed CHILD directory is inside the repo, not outside it", async
   }
 });
 
+test("a refused trust decision is replayed, never cached away", async () => {
+  // Assigning cachedRoot and throwing separately meant the NEXT call hit the
+  // cache and returned the untrusted root with no check — so catching the error
+  // once disabled the guard for the rest of the process. The refusal must repeat.
+  const trustRoot = await import("../src/trust-root.js");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-poison-"));
+  const oldPath = process.env.PATH;
+  const oldCwd = process.cwd();
+  try {
+    fs.mkdirSync(path.join(repo, ".git"));
+    // The ONLY git is inside the repo, reached via a PATH dir outside it, so the
+    // bootstrap runs it and the post-check refuses.
+    const outsideBin = fs.mkdtempSync(path.join(os.tmpdir(), "adv-poison-bin-"));
+    const payload = path.join(repo, "git");
+    fs.writeFileSync(payload, `#!/bin/sh\necho "${repo}"\n`);
+    fs.chmodSync(payload, 0o755);
+    fs.symlinkSync(payload, path.join(outsideBin, "git"));
+
+    process.chdir(repo);
+    trustRoot._resetTrustRootCache();
+    process.env.PATH = outsideBin;
+
+    // Whatever the first call does, EVERY later call must agree — a refusal that
+    // stops repeating is the bypass.
+    let first = null;
+    try { trustRoot.reviewTrustRoot(); } catch (err) { first = err; }
+    if (first) {
+      assert.equal(first.code, "EUNTRUSTEDGIT");
+      for (let i = 0; i < 3; i++) {
+        assert.throws(() => trustRoot.reviewTrustRoot(), (err) => err.code === "EUNTRUSTEDGIT",
+          "the refusal must replay on every subsequent call");
+      }
+    }
+    fs.rmSync(outsideBin, { recursive: true, force: true });
+  } finally {
+    process.chdir(oldCwd);
+    process.env.PATH = oldPath;
+    trustRoot._resetTrustRootCache();
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("a CLI named by absolute path resolves, and is still trust-checked", async () => {
+  // `--loop-fixer /opt/tools/codex` resolved to null and was reported as "not
+  // installed", because resolveCommand rejects every non-bare token. Naming a
+  // path must work — and must buy no trust a bare name would not get.
+  const { resolveTrustedCommand } = await import("../src/spawn-safe.js");
+  const trustRoot = await import("../src/trust-root.js");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-abs-repo-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "adv-abs-out-"));
+  const oldCwd = process.cwd();
+  try {
+    fs.mkdirSync(path.join(repo, ".git"));
+    const good = path.join(outside, "myfixer");
+    fs.writeFileSync(good, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(good, 0o755);
+    const evil = path.join(repo, "myfixer");
+    fs.writeFileSync(evil, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(evil, 0o755);
+
+    process.chdir(repo);
+    trustRoot._resetTrustRootCache();
+
+    assert.equal(resolveTrustedCommand(good), fs.realpathSync(good), "an outside path resolves");
+    assert.equal(resolveTrustedCommand(evil), null, "a path INSIDE the repo is still refused");
+    assert.equal(resolveTrustedCommand(path.join(outside, "nope")), null, "a missing path resolves to null");
+    if (process.platform !== "win32") {
+      const notExec = path.join(outside, "plain.txt");
+      fs.writeFileSync(notExec, "not executable\n");
+      fs.chmodSync(notExec, 0o644);
+      assert.equal(resolveTrustedCommand(notExec), null, "a non-executable file is not a command");
+    }
+  } finally {
+    process.chdir(oldCwd);
+    trustRoot._resetTrustRootCache();
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test("the sanitized child environment drops repo PATH entries", async () => {
   // Resolving what we spawn is not the end of it: an npm .cmd wrapper falls back
   // to a bare `node`, and `#!/usr/bin/env node` resolves from PATH. Both would

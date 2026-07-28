@@ -63,7 +63,8 @@ function gitRun(cwd, args, { allowFail = false } = {}) {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      maxBuffer: 4 * 1024 * 1024
+      maxBuffer: 4 * 1024 * 1024,
+      env: sanitizedSpawnEnv()
     }).trim();
   } catch (err) {
     if (allowFail) return "";
@@ -198,11 +199,11 @@ function probeFixer(cmd) {
   const resolved = resolveTrustedCommand(cmd);
   if (!resolved) return false;
   try {
-    execFileSync(resolved, ["--version"], { stdio: "ignore", timeout: 5000 });
+    execFileSync(resolved, ["--version"], { stdio: "ignore", timeout: 5000, env: sanitizedSpawnEnv() });
     return true;
   } catch {
     try {
-      execFileSync(resolved, ["-h"], { stdio: "ignore", timeout: 5000 });
+      execFileSync(resolved, ["-h"], { stdio: "ignore", timeout: 5000, env: sanitizedSpawnEnv() });
       return true;
     } catch {
       // It exists and is trusted; it just has no probe-friendly flag.
@@ -252,12 +253,12 @@ function probeLinuxConstraint() {
   if (!unshare) return null;
   try {
     execFileSync(unshare, ["--mount", "--user", "--map-root-user", "true"], {
-      stdio: "ignore", timeout: 3000
+      stdio: "ignore", timeout: 3000, env: sanitizedSpawnEnv()
     });
     return "unshare-user";
   } catch {}
   try {
-    execFileSync(unshare, ["--mount", "true"], { stdio: "ignore", timeout: 3000 });
+    execFileSync(unshare, ["--mount", "true"], { stdio: "ignore", timeout: 3000, env: sanitizedSpawnEnv() });
     return "unshare";
   } catch {}
   return null;

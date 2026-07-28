@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import { resolveTrustedGit } from "./trust-root.js";
 import { isPathInside } from "./path-containment.js";
+import { sanitizedSpawnEnv } from "./spawn-safe.js";
 
 const MAX_INLINE_FILE_BYTES = 256 * 1024;
 
@@ -24,7 +25,8 @@ function git(cwd, gitArgs, { allowFail = false } = {}) {
       cwd,
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      env: sanitizedSpawnEnv()
     });
   } catch (err) {
     if (allowFail) return "";

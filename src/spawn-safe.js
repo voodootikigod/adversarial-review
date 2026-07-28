@@ -36,7 +36,26 @@ export { resolveCommand };
  * usually before the sandbox meant to contain it exists.
  */
 export function resolveTrustedCommand(cmd) {
-  return resolveCommand(cmd, { excludeRoots: [reviewTrustRoot()] });
+  const root = reviewTrustRoot();
+
+  // A user may name a CLI by PATH (`--loop-fixer /opt/tools/codex`). resolveCommand
+  // deliberately rejects anything non-bare — a path reaching the PATH walk is a
+  // caller bug — so such an input resolved to null and was reported as "not
+  // installed", which is both wrong and misleading. Handle it explicitly instead:
+  // it still has to exist, be a regular executable file, and canonicalize outside
+  // the repository, so naming a path buys no trust that a bare name would not get.
+  if (typeof cmd === "string" && (path.isAbsolute(cmd) || cmd.includes("/") || cmd.includes("\\"))) {
+    const real = realpathOrSelf(path.resolve(cmd));
+    try {
+      if (!fs.statSync(real).isFile()) return null;
+      if (process.platform !== "win32") fs.accessSync(real, fs.constants.X_OK);
+    } catch {
+      return null;
+    }
+    return isPathInside(real, root) ? null : real;
+  }
+
+  return resolveCommand(cmd, { excludeRoots: [root] });
 }
 
 /**
