@@ -66,7 +66,8 @@ export function openContainedAppendFd(
   // is WRONG: a legitimate child like `..cache/x` starts with ".." without being
   // a traversal, and would then skip the suffix walk. Match the traversal token
   // exactly — ".." alone or "../…".
-  const escapes = rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel);
+  const isWin = process.platform === "win32";
+  const escapes = rel === ".." || rel.startsWith("../") || (isWin && rel.startsWith("..\\")) || path.isAbsolute(rel);
   const insideBase = rel !== "" && !escapes;
 
   if (insideBase) {
@@ -82,7 +83,7 @@ export function openContainedAppendFd(
     // resolution follows those intermediates for us; only each final component
     // is lstat'd, and none of base's own components is ever a "final" here.
     let cur = lexicalBase;
-    for (const part of rel.split(path.sep)) {
+    for (const part of rel.split(/[/\\]/)) {
       cur = path.join(cur, part);
       let st;
       try {

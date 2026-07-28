@@ -45,7 +45,7 @@ test("collectReviewContext rejects malicious branch refs without executing shell
   );
 });
 
-test("collectReviewContext skips untracked symlinks instead of reading their targets", () => {
+test("collectReviewContext skips untracked symlinks instead of reading their targets", { skip: process.platform === "win32" ? "Symlinks require Administrator privileges on Windows" : false }, () => {
   const dir = initRepo();
   const secret = path.join(os.tmpdir(), `adversarial-review-secret-${Date.now()}.txt`);
   fs.writeFileSync(secret, "SECRET_SHOULD_NOT_BE_IN_PROMPT\n");

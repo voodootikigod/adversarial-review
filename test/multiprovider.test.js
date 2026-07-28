@@ -74,7 +74,9 @@ test("#1: a single provider failure is recorded and the rest proceed (degrade-an
   assert.match(failures[0].error, /transient 500/);
 });
 
-test("AC8: --providers auto selects >=2 distinct families, excluding the builder's family", () => {
+const SKIP_WIN32_AGY = { skip: process.platform === "win32" ? "agy CLI shim is unusable for review on Windows" : false };
+
+test("AC8: --providers auto selects >=2 distinct families, excluding the builder's family", SKIP_WIN32_AGY, () => {
   // Builder = Claude (anthropic). codex(openai), agy(gemini), claude(anthropic) all installed.
   withMockBins(["codex", "agy", "claude"], { CLAUDE_CODE: "1" }, () => {
     const sel = selectProviders({ providers: "auto" });
@@ -101,7 +103,7 @@ test("builderFamily detects Antigravity (Gemini) from either env var alone", () 
   }
 });
 
-test("AC8: --providers auto excludes the builder family in Cursor too", () => {
+test("AC8: --providers auto excludes the builder family in Cursor too", SKIP_WIN32_AGY, () => {
   // Builder = Cursor (openai family). codex(openai), agy(gemini), claude(anthropic) installed.
   withMockBins(["codex", "agy", "claude"], { TERM_PROGRAM: "cursor" }, () => {
     const sel = selectProviders({ providers: "auto" });
@@ -111,7 +113,7 @@ test("AC8: --providers auto excludes the builder family in Cursor too", () => {
   });
 });
 
-test("AC7: under-satisfied when fewer providers are reachable than requested", () => {
+test("AC7: under-satisfied when fewer providers are reachable than requested", SKIP_WIN32_AGY, () => {
   // Request gpt+gemini, but only agy (gemini family) is installed and no API keys.
   withMockBins(["agy"], {}, () => {
     const sel = selectProviders({ providers: ["gpt", "gemini"] });
@@ -155,7 +157,7 @@ test("#1(r6): a CLI-name token is unreachable (not API) when its binary is absen
   });
 });
 
-test("#3/#5: a generic LLM_API_KEY does NOT force API mode for a family without its own key", () => {
+test("#3/#5: a generic LLM_API_KEY does NOT force API mode for a family without its own key", SKIP_WIN32_AGY, () => {
   // agy installed, no GEMINI_API_KEY, but a generic LLM_API_KEY is set (an OpenAI
   // key, say). gemini must resolve to the CLI fallback, not the API with a wrong key.
   withMockBins(["agy"], { LLM_API_KEY: "sk-not-gemini" }, () => {

@@ -25,15 +25,15 @@ test("isInsideTrustRoot uses the GIT WORKTREE root, not cwd — nested-dir invoc
   assert.equal(isInsideTrustRoot(repoRootBin), true);
 });
 
+import { writeSimpleMockBin } from "./helpers/mock-bin.mjs";
+
 test("resolveTrustedCli REFUSES a repository-local executable (T22: node_modules/.bin shim)", () => {
   // Simulate a repo-local shim: an executable that resolves to a path inside the
   // current working tree, exposed first on PATH (as npm/npx would do).
   const repoLocalDir = fs.mkdtempSync(path.join(process.cwd(), ".t22trust-"));
   const savedPath = process.env.PATH;
   try {
-    const shim = path.join(repoLocalDir, "codex");
-    fs.writeFileSync(shim, "#!/bin/sh\necho pwned\n");
-    fs.chmodSync(shim, 0o755);
+    writeSimpleMockBin(repoLocalDir, "codex");
     process.env.PATH = repoLocalDir; // only the repo-local shim is on PATH
     assert.equal(resolveTrustedCli("codex"), null, "a repo-local codex must not be trusted");
     assert.equal(isTrustedCliInstalled("codex"), false);
@@ -47,9 +47,9 @@ test("resolveTrustedCli ACCEPTS an executable outside the working tree and retur
   const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "t22-outside-"));
   const savedPath = process.env.PATH;
   try {
-    const bin = path.join(outsideDir, "codex");
-    fs.writeFileSync(bin, "#!/bin/sh\necho ok\n");
-    fs.chmodSync(bin, 0o755);
+    writeSimpleMockBin(outsideDir, "codex");
+    const binName = process.platform === "win32" ? "codex.cmd" : "codex";
+    const bin = path.join(outsideDir, binName);
     process.env.PATH = outsideDir;
     const trusted = resolveTrustedCli("codex");
     assert.ok(trusted, "an out-of-tree codex should be trusted");

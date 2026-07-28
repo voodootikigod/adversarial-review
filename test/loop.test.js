@@ -203,6 +203,17 @@ test("T15 AC4: the trusted file list and constraint stay outside the fences", ()
   }
 });
 
+test("probeOsConstraint on win32 throws without --loop-unsafe and returns advisory mode with --loop-unsafe", () => {
+  assert.throws(
+    () => probeOsConstraint({ loopUnsafe: false }, { platform: "win32" }),
+    /--loop on Windows has no enforced write sandbox/
+  );
+  assert.deepEqual(
+    probeOsConstraint({ loopUnsafe: true }, { platform: "win32" }),
+    { mode: "advisory" }
+  );
+});
+
 test("T15 AC5: the preamble grants scoped authority, not data-only semantics", () => {
   const prompt = buildFixPrompt([fixFinding()], ["src/job.js"]);
   // The fixer MUST act on the recommendation — the review path's wording would
