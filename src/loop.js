@@ -596,6 +596,9 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
       ...(uid !== null ? [`/run/user/${uid}`] : [])
     ];
     for (const secretPath of secretPaths) {
+      if (realCwd === secretPath || realCwd.startsWith(secretPath + path.sep)) {
+        continue;
+      }
       try {
         const stat = fs.statSync(secretPath);
         if (stat.isDirectory()) {
@@ -613,7 +616,7 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
     if (fs.existsSync(gitDir)) {
       bwrapArgs.push("--ro-bind", gitDir, gitDir);
     }
-    bwrapArgs.push("--", cmd, ...args);
+    bwrapArgs.push("--chdir", realCwd, "--", cmd, ...args);
     return {
       cmd: "bwrap",
       args: bwrapArgs,

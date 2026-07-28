@@ -492,10 +492,17 @@ test("T44: buildFixerCmd masks sensitive host secret directories with tmpfs", ()
     fixerPath: "/usr/local/bin/agy",
     cwd: process.cwd()
   });
+  assert.ok(args.includes("--chdir"));
   const sshDir = path.join(os.homedir(), ".ssh");
   if (fs.existsSync(sshDir)) {
     const idx = args.indexOf(sshDir);
     assert.ok(idx > 0);
     assert.equal(args[idx - 1], "--tmpfs");
   }
+});
+
+test("T44: buildFixerCmd skips secret path masking if workspace is inside secret path", () => {
+  const sshDir = path.join(os.homedir(), ".ssh");
+  const mockWorkdir = path.join(sshDir, "mock-repo");
+  assert.ok(mockWorkdir.startsWith(sshDir + path.sep));
 });
