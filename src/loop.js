@@ -580,17 +580,20 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
       "--proc", "/proc"
     ];
     const home = os.homedir();
+    const uid = process.getuid ? process.getuid() : null;
     const secretPaths = [
       path.join(home, ".ssh"),
       path.join(home, ".aws"),
       path.join(home, ".gnupg"),
+      path.join(home, ".docker"),
       path.join(home, ".config", "gcloud"),
       path.join(home, ".azure"),
       path.join(home, ".netrc"),
       path.join(home, ".npmrc"),
       path.join(home, ".git-credentials"),
       path.join(home, ".bash_history"),
-      path.join(home, ".zsh_history")
+      path.join(home, ".zsh_history"),
+      ...(uid !== null ? [`/run/user/${uid}`] : [])
     ];
     for (const secretPath of secretPaths) {
       try {
