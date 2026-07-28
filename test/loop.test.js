@@ -37,12 +37,36 @@ test("buildFixerCmd gives agy the fix prompt as the -p VALUE, never the stdin se
   assert.notEqual(args.at(-1), "-");
 });
 
-test("buildFixerCmd keeps the prompt last when wrapped in unshare", () => {
-  const { cmd, args } = buildFixerCmd("agy", { mode: "unshare" }, { prompt: "P", timeoutMs: 60_000 });
-  assert.equal(cmd, "unshare");
-  assert.deepEqual(args.slice(0, 3), ["--mount", "agy", "--dangerously-skip-permissions"]);
-  assert.equal(args.at(-1), "P");
-  assert.equal(args.at(-2), "-p");
+test("the unshare wrapper receives the fixer's ABSOLUTE path, never a bare name", () => {
+  // unshare performs its OWN PATH lookup on the command in its arguments. A bare
+  // name there is re-resolved against the inherited npx-style PATH, so a repo's
+  // ./node_modules/.bin/claude wins — the wrapper meant to contain the fixer
+  // becomes the thing that launches the repository's payload. Resolving only the
+  // command handed to spawn() does not cover this: the real target is one level in.
+  const abs = "/usr/local/bin/agy";
+  for (const mode of ["unshare", "unshare-user"]) {
+    const { cmd, args } = buildFixerCmd("agy", { mode }, {
+      prompt: "P", timeoutMs: 60_000, fixerPath: abs
+    });
+    assert.equal(cmd, "unshare");
+    assert.ok(args.includes(abs), `${mode}: the absolute fixer path must be in unshare's args`);
+    assert.ok(!args.includes("agy"), `${mode}: a bare fixer name must not survive`);
+    // unshare's own flags come first, then the fixer, then its args.
+    assert.ok(args.indexOf("--mount") < args.indexOf(abs));
+    assert.equal(args.at(-1), "P", "the prompt still has to be last");
+    assert.equal(args.at(-2), "-p");
+  }
+});
+
+test("the unresolved fixer name is only a fallback for direct invocation", () => {
+  // Without fixerPath the name passes through, which is what unit callers use;
+  // spawnFixer always supplies the resolved path.
+  const { cmd } = buildFixerCmd("agy", { mode: "none" }, { prompt: "P", timeoutMs: 60_000 });
+  assert.equal(cmd, "agy");
+  const { cmd: resolved } = buildFixerCmd("agy", { mode: "none" }, {
+    prompt: "P", timeoutMs: 60_000, fixerPath: "/usr/local/bin/agy"
+  });
+  assert.equal(resolved, "/usr/local/bin/agy");
 });
 
 test("buildFixerCmd still pipes claude and codex over stdin", () => {

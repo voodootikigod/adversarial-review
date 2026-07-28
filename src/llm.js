@@ -6,7 +6,6 @@ import os from "os";
 import path from "path";
 import { log } from "./utils.js";
 import { sanitizeSchemaForProvider } from "./schema-validate.js";
-import { isInsideTrustRoot } from "./trust-root.js";
 
 const DEFAULT_TIMEOUT_MS = 120 * 1000;
 
@@ -231,16 +230,14 @@ export function isCmdInstalled(cmd) {
 // tree whose target is inside is still refused. This is the SINGLE resolver used
 // by fresh detection, cache reuse, and the spawn site (T22).
 export function resolveTrustedCli(cmd) {
-  const resolved = resolveCommand(cmd);
-  if (!resolved) return null;
-  let real;
-  try {
-    real = fs.realpathSync(resolved);
-  } catch {
-    real = path.resolve(resolved);
-  }
-  if (isInsideTrustRoot(real)) return null;
-  return real;
+  // SKIP repo-local PATH entries and keep looking, rather than resolving to the
+  // first match and then rejecting it. Rejecting made one repo-local binary hide
+  // the real system CLI behind it: a dependency that installs its own `codex`
+  // into node_modules/.bin — which npx puts first — made an installed
+  // /usr/local/bin/codex report as unavailable, so the tool refused a provider
+  // the user actually had. Excluding the trust root during the walk is both safer
+  // and correct, since resolveCommand also canonicalizes and re-checks the target.
+  return resolveTrustedCommand(cmd);
 }
 
 // Boolean form for the detection ladder: a repo-local CLI is NOT available.

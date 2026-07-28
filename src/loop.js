@@ -470,7 +470,15 @@ export function buildFixPrompt(findings, files) {
 // ─── Fixer spawning ───────────────────────────────────────────────────────────
 
 // Build the command + args for the write-capable fixer invocation.
-export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs = null } = {}) {
+// `fixerPath` is the trusted absolute executable; `fixerCmd` only selects the
+// calling convention. They are separate because the unshare wrapper puts the
+// fixer in unshare's ARGUMENTS, where unshare performs its own PATH lookup —
+// resolving the command handed to spawn() is not enough when the real target is
+// one level in. A bare name there would be re-resolved against the inherited
+// npx-style PATH, handing the repository the exact execution the wrapper exists
+// to contain.
+export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs = null, fixerPath = null } = {}) {
+  const exe = fixerPath || fixerCmd;
   let cmd, args;
   // Whether the prompt travels over stdin. agy is the exception on BOTH paths:
   // its -p takes the prompt as a VALUE and it has no `-` sentinel, so `-p -`
@@ -479,10 +487,10 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
   let useStdin = true;
 
   if (fixerCmd === "codex") {
-    cmd = "codex";
+    cmd = exe;
     args = ["exec", "--ephemeral", "--ignore-rules", "-"];
   } else if (fixerCmd === "agy") {
-    cmd = "agy";
+    cmd = exe;
     args = ["--dangerously-skip-permissions"];
     // Before the -p pair: agy parses with Go's flag package, which stops at the
     // first non-flag argument, so anything after the prompt is dropped.
@@ -490,11 +498,11 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
     args.push("-p", prompt ?? "");
     useStdin = false;
   } else if (fixerCmd === "claude") {
-    cmd = fixerCmd;
+    cmd = exe;
     args = ["--dangerously-skip-permissions", "-p", "-"];
   } else {
     // unknown custom CLI: try piping via stdin
-    cmd = fixerCmd;
+    cmd = exe;
     args = ["-"];
   }
 
@@ -529,21 +537,38 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
     }
   }
 
-  const { cmd, args, useStdin } = buildFixerCmd(fixerCmd, constraint, { prompt, timeoutMs });
-
   // The fixer runs WITH WRITE ACCESS in the reviewed repository's directory, so
   // this is the last place a bare name should survive: on Windows the current
   // directory is searched first, and npx puts ./node_modules/.bin at the head of
-  // PATH everywhere. Resolve to a trusted absolute path, then route through
-  // buildSpawnTarget so a Windows .cmd shim reaches its interpreter correctly.
-  const resolved = resolveTrustedCommand(cmd);
-  if (!resolved) {
+  // PATH everywhere. Resolve the fixer BEFORE building the command line — under
+  // unshare it ends up in unshare's arguments, where unshare does its own PATH
+  // lookup, so resolving only what spawn() receives would leave the real target
+  // bare one level in.
+  const fixerPath = resolveTrustedCommand(fixerCmd);
+  if (!fixerPath) {
     throw new Error(
-      `Fixer command "${cmd}" was not found on PATH outside the repository under review. ` +
+      `Fixer command "${fixerCmd}" was not found on PATH outside the repository under review. ` +
       `A repository must not supply the tool that edits it.`
     );
   }
-  const target = buildSpawnTarget(resolved, args, { argsContainUntrusted: !useStdin });
+
+  const { cmd, args, useStdin } = buildFixerCmd(fixerCmd, constraint, { prompt, timeoutMs, fixerPath });
+
+  // `cmd` is the resolved fixer, or the sandbox wrapper when one is in use. The
+  // wrapper is a separate binary and gets its own resolution.
+  let spawnCmd = cmd;
+  if (cmd === "unshare") {
+    spawnCmd = resolveTrustedCommand("unshare");
+    if (!spawnCmd) {
+      throw new Error(
+        "The write sandbox helper \"unshare\" was not found on PATH outside the repository " +
+        "under review. Re-run with --loop-unsandboxed to proceed without it, or install " +
+        "util-linux system-wide."
+      );
+    }
+  }
+  // Route through buildSpawnTarget so a Windows .cmd shim reaches its interpreter.
+  const target = buildSpawnTarget(spawnCmd, args, { argsContainUntrusted: !useStdin });
 
   const child = spawn(target.command, target.args, {
     cwd,

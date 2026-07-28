@@ -123,6 +123,47 @@ test("a PATH symlink whose TARGET is inside the repo is refused", () => {
   }
 });
 
+test("a repo-local binary does not HIDE the real system CLI behind it", async () => {
+  // Resolving to the first match and then rejecting it made one repo-local
+  // binary shadow the genuine tool: a dependency shipping its own `advcli` into
+  // node_modules/.bin — which npx puts first — made an installed system copy
+  // report as unavailable, so the tool refused a provider the user had. Skipping
+  // repo entries during the walk is both safer and correct.
+  const { resolveTrustedCli } = await import("../src/llm.js");
+  const trustRoot = await import("../src/trust-root.js");
+
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-shadow-repo-"));
+  const system = fs.mkdtempSync(path.join(os.tmpdir(), "adv-shadow-sys-"));
+  const oldPath = process.env.PATH;
+  const oldCwd = process.cwd();
+  try {
+    const repoBin = path.join(repo, "node_modules", ".bin");
+    fs.mkdirSync(repoBin, { recursive: true });
+    fs.mkdirSync(path.join(repo, ".git"));
+    for (const dir of [repoBin, system]) {
+      const p = path.join(dir, "advcli");
+      fs.writeFileSync(p, "#!/bin/sh\nexit 0\n");
+      fs.chmodSync(p, 0o755);
+    }
+
+    process.chdir(repo);
+    trustRoot._resetTrustRootCache();
+    process.env.PATH = [repoBin, system].join(path.delimiter);
+
+    assert.equal(
+      resolveTrustedCli("advcli"),
+      fs.realpathSync(path.join(system, "advcli")),
+      "the system copy must be found past the repo-local one, not hidden by it"
+    );
+  } finally {
+    process.chdir(oldCwd);
+    process.env.PATH = oldPath;
+    trustRoot._resetTrustRootCache();
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(system, { recursive: true, force: true });
+  }
+});
+
 test("the worktree boundary is found without executing anything", async () => {
   const { findWorktreeBoundary } = await import("../src/trust-root.js");
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-boundary-"));
