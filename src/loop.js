@@ -259,17 +259,6 @@ export function probeLinuxConstraint() {
     } catch {}
   }
 
-  // Check for landlock helper if available.
-  const landlock = resolveTrustedCommand("landlock-exec");
-  if (landlock) {
-    try {
-      execFileSync(landlock, ["--help"], {
-        stdio: "ignore", timeout: 3000, env: sanitizedSpawnEnv()
-      });
-      return "landlock";
-    } catch {}
-  }
-
   // The sandbox helper is itself a spawn, and a repo-supplied `unshare` that
   // exits 0 would report a sandbox that does not exist — then wrap the fixer.
   const unshare = resolveTrustedCommand("unshare");
@@ -604,14 +593,6 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
       useStdin
     };
   }
-  if (constraint.mode === "landlock") {
-    const targetCwd = path.resolve(cwd || process.cwd());
-    return {
-      cmd: "landlock-exec",
-      args: ["--rw", targetCwd, "--ro", "/", "--", cmd, ...args],
-      useStdin
-    };
-  }
   if (constraint.mode === "unshare-user") {
     return { cmd: "unshare", args: ["--mount", "--user", "--map-root-user", cmd, ...args], useStdin };
   }
@@ -670,13 +651,6 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
         "The write sandbox helper \"bwrap\" was not found on PATH outside the repository " +
         "under review. Re-run with --loop-unsafe to proceed without it, or install " +
         "bubblewrap system-wide."
-      );
-    }
-  } else if (cmd === "landlock-exec") {
-    spawnCmd = resolveTrustedCommand("landlock-exec");
-    if (!spawnCmd) {
-      throw new Error(
-        "The write sandbox helper \"landlock-exec\" was not found on PATH outside the repository under review."
       );
     }
   } else if (cmd === "unshare") {
