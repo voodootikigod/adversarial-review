@@ -192,15 +192,28 @@ test("T47: assessFindings resolves repo-root relative file citations when invoke
   assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
 });
 
-test("T47: assessFindings preserves CLI grounding for local CLI findings in mixed API/CLI runs", () => {
+test("T47: assessFindings preserves CLI grounding for local CLI findings via trusted providerModes map", () => {
   const result = validResult({
-    findings: [validFinding({ file: "src/review.js", confidence: 0.9, evidence: "SEVERITY_RANK", provider: "codex" })]
+    findings: [validFinding({ file: "src/review.js", confidence: 0.9, evidence: "SEVERITY_RANK", corroborated_by: ["gemini"] })]
   });
   const context = { changedFiles: ["src/other.js"], includeDiff: true, content: "## Diff\n```\nconst x = 1;\n```" };
+  const providerModes = new Map([["gemini", "cli"], ["gpt", "api"]]);
 
-  const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
+  const assessments = assessFindings(result, context, { apiMode: true, providerModes, cwd: process.cwd() });
   assert.equal(assessments[0].effectiveConfidence, 0.9);
   assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+});
+
+test("T47: assessFindings prevents untrusted LLM payload spoofing from bypassing API grounding", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.9, evidence: "", corroborated_by: ["claude"] })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
+
+  // In API mode without trusted providerModes, payload metadata is NOT trusted to bypass API grounding
+  const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 0.45);
+  assert.ok(assessments[0].notes.some(n => n.includes("cited file is not in the reviewed change set")));
 });
 
 test("T47: assessFindings handles trust root discovery failures gracefully without crashing", () => {

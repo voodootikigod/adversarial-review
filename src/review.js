@@ -202,7 +202,7 @@ function collapseWhitespace(s) {
 // for gating and the report marks it. In local-CLI mode the reviewer can
 // legitimately inspect untouched files, so the file check only applies to API
 // providers (which saw nothing beyond the prompt).
-export function assessFindings(result, context, { apiMode = true, cwd = process.cwd() } = {}) {
+export function assessFindings(result, context, { apiMode = true, providerModes = null, cwd = process.cwd() } = {}) {
   const changed = new Set((context.changedFiles || []).map(normalizePath));
   const rawContent = context.content || "";
   
@@ -210,7 +210,11 @@ export function assessFindings(result, context, { apiMode = true, cwd = process.
   try {
     const rootCandidate = reviewTrustRoot({ cwd });
     if (rootCandidate) trustRoot = path.resolve(rootCandidate);
-  } catch {}
+  } catch (err) {
+    if (err?.code === "EUNTRUSTEDGIT" || err?.code === "EUNTRUSTEDCLI") {
+      throw err;
+    }
+  }
 
   const haystackShown = context.includeDiff
     ? collapseWhitespace(stripFenceSentinels(rawContent))
@@ -223,16 +227,17 @@ export function assessFindings(result, context, { apiMode = true, cwd = process.
     const notes = [];
     let effectiveConfidence = f.confidence;
 
-    // Check if finding originated from or was corroborated by a local CLI provider
-    const isLocalCliFinding =
-      f.provider === "claude" ||
-      f.provider === "codex" ||
-      f.provider === "agy" ||
-      (Array.isArray(f.corroborated_by) &&
-        f.corroborated_by.some((p) => ["claude", "codex", "agy"].includes(p)));
+    // Determine if finding uses API mode grounding. In multi-provider runs,
+    // caller passes trusted providerModes out-of-band so findings corroborated
+    // by a local CLI provider preserve CLI grounding without trusting untrusted LLM payload fields.
+    let isFindingApi = apiMode;
+    if (providerModes && typeof providerModes.get === "function" && Array.isArray(f.corroborated_by)) {
+      const hasCliCorroborator = f.corroborated_by.some((p) => providerModes.get(p) === "cli");
+      if (hasCliCorroborator) {
+        isFindingApi = false;
+      }
+    }
 
-    // Preserve local CLI mode grounding for local CLI findings in mixed runs
-    const isFindingApi = apiMode && !isLocalCliFinding;
     const haystack = isFindingApi ? haystackShown : haystackRaw;
 
     const normFile = normalizePath(f.file || "");

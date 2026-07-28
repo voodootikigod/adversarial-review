@@ -143,11 +143,15 @@ async function runMultiProvider(args, context, prompt) {
       `(effective quorum ${derived.effectiveQuorum} of requested ${derived.quorum}) → ${derived.verdict}`
   );
 
-  // Surface grounding/hallucination warnings on the merged findings. apiMode is
-  // based on providers that ACTUALLY produced results (a selected API provider may
-  // have failed), so the strictness matches what really participated.
+  const providerModes = new Map();
+  for (const pp of perProvider) {
+    const cfg = byId.get(pp.provider);
+    if (cfg) providerModes.set(pp.provider, cfg.provider);
+  }
+
   const mergedAssessments = assessFindings(merged, context, {
-    apiMode: perProvider.some((pp) => byId.get(pp.provider).provider !== "cli")
+    apiMode: perProvider.some((pp) => byId.get(pp.provider).provider !== "cli"),
+    providerModes
   });
   // Log grounding warnings to stderr (as the single-provider path does) so they
   // are visible even with --json. The quorum verdict already gated on each
