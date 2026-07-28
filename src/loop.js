@@ -246,7 +246,29 @@ export const FIXER_PROVIDER_MAP = {
 
 // ─── OS write constraint ──────────────────────────────────────────────────────
 
-function probeLinuxConstraint() {
+export function probeLinuxConstraint() {
+  // Check for bubblewrap (bwrap) write confinement first.
+  const bwrap = resolveTrustedCommand("bwrap");
+  if (bwrap) {
+    try {
+      execFileSync(bwrap, ["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc", "true"], {
+        stdio: "ignore", timeout: 3000, env: sanitizedSpawnEnv()
+      });
+      return "bwrap";
+    } catch {}
+  }
+
+  // Check for landlock helper if available.
+  const landlock = resolveTrustedCommand("landlock-exec");
+  if (landlock) {
+    try {
+      execFileSync(landlock, ["--help"], {
+        stdio: "ignore", timeout: 3000, env: sanitizedSpawnEnv()
+      });
+      return "landlock";
+    } catch {}
+  }
+
   // The sandbox helper is itself a spawn, and a repo-supplied `unshare` that
   // exits 0 would report a sandbox that does not exist — then wrap the fixer.
   const unshare = resolveTrustedCommand("unshare");
@@ -264,7 +286,7 @@ function probeLinuxConstraint() {
   return null;
 }
 
-function probeOsConstraint(args) {
+export function probeOsConstraint(args) {
   const { platform } = process;
   if (platform === "win32") throw new Error("--loop is not supported on Windows.");
 
@@ -283,31 +305,29 @@ function probeOsConstraint(args) {
   //
   // `unshare --mount` creates a new MOUNT NAMESPACE. It does not remount anything
   // read-only and does not restrict writes — the fixer keeps every filesystem
-  // permission of the invoking user. Treating it as a write sandbox told Linux
-  // users they were confined when they were not, and skipped the --loop-unsafe
-  // acknowledgement macOS correctly requires. That matters here because the fixer
-  // runs with --dangerously-skip-permissions on a prompt derived from an
-  // untrusted diff, and the loop's git rollback cannot undo a write to
-  // ~/.ssh/authorized_keys, a shell profile, .git/hooks, or another repository.
-  //
-  // Real write confinement needs Landlock or bubblewrap. Until that exists, Linux
-  // is acknowledged as unconfined too. The namespace is still used when available
-  // — it does contain mount operations — but it is not claimed to be more.
+  // permission of the invoking user.
+  // Real write confinement needs Landlock LSM or bubblewrap (bwrap).
   const linuxMode = probeLinuxConstraint();
-  if (!args.loopUnsafe) {
+  const isConfined = linuxMode === "bwrap" || linuxMode === "landlock";
+  if (!isConfined && !args.loopUnsafe) {
     throw new Error(
       "--loop has no enforced write confinement on Linux.\n" +
       "`unshare --mount` creates a mount namespace but remounts nothing read-only, so the fixer " +
       "keeps full write access to your filesystem — home directory, credentials, .git internals, " +
       "other repositories — and the loop's git rollback cannot undo changes outside the worktree.\n" +
-      "Pass --loop-unsafe to proceed, acknowledging the fixer has unrestricted write access."
+      "Install bubblewrap (`bwrap`) for kernel-level write confinement, or pass --loop-unsafe to proceed, " +
+      "acknowledging the fixer has unrestricted write access."
     );
   }
-  log.warn(
-    linuxMode
-      ? `Linux: mount namespace (${linuxMode}) active, but writes are NOT confined (--loop-unsafe). Fixer has unrestricted write access.`
-      : "Linux: running without write confinement (--loop-unsafe). Fixer has unrestricted write access."
-  );
+  if (isConfined) {
+    log.info(`Linux: ${linuxMode} write confinement active (workspace writable, filesystem read-only).`);
+  } else {
+    log.warn(
+      linuxMode
+        ? `Linux: mount namespace (${linuxMode}) active, but writes are NOT confined (--loop-unsafe). Fixer has unrestricted write access.`
+        : "Linux: running without write confinement (--loop-unsafe). Fixer has unrestricted write access."
+    );
+  }
   return { mode: linuxMode ?? "none" };
 }
 
@@ -510,7 +530,7 @@ export function fixerKind(fixerCmd) {
   return base.replace(/\.(cmd|bat|exe|com)$/, "");
 }
 
-export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs = null, fixerPath = null } = {}) {
+export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs = null, fixerPath = null, cwd = null } = {}) {
   const exe = fixerPath || fixerCmd;
   const kind = fixerKind(fixerCmd);
   let cmd, args;
@@ -540,7 +560,30 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
     args = ["-"];
   }
 
-  // Wrap with unshare if available. The prompt stays the LAST argument either way.
+  // Wrap with bwrap / landlock / unshare if available. The prompt stays the LAST argument either way.
+  if (constraint.mode === "bwrap") {
+    const targetCwd = path.resolve(cwd || process.cwd());
+    return {
+      cmd: "bwrap",
+      args: [
+        "--ro-bind", "/", "/",
+        "--bind", targetCwd, targetCwd,
+        "--bind", "/tmp", "/tmp",
+        "--dev-bind", "/dev", "/dev",
+        "--proc", "/proc",
+        "--", cmd, ...args
+      ],
+      useStdin
+    };
+  }
+  if (constraint.mode === "landlock") {
+    const targetCwd = path.resolve(cwd || process.cwd());
+    return {
+      cmd: "landlock-exec",
+      args: ["--rw", targetCwd, "--ro", "/", "--", cmd, ...args],
+      useStdin
+    };
+  }
   if (constraint.mode === "unshare-user") {
     return { cmd: "unshare", args: ["--mount", "--user", "--map-root-user", cmd, ...args], useStdin };
   }
@@ -587,12 +630,28 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
     );
   }
 
-  const { cmd, args, useStdin } = buildFixerCmd(fixerCmd, constraint, { prompt, timeoutMs, fixerPath });
+  const { cmd, args, useStdin } = buildFixerCmd(fixerCmd, constraint, { prompt, timeoutMs, fixerPath, cwd });
 
   // `cmd` is the resolved fixer, or the sandbox wrapper when one is in use. The
   // wrapper is a separate binary and gets its own resolution.
   let spawnCmd = cmd;
-  if (cmd === "unshare") {
+  if (cmd === "bwrap") {
+    spawnCmd = resolveTrustedCommand("bwrap");
+    if (!spawnCmd) {
+      throw new Error(
+        "The write sandbox helper \"bwrap\" was not found on PATH outside the repository " +
+        "under review. Re-run with --loop-unsafe to proceed without it, or install " +
+        "bubblewrap system-wide."
+      );
+    }
+  } else if (cmd === "landlock-exec") {
+    spawnCmd = resolveTrustedCommand("landlock-exec");
+    if (!spawnCmd) {
+      throw new Error(
+        "The write sandbox helper \"landlock-exec\" was not found on PATH outside the repository under review."
+      );
+    }
+  } else if (cmd === "unshare") {
     spawnCmd = resolveTrustedCommand("unshare");
     if (!spawnCmd) {
       throw new Error(

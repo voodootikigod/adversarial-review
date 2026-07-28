@@ -1,6 +1,21 @@
 {
   "tickets": [
     {
+      "body": "Implement Linux process confinement for loop fixer execution using bubblewrap (bwrap) / Landlock LSM. Restrict filesystem write access strictly to workspace target directory, blocking home, credentials, parent dirs, and other repos. Allow loop execution on Linux without --loop-unsafe when bwrap/landlock is active.",
+      "category": "feature",
+      "duration": 1,
+      "edges": [],
+      "id": "T44",
+      "rails": [],
+      "scope": [
+        "src/loop.js",
+        "test/loop.test.js",
+        "README.md",
+        "skills/adversarial-review/SKILL.md"
+      ],
+      "title": "Implement Linux process confinement (Landlock/bubblewrap) for loop fixer execution"
+    },
+    {
       "body": "From a project-level adversarial review (Cursor/Grok) focused on reliability, resiliency, and capabilities of the multi-model adversarial-review plugin. Implement the grounded findings below without changing the schema contract except where JSON verdict parity requires overwriting `verdict` (same as multi-provider already does).\n\nFINDINGS TO FIX:\n1. HIGH/error-handling — src/llm.js callCliLLM: Claude primary path uses `primaryArgs=[]` while agy gets `[\"-p\",\"-\"]`. Bare claude can hang until the 10m execCli timeout. Fix: treat claude like agy (`[\"-p\",\"-\"]`). Add contract test symmetric to the agy test.\n2. HIGH/security — Claude/agy review CLIs lack Codex read-only isolation. Fix: invoke review with `--permission-mode plan` (read-only) plus `-p -`. Add `--allow-unsandboxed-cli` to opt out explicitly. Do NOT change fixer path (`--dangerously-skip-permissions`).\n3. HIGH/correctness — src/review.js buildVerifyPrompt defaults to `refuted=true`, lowering gate recall. Fix: invert prior — default `refuted=false`; require concrete contradictory evidence to drop a finding. Update any docs that claim verify-only raises precision without the recall tradeoff.\n4. MEDIUM/compatibility — bin/cli.js single-provider `--json` emits model `verdict` while exit code uses `deriveVerdict`. Multi-provider already overwrites. Fix: set `result.verdict = derived.verdict` before JSON emit (keep model disagreement on stderr).\n5. MEDIUM/error-handling — execCli hardcodes `timeout: 10*60*1000` and ignores `config.timeoutMs`. Fix: thread timeoutMs through callCliLLM/callCodexCli/execCli.\n6. MEDIUM/ci-cd — src/loop.js empty working-tree at fixCount===0 exits 0 even with `--fail-on-empty`. Fix: honor args.failOnEmpty (exit 1) like bin/cli.js.\n7. MEDIUM/compatibility — package.json sync-skill only copies prompt-template.md+schema.json into skills/; omits prompt-template-artifact.md and does not sync `.agents/skills/`. Fix: sync artifact template + schema/prompt into both skill trees; extend test/skill-assets.test.js drift guard.\n8. LOW/observability — API retries ignore Retry-After. Fix: when status is 429/503 and Retry-After is present, wait that duration (capped) before retry.\n\nAcceptance criteria:\n- AC1: claude primary review args include `-p` and `-`; node --test test/llm.test.js covers it.\n- AC2: claude/agy review args include `--permission-mode plan`; `--allow-unsandboxed-cli` omits plan mode; fixer path unchanged.\n- AC3: buildVerifyPrompt text defaults to keeping findings (refuted=false) unless contradictory evidence; unit assert on prompt text.\n- AC4: single-provider path with mocked review where model.verdict=approve but gating finding exists → JSON.verdict=needs-attention AND exit 2 (or unit-level assert that cli overwrites before emit).\n- AC5: execCli/llmCall CLI path uses config.timeoutMs (mock binary that sleeps > timeout fails fast).\n- AC6: loop empty WT + failOnEmpty → exit 1; without flag still exit 0.\n- AC7: sync-skill copies prompt-template-artifact.md; skill-assets.test.js asserts root↔skills and root↔.agents copies match for all three assets.\n- AC8: 429 with Retry-After:2 waits ~2s before retry (unit test with fake fetch).\n- AC9: npm test green.\n\nOut of scope: changing schema.json required fields; changing fixer sandbox on macOS; new providers; weakening multi-provider quorum.",
       "category": "bug",
       "duration": 3,

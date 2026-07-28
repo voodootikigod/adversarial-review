@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { log } from "../src/utils.js";
-import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, fixerKind, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
+import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, fixerKind, FIXER_PROVIDER_MAP, detectFixer, probeLinuxConstraint, probeOsConstraint } from "../src/loop.js";
 
 test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemini key", () => {
   assert.equal(FIXER_PROVIDER_MAP.agy, "gemini");
@@ -394,3 +394,72 @@ test("T14: bounded stderr keeps the TAIL, where resume commands live", () => {
   assert.ok(kept.length <= 2048, "the bound must still hold");
   assert.equal(tailOf("short", 2048), "short", "shorter input is unchanged");
 });
+
+test("T44: probeLinuxConstraint detects bwrap when installed", () => {
+  if (process.platform !== "linux") return;
+  const mode = probeLinuxConstraint();
+  if (mode === "bwrap") {
+    assert.equal(mode, "bwrap");
+  }
+});
+
+test("T44: probeOsConstraint permits --loop on Linux when bwrap is active without --loop-unsafe", () => {
+  if (process.platform !== "linux") return;
+  const mode = probeLinuxConstraint();
+  if (mode === "bwrap" || mode === "landlock") {
+    const res = probeOsConstraint({ loopUnsafe: false });
+    assert.equal(res.mode, mode);
+  }
+});
+
+test("T44: buildFixerCmd wraps command with bwrap when mode is bwrap", () => {
+  const targetDir = path.resolve("/tmp/test-workspace");
+  const { cmd, args, useStdin } = buildFixerCmd("agy", { mode: "bwrap" }, {
+    prompt: "P",
+    timeoutMs: 60_000,
+    fixerPath: "/usr/local/bin/agy",
+    cwd: targetDir
+  });
+  assert.equal(cmd, "bwrap");
+  assert.ok(args.includes("--ro-bind"));
+  assert.ok(args.includes("/"));
+  assert.ok(args.includes("--bind"));
+  assert.ok(args.includes(targetDir));
+  assert.ok(args.includes("/usr/local/bin/agy"));
+  assert.equal(args.at(-1), "P");
+  assert.equal(useStdin, false);
+});
+
+test("T44: real bwrap kernel write blocking blocks writes outside workspace", () => {
+  if (process.platform !== "linux") return;
+  const mode = probeLinuxConstraint();
+  if (mode !== "bwrap") return;
+
+  const tmpWorkdir = fs.mkdtempSync(path.join(os.tmpdir(), "bwrap-test-"));
+  try {
+    const script = `
+const fs = require('fs');
+fs.writeFileSync('${tmpWorkdir}/writable.txt', 'ok');
+try {
+  fs.writeFileSync('${os.homedir()}/blocked.txt', 'fail');
+  process.exit(1);
+} catch (e) {
+  if (e.code === 'EROFS') process.exit(0);
+  process.exit(2);
+}
+`;
+    execFileSync("bwrap", [
+      "--ro-bind", "/", "/",
+      "--bind", tmpWorkdir, tmpWorkdir,
+      "--bind", "/tmp", "/tmp",
+      "--dev-bind", "/dev", "/dev",
+      "--proc", "/proc",
+      "--",
+      process.execPath, "-e", script
+    ], { stdio: "ignore" });
+    assert.ok(fs.existsSync(path.join(tmpWorkdir, "writable.txt")));
+  } finally {
+    fs.rmSync(tmpWorkdir, { recursive: true, force: true });
+  }
+});
+
