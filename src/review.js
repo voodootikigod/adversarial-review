@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import { colors, log } from "./utils.js";
 import { llmCall, cleanJsonResponse, cliFallbackForFamily } from "./llm.js";
 import { validateAgainstSchema } from "./schema-validate.js";
+import { isInsideTrustRoot, reviewTrustRoot } from "./trust-root.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -204,10 +205,8 @@ function collapseWhitespace(s) {
 export function assessFindings(result, context, { apiMode = true, cwd = process.cwd() } = {}) {
   const changed = new Set((context.changedFiles || []).map(normalizePath));
   const rawContent = context.content || "";
+  const trustRoot = path.resolve(reviewTrustRoot({ cwd }) || cwd);
 
-  // Ground against the text the model was actually SHOWN based on route:
-  // API providers read the fenced/neutralized prompt (haystackShown).
-  // Local CLI agents read raw files on disk (haystackRaw).
   const haystackShown = context.includeDiff
     ? collapseWhitespace(stripFenceSentinels(rawContent))
     : null;
@@ -223,46 +222,51 @@ export function assessFindings(result, context, { apiMode = true, cwd = process.
     const normFile = normalizePath(f.file || "");
     const inChangeSet = !changed.size || changed.has(normFile);
 
-    // Check if cited file exists in the repository on disk
+    // Safely check if cited file exists within the repository trust root
     let fileExistsInRepo = false;
-    let fileContentOnDisk = null;
-    if (f.file) {
+    let targetFilePath = null;
+    if (f.file && typeof f.file === "string") {
       try {
-        const targetFilePath = path.resolve(cwd, f.file);
-        if (fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).isFile()) {
-          fileExistsInRepo = true;
+        const resolved = path.resolve(cwd, f.file);
+        if (isInsideTrustRoot(resolved, { root: trustRoot })) {
+          const stat = fs.statSync(resolved);
+          if (stat.isFile() && stat.size < 2_000_000) {
+            fileExistsInRepo = true;
+            targetFilePath = resolved;
+          }
         }
       } catch {}
     }
 
     if (!inChangeSet) {
-      if (fileExistsInRepo) {
+      if (apiMode) {
+        // API mode: provider was only shown the change set in the prompt.
+        // Prompt-invisible files are penalized as ungrounded for API reviewers.
+        notes.push(`cited file is not in the reviewed change set (${f.file})`);
+        effectiveConfidence /= 2;
+      } else if (fileExistsInRepo) {
+        // Local CLI mode: reviewer can inspect untouched repo files.
         notes.push(`out-of-diff evidence: pre-existing repository file (${f.file})`);
-      } else if (apiMode) {
-        notes.push(`cited file is not in the reviewed change set or repository (${f.file})`);
+      } else {
+        // Local CLI mode: file does not exist in repo.
+        notes.push(`cited file is not in the repository (${f.file})`);
         effectiveConfidence /= 2;
       }
     }
 
     if (haystack && f.evidence && f.evidence.trim()) {
-      const normalizedEvidence = collapseWhitespace(stripFenceSentinels(f.evidence));
-      const rawEvidence = collapseWhitespace(f.evidence);
-      const targetEvidence = apiMode ? normalizedEvidence : rawEvidence;
+      const targetEvidence = apiMode
+        ? collapseWhitespace(stripFenceSentinels(f.evidence))
+        : collapseWhitespace(f.evidence);
 
-      const inDiff =
-        haystack.includes(targetEvidence) ||
-        (haystackShown && haystackShown.includes(normalizedEvidence)) ||
-        (haystackRaw && haystackRaw.includes(rawEvidence));
+      const inDiff = haystack.includes(targetEvidence);
 
       if (!inDiff) {
         let inRepoFile = false;
-        if (fileExistsInRepo && f.file) {
+        if (!apiMode && fileExistsInRepo && targetFilePath) {
           try {
-            const targetFilePath = path.resolve(cwd, f.file);
-            fileContentOnDisk = fs.readFileSync(targetFilePath, "utf8");
-            const normDisk = collapseWhitespace(stripFenceSentinels(fileContentOnDisk));
-            const rawDisk = collapseWhitespace(fileContentOnDisk);
-            if (normDisk.includes(normalizedEvidence) || rawDisk.includes(rawEvidence)) {
+            const fileContent = fs.readFileSync(targetFilePath, "utf8");
+            if (collapseWhitespace(fileContent).includes(targetEvidence)) {
               inRepoFile = true;
             }
           } catch {}
@@ -271,7 +275,7 @@ export function assessFindings(result, context, { apiMode = true, cwd = process.
         if (inRepoFile) {
           notes.push("out-of-diff evidence: quoted evidence is in existing repository code outside the diff patch");
         } else {
-          notes.push("quoted evidence was not found in the provided context or repository");
+          notes.push("quoted evidence was not found in the provided context");
           effectiveConfidence /= 2;
         }
       }

@@ -118,9 +118,13 @@ test("assessFindings flags files outside the change set and halves confidence", 
   assert.equal(assessments[0].notes.length, 1);
   assert.equal(assessments[0].effectiveConfidence, 0.4);
 
-  // Local CLI reviewers can legitimately inspect untouched files.
-  const cliAssessments = assessFindings(result, context, { apiMode: false });
-  assert.deepEqual(cliAssessments[0].notes, []);
+  // Local CLI reviewers can legitimately inspect untouched existing repo files.
+  const cliRepoResult = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.8, evidence: "" })]
+  });
+  const cliAssessments = assessFindings(cliRepoResult, context, { apiMode: false, cwd: process.cwd() });
+  assert.equal(cliAssessments[0].effectiveConfidence, 0.8);
+  assert.ok(cliAssessments[0].notes.some(n => n.includes("out-of-diff evidence")));
 });
 
 test("assessFindings flags evidence not present in the inlined context", () => {
@@ -138,18 +142,29 @@ test("assessFindings flags evidence not present in the inlined context", () => {
   assert.equal(assessments[0].effectiveConfidence, 0.5);
 });
 
-test("T47: assessFindings preserves full confidence for valid out-of-diff repository files", () => {
+test("T47: assessFindings preserves full confidence for valid out-of-diff repository files in local CLI mode", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.8, evidence: "" })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
+
+  const assessments = assessFindings(result, context, { apiMode: false, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 0.8);
+  assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+});
+
+test("T47: assessFindings penalizes prompt-invisible out-of-diff files in API mode", () => {
   const result = validResult({
     findings: [validFinding({ file: "src/review.js", confidence: 0.8, evidence: "" })]
   });
   const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
 
   const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
-  assert.equal(assessments[0].effectiveConfidence, 0.8);
-  assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+  assert.equal(assessments[0].effectiveConfidence, 0.4);
+  assert.ok(assessments[0].notes.some(n => n.includes("cited file is not in the reviewed change set")));
 });
 
-test("T47: assessFindings preserves full confidence for evidence present in existing repo code outside diff patch", () => {
+test("T47: assessFindings preserves full confidence for evidence present in existing repo code outside diff patch in CLI mode", () => {
   const result = validResult({
     findings: [validFinding({ file: "src/review.js", confidence: 1.0, evidence: "SEVERITY_RANK" })]
   });
@@ -159,36 +174,20 @@ test("T47: assessFindings preserves full confidence for evidence present in exis
     content: "## Diff\n```\nconst x = 1;\n```"
   };
 
-  const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
+  const assessments = assessFindings(result, context, { apiMode: false, cwd: process.cwd() });
   assert.equal(assessments[0].effectiveConfidence, 1.0);
   assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
 });
 
-test("T47: assessFindings halves confidence for fabricated files non-existent in repo or diff", () => {
+test("T47: assessFindings blocks path traversal in finding.file and penalizes confidence", () => {
   const result = validResult({
-    findings: [validFinding({ file: "src/nonexistent_fake_file.js", confidence: 0.8, evidence: "" })]
+    findings: [validFinding({ file: "../../../../etc/passwd", confidence: 0.8, evidence: "" })]
   });
   const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
 
-  const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
+  const assessments = assessFindings(result, context, { apiMode: false, cwd: process.cwd() });
   assert.equal(assessments[0].effectiveConfidence, 0.4);
-  assert.ok(assessments[0].notes.some(n => n.includes("cited file is not in the reviewed change set or repository")));
-});
-
-test("T30: assessFindings uses route-aware haystack matching for API vs CLI reviewers", () => {
-  const result = validResult({
-    findings: [validFinding({ file: "src/review.js", evidence: "SEVERITY_RANK", confidence: 1.0 })]
-  });
-  const context = {
-    changedFiles: ["src/review.js"],
-    includeDiff: true,
-    content: "## Diff\n```\nSEVERITY_RANK\n```"
-  };
-
-  const apiAssessments = assessFindings(result, context, { apiMode: true });
-  const cliAssessments = assessFindings(result, context, { apiMode: false });
-  assert.equal(apiAssessments[0].effectiveConfidence, 1.0);
-  assert.equal(cliAssessments[0].effectiveConfidence, 1.0);
+  assert.ok(assessments[0].notes.some(n => n.includes("cited file is not in the repository")));
 });
 
 test("assessFindings matches evidence with collapsed whitespace", () => {
