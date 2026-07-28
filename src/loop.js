@@ -560,16 +560,12 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
       realCwd = fs.realpathSync.native(targetCwd);
     } catch {}
 
-    try {
-      const root = reviewTrustRoot({ cwd: rawCwd });
-      if (root && !isInsideTrustRoot(realCwd, { root })) {
-        throw new Error(
-          `Directory "${targetCwd}" (resolves to "${realCwd}") is outside the repository trust root "${root}". ` +
-          `Bubblewrap write confinement refuses to bind external target directories.`
-        );
-      }
-    } catch (err) {
-      if (err && err.message && err.message.includes("outside")) throw err;
+    const root = reviewTrustRoot({ cwd: rawCwd });
+    if (root && !isInsideTrustRoot(realCwd, { root })) {
+      throw new Error(
+        `Directory "${targetCwd}" (resolves to "${realCwd}") is outside the repository trust root "${root}". ` +
+        `Bubblewrap write confinement refuses to bind external target directories.`
+      );
     }
 
     const bwrapArgs = [
@@ -581,7 +577,7 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
     ];
     const home = os.homedir();
     const uid = process.getuid ? process.getuid() : null;
-    const secretPaths = [
+    const rawSecretPaths = [
       path.join(home, ".ssh"),
       path.join(home, ".aws"),
       path.join(home, ".gnupg"),
@@ -601,8 +597,18 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
       "/run/podman",
       ...(uid !== null ? [`/run/user/${uid}`] : [])
     ];
-    for (const secretPath of secretPaths) {
-      if (realCwd === secretPath || realCwd.startsWith(secretPath + path.sep)) {
+    for (const rawSecretPath of rawSecretPaths) {
+      let secretPath = rawSecretPath;
+      try {
+        secretPath = fs.realpathSync.native(rawSecretPath);
+      } catch {}
+
+      if (
+        realCwd === secretPath ||
+        realCwd.startsWith(secretPath + path.sep) ||
+        realCwd === rawSecretPath ||
+        realCwd.startsWith(rawSecretPath + path.sep)
+      ) {
         throw new Error(
           `Refusing to run --loop with bwrap write confinement because the repository "${realCwd}" ` +
           `is located inside a sensitive host credential directory "${secretPath}". ` +
