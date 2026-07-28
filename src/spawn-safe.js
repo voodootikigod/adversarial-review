@@ -17,7 +17,7 @@ import { spawnSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { isInsideTrustRoot, reviewTrustRoot } from "./trust-root.js";
-import { resolveCommand } from "./resolve-command.js";
+import { resolveCommand, sanitizePathEnv } from "./resolve-command.js";
 import { isPathInside } from "./path-containment.js";
 
 // Re-exported: this was resolveCommand's original home, and callers import it here.
@@ -73,16 +73,19 @@ export function resolveTrustedCommand(cmd) {
  * searching the current directory — the repository — ahead of PATH.
  */
 export function sanitizedSpawnEnv(env = process.env) {
-  const root = reviewTrustRoot();
-  const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
-  const kept = (env[key] || "")
-    .split(path.delimiter)
-    .filter(Boolean)
-    .filter((dir) => !isPathInside(realpathOrSelf(dir), root));
+  return sanitizePathEnv(env, reviewTrustRoot());
+}
 
-  const out = { ...env, [key]: kept.join(path.delimiter) };
-  if (process.platform === "win32") out.NoDefaultCurrentDirectoryInExePath = "1";
-  return out;
+// Termination must never fail because the trust root is unavailable or poisoned
+// — a process would be left running. Fall back to the boundary-free environment
+// only for that path, where the command is an absolute System32 path with fixed
+// numeric arguments and performs no interpreter lookup.
+function safeSpawnEnvOrRaw() {
+  try {
+    return sanitizedSpawnEnv();
+  } catch {
+    return process.env;
+  }
 }
 
 function realpathOrSelf(p) {
@@ -325,13 +328,16 @@ export function isPidAlive(pid, killImpl = process.kill.bind(process)) {
 }
 
 // Minimal spawnSync wrapper used only for taskkill. shell:false unconditionally
-// — never selected from the environment.
+// — never selected from the environment. The sanitized env applies here too: it
+// costs nothing, and exempting "just this one" spawn is how the previous three
+// gaps in this class started.
 function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
     encoding: "utf8",
     stdio: "pipe",
     shell: false,
     windowsHide: true,
+    env: options.env ?? safeSpawnEnvOrRaw(),
     ...options
   });
   return {

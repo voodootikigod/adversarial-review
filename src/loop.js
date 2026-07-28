@@ -495,8 +495,24 @@ export function buildFixPrompt(findings, files) {
 // one level in. A bare name there would be re-resolved against the inherited
 // npx-style PATH, handing the repository the exact execution the wrapper exists
 // to contain.
+// The fixer's KIND — which calling convention it needs — is separate from WHERE
+// it lives. Once --loop-fixer accepted a path, comparing the raw string to bare
+// names sent "/opt/tools/agy" down the generic stdin branch, silently dropping
+// --dangerously-skip-permissions, --print-timeout and the -p prompt, so the fix
+// was never applied and the loop exited no-diff. Match on the basename, minus a
+// Windows executable/shim extension.
+export function fixerKind(fixerCmd) {
+  // Split on BOTH separators explicitly. path.basename follows the host's rules,
+  // so on POSIX it treats "C:\tools\agy.cmd" as one long filename and the kind
+  // comes back as the whole string — the Windows case would silently fall through
+  // to the generic branch on any non-Windows machine, including CI.
+  const base = String(fixerCmd || "").split(/[/\\]/).pop().toLowerCase();
+  return base.replace(/\.(cmd|bat|exe|com)$/, "");
+}
+
 export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs = null, fixerPath = null } = {}) {
   const exe = fixerPath || fixerCmd;
+  const kind = fixerKind(fixerCmd);
   let cmd, args;
   // Whether the prompt travels over stdin. agy is the exception on BOTH paths:
   // its -p takes the prompt as a VALUE and it has no `-` sentinel, so `-p -`
@@ -504,10 +520,10 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
   // path already accounts for that; this one has to as well.
   let useStdin = true;
 
-  if (fixerCmd === "codex") {
+  if (kind === "codex") {
     cmd = exe;
     args = ["exec", "--ephemeral", "--ignore-rules", "-"];
-  } else if (fixerCmd === "agy") {
+  } else if (kind === "agy") {
     cmd = exe;
     args = ["--dangerously-skip-permissions"];
     // Before the -p pair: agy parses with Go's flag package, which stops at the
@@ -515,7 +531,7 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
     args.push(...cliPrintTimeoutArgs("agy", timeoutMs));
     args.push("-p", prompt ?? "");
     useStdin = false;
-  } else if (fixerCmd === "claude") {
+  } else if (kind === "claude") {
     cmd = exe;
     args = ["--dangerously-skip-permissions", "-p", "-"];
   } else {
@@ -540,7 +556,8 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
 function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
   // An argv-delivered prompt has a hard platform ceiling, and exceeding it fails
   // as an opaque spawn error. Check before spawning so the message is actionable.
-  if (cliRequiresArgvPrompt(fixerCmd)) {
+  const kind = fixerKind(fixerCmd);
+  if (cliRequiresArgvPrompt(kind)) {
     const promptBytes = Buffer.byteLength(prompt);
     const argvLimit = maxArgvPromptBytes();
     if (promptBytes > argvLimit) {
@@ -550,8 +567,8 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
         `Narrow --loop-fixer-scope, lower --max-bytes, or use --loop-fixer codex.`
       );
     }
-    if (!cliUsableForReview(fixerCmd)) {
-      throw new Error(cliUnusableMessage(fixerCmd));
+    if (!cliUsableForReview(kind)) {
+      throw new Error(cliUnusableMessage(kind));
     }
   }
 
@@ -580,7 +597,7 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
     if (!spawnCmd) {
       throw new Error(
         "The write sandbox helper \"unshare\" was not found on PATH outside the repository " +
-        "under review. Re-run with --loop-unsandboxed to proceed without it, or install " +
+        "under review. Re-run with --loop-unsafe to proceed without it, or install " +
         "util-linux system-wide."
       );
     }
@@ -815,7 +832,7 @@ export async function runLoop(cwd, args) {
       );
       process.exit(1);
     }
-    const fixerProvider = FIXER_PROVIDER_MAP[fixerCmd];
+    const fixerProvider = FIXER_PROVIDER_MAP[fixerKind(fixerCmd)];
     if (!fixerProvider) {
       log.warn(
         "--loop-unsafe-allow-fix-secrets: cannot verify provider match for custom fixer — " +
@@ -1344,7 +1361,7 @@ export async function runBranchLoop(cwd, args) {
       );
       process.exit(1);
     }
-    const fixerProvider = FIXER_PROVIDER_MAP[fixerCmd];
+    const fixerProvider = FIXER_PROVIDER_MAP[fixerKind(fixerCmd)];
     if (!fixerProvider) {
       log.warn("--loop-unsafe-allow-fix-secrets: cannot verify provider match for custom fixer — bypassing at your own risk.");
     } else {

@@ -33,6 +33,31 @@ function isInside(target, root) {
 }
 
 /**
+ * An environment whose PATH excludes everything inside `root`.
+ *
+ * Lives HERE, taking the root as a parameter, precisely so the trust-root
+ * bootstrap can use it. The convenience wrapper in spawn-safe.js supplies
+ * reviewTrustRoot(), which the bootstrap cannot call — it is what computes it —
+ * and importing that wrapper would be a cycle. Without this split the one git
+ * invocation that runs before everything else was the only spawn still inheriting
+ * the repository's PATH, so an external git wrapper with a `/usr/bin/env` shebang
+ * would resolve its interpreter out of ./node_modules/.bin.
+ */
+export function sanitizePathEnv(env, root) {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  const kept = (env[key] || "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .filter((dir) => !isInside(dir, root));
+
+  const out = { ...env, [key]: kept.join(path.delimiter) };
+  // Stops the Windows command interpreter searching the current directory — the
+  // repository under review — ahead of PATH.
+  if (process.platform === "win32") out.NoDefaultCurrentDirectoryInExePath = "1";
+  return out;
+}
+
+/**
  * Resolve a bare command name to an absolute executable path, or null.
  *
  * `excludeRoots` drops PATH entries that live inside any of the given

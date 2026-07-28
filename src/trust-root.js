@@ -1,7 +1,7 @@
 import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
-import { resolveCommand } from "./resolve-command.js";
+import { resolveCommand, sanitizePathEnv } from "./resolve-command.js";
 import { isPathInside } from "./path-containment.js";
 
 // The TRUST BOUNDARY for a review is the whole git worktree under review, NOT
@@ -91,7 +91,12 @@ export function reviewTrustRoot({ cwd = process.cwd() } = {}) {
         cwd,
         encoding: "utf8",
         timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"]
+        stdio: ["ignore", "pipe", "ignore"],
+        // Resolving git to an outside path protects that executable only. An
+        // external wrapper with a `/usr/bin/env` shebang still resolves its
+        // INTERPRETER from the inherited PATH, which under npx starts with the
+        // repository. Filter against the boundary we just computed.
+        env: sanitizePathEnv(process.env, boundary)
       }).trim();
       // A git-reported root may only WIDEN the filesystem boundary. The walk
       // cannot be hijacked; a git invocation can be steered (GIT_DIR, a planted

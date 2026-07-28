@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { log } from "../src/utils.js";
-import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
+import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, fixerKind, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
 
 test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemini key", () => {
   assert.equal(FIXER_PROVIDER_MAP.agy, "gemini");
@@ -55,6 +55,38 @@ test("the unshare wrapper receives the fixer's ABSOLUTE path, never a bare name"
     assert.ok(args.indexOf("--mount") < args.indexOf(abs));
     assert.equal(args.at(-1), "P", "the prompt still has to be last");
     assert.equal(args.at(-2), "-p");
+  }
+});
+
+test("a path-named fixer still gets its own calling convention", () => {
+  // Once --loop-fixer accepted a path, comparing the raw string to bare names
+  // sent "/opt/tools/agy" down the generic stdin branch — dropping
+  // --dangerously-skip-permissions, --print-timeout and the -p prompt, so the fix
+  // was never applied and the loop exited no-diff. Match on the basename.
+  const cases = [
+    ["/opt/tools/agy", "agy"],
+    ["C:\\tools\\agy.cmd", "agy"],
+    ["/opt/tools/claude", "claude"],
+    ["C:\\npm\\claude.CMD", "claude"],
+    ["/opt/tools/codex", "codex"],
+    ["/opt/tools/codex.exe", "codex"]
+  ];
+  for (const [named, expectedKind] of cases) {
+    assert.equal(fixerKind(named), expectedKind, `${named} must be recognised as ${expectedKind}`);
+    const { cmd, args, useStdin } = buildFixerCmd(named, { mode: "none" }, {
+      prompt: "FIXP", timeoutMs: 600 * 1000, fixerPath: named
+    });
+    assert.equal(cmd, named, "the resolved path is what gets spawned");
+    if (expectedKind === "agy") {
+      assert.equal(useStdin, false);
+      assert.ok(args.includes("--dangerously-skip-permissions"), `${named}: lost its write flag`);
+      assert.deepEqual(args.slice(-2), ["-p", "FIXP"], `${named}: lost its argv prompt`);
+      assert.ok(args.includes("--print-timeout"), `${named}: lost its print timeout`);
+    } else {
+      assert.equal(useStdin, true);
+      assert.equal(args.at(-1), "-", `${named}: lost its stdin sentinel`);
+      assert.notDeepEqual(args, ["-"], `${named}: fell through to the generic branch`);
+    }
   }
 });
 

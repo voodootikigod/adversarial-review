@@ -38,6 +38,28 @@ test("no source file spawns ANY command by bare name", () => {
   assert.deepEqual(offenders, [], `bare-name spawns found:\n${offenders.join("\n")}`);
 });
 
+test("every spawn passes a sanitized environment", () => {
+  // Third time this class regressed by being applied incompletely: bare-name
+  // spawns, then containment predicates, now inherited environments. Resolving
+  // the executable is only half — the child does its OWN lookups from what it
+  // inherits (`#!/usr/bin/env node`, a .cmd wrapper falling back to bare `node`).
+  // Enforced by scan rather than by remembering every call site.
+  const offenders = [];
+  for (const file of fs.readdirSync(path.join(root, "src"))) {
+    if (!file.endsWith(".js")) continue;
+    const raw = fs.readFileSync(path.join(root, "src", file), "utf8");
+    const code = raw.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+    // Each spawn call, from the opening paren to its matching close-ish boundary.
+    const calls = code.match(/(?:execFileSync|spawnSync|spawn|spawnImpl)\([\s\S]{0,600}?\n\s*\}\)/g) || [];
+    for (const call of calls) {
+      // spawn-safe.js owns the sanitizer itself; exec-watchdog forwards it.
+      if (/env:\s*(sanitizedSpawnEnv|sanitizePathEnv|safeSpawnEnvOrRaw|options\.env)/.test(call)) continue;
+      offenders.push(`${file}: ${call.split("\n")[0].trim()}`);
+    }
+  }
+  assert.deepEqual(offenders, [], `spawns without a sanitized env:\n${offenders.join("\n")}`);
+});
+
 test("no source file spawns git by bare name", () => {
   // The whole defence is that an absolute path reaches execFileSync. A single
   // bare "git" anywhere in src/ reopens the current-directory search.
