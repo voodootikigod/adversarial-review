@@ -23,5 +23,8 @@ export function isPathInside(target, root) {
   const rel = path.relative(path.resolve(root), path.resolve(target));
   if (rel === "") return true;
   if (path.isAbsolute(rel)) return false;
-  return rel !== ".." && !rel.startsWith(".." + path.sep);
+  if (rel === "..") return false;
+  if (rel.startsWith("../")) return false;
+  if (process.platform === "win32" && rel.startsWith("..\\")) return false;
+  return true;
 }

@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolveBranchBaseSha } from "../src/loop.js";
 import { makeGit } from "./helpers/git-retry.mjs";
+import { writeMockBin } from "./helpers/mock-bin.mjs";
 
 // T7 / GitHub #12 — branch-scope --loop. Reviews <branch> vs <base>, commits fixes
 // onto the FEATURE branch, resets --hard on a failed fix. The load-bearing safety
@@ -22,30 +23,56 @@ const FLAG = '{"verdict":"needs-attention","summary":"bad","coverage":{"files_ex
 
 // Reviewer mocks (read stdin = the prompt incl. the branch diff): static, or
 // "smart" (APPROVE once the diff carries FIXED_MARKER — proves per-round re-review).
-const staticMock = (body) => `#!/bin/sh\ncat >/dev/null\ncat <<'JSON'\n${body}\nJSON\n`;
-const smartMock =
-  `#!/bin/sh\n` +
-  `INPUT=$(cat)\n` +
-  `if printf '%s' "$INPUT" | grep -q 'FIXED_MARKER'; then\n` +
-  `cat <<'JSON'\n${APPROVE}\nJSON\n` +
-  `else\n` +
-  `cat <<'JSON'\n${FLAG}\nJSON\n` +
-  `fi\n`;
+const staticMock = (body) => `
+import fs from "node:fs";
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(${JSON.stringify(body)});
+});
+`;
+const smartMock = `
+import fs from "node:fs";
+const input = fs.readFileSync(0, "utf8");
+if (input.includes("FIXED_MARKER")) {
+  process.stdout.write(${JSON.stringify(APPROVE)});
+} else {
+  process.stdout.write(${JSON.stringify(FLAG)});
+}
+`;
 // A reviewer that flags a DIFFERENT finding each round (line jumps by 10 per marker)
 // so the gating set never repeats → the loop reaches the ceiling, not no-progress.
-const varyingMock =
-  `#!/bin/sh\n` +
-  `INPUT=$(cat)\n` +
-  `N=$(printf '%s' "$INPUT" | grep -c 'FIXED_MARKER')\n` +
-  `LINE=$(( (N + 1) * 10 ))\n` +
-  `cat <<JSON\n` +
-  `{"verdict":"needs-attention","summary":"bad","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[{"severity":"high","category":"security","title":"t","body":"b","exploit_scenario":"e","evidence":"","file":"code.js","line_start":$LINE,"line_end":$LINE,"confidence":0.9,"recommendation":"r"}],"next_steps":["n"]}\n` +
-  `JSON\n`;
+const varyingMock = `
+import fs from "node:fs";
+const input = fs.readFileSync(0, "utf8");
+const count = (input.match(/FIXED_MARKER/g) || []).length;
+const line = (count + 1) * 10;
+const res = {
+  verdict: "needs-attention",
+  summary: "bad",
+  coverage: { files_examined: ["code.js"], files_skipped: [] },
+  findings: [{
+    severity: "high", category: "security", title: "t", body: "b", exploit_scenario: "e",
+    evidence: "", file: "code.js", line_start: line, line_end: line, confidence: 0.9, recommendation: "r"
+  }],
+  next_steps: ["n"]
+};
+process.stdout.write(JSON.stringify(res));
+`;
 
 // Fixer mocks: append a marker (resolves + changes the tree), no-op, or partial+fail.
-const MARKER_FIXER = `#!/bin/sh\ncat >/dev/null\nprintf '\\n// FIXED_MARKER\\n' >> code.js\nexit 0\n`;
-const NOOP_FIXER = `#!/bin/sh\ncat >/dev/null\nexit 0\n`;
-const ERR_FIXER = `#!/bin/sh\ncat >/dev/null\nprintf '\\n// partial\\n' >> code.js\nexit 1\n`;
+const MARKER_FIXER = `
+import fs from "node:fs";
+fs.appendFileSync("code.js", "\\n// FIXED_MARKER\\n");
+process.exit(0);
+`;
+const NOOP_FIXER = `
+process.exit(0);
+`;
+const ERR_FIXER = `
+import fs from "node:fs";
+fs.appendFileSync("code.js", "\\n// partial\\n");
+process.exit(1);
+`;
 
 // ── resolveBranchBaseSha unit tests (kills the base-resolution hollow survivors:
 //    the pin's VALUE, the invalid-ref guard, and the develop/master fallback) ────
@@ -59,7 +86,7 @@ function makeRepo(defaultBranch) {
   git(["config", "commit.gpgsign", "false"]);
   fs.writeFileSync(path.join(dir, "f.txt"), "hi\n");
   git(["add", "."]);
-  git(["commit", "-qm", "c1"]);
+  git(["commit", "-qm", "init"]);
   return { dir, git };
 }
 
@@ -67,7 +94,6 @@ test("resolveBranchBaseSha: an explicit base ref resolves to that ref's commit s
   const { dir, git } = makeRepo("main");
   try {
     const expected = git(["rev-parse", "main^{commit}"]).stdout.trim();
-    // The pin's VALUE is asserted here — a `return null` mutant fails this.
     assert.equal(resolveBranchBaseSha(dir, "main"), expected);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -87,33 +113,25 @@ test("resolveBranchBaseSha: with no base, auto-resolves to develop when main is 
   const { dir, git } = makeRepo("develop");
   try {
     const expected = git(["rev-parse", "develop^{commit}"]).stdout.trim();
-    // Exercises the candidate fallback loop (main absent → develop).
     assert.equal(resolveBranchBaseSha(dir, null), expected);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-// Build a repo: main (base) + a feature branch one commit ahead, then run the CLI.
-// `dirty` leaves an uncommitted change before invoking (AC1). Returns status/io +
-// a git() helper and the recorded base/feature shas.
+// ── Integration tests for bin/cli.js --loop with branch scope ──────────────
+
 function runBranchLoopCli(args, { mocks = {}, dirty = false, fixer = "myfixer", detach = false } = {}) {
   const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-bl-mocks-"));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-bl-repo-"));
   const git = makeGit(repoDir);
   try {
     for (const [name, body] of Object.entries(mocks)) {
-      const binName = process.platform === "win32" ? `${name}.cmd` : name;
-      const p = path.join(mocksDir, binName);
-      fs.writeFileSync(p, body);
-      if (process.platform !== "win32") fs.chmodSync(p, 0o755);
+      writeMockBin(mocksDir, name, body);
     }
     git(["init", "-q", "-b", "main"]);
     git(["config", "user.email", "t@example.com"]);
     git(["config", "user.name", "Test"]);
-    // Disable commit signing in the throwaway repo: a global signing config
-    // (e.g. 1Password) has no agent in a headless test run and would fail every
-    // commit — including the fix commits runBranchLoop makes.
     git(["config", "commit.gpgsign", "false"]);
     git(["config", "tag.gpgsign", "false"]);
     fs.writeFileSync(path.join(repoDir, "code.js"), "export const x = 1;\n");
@@ -128,12 +146,21 @@ function runBranchLoopCli(args, { mocks = {}, dirty = false, fixer = "myfixer", 
     const baseSha = git(["rev-parse", "main"]).stdout.trim();
     const headBefore = git(["rev-parse", "HEAD"]).stdout.trim();
 
-    const PATH = [mocksDir, nodeBinDir, "/usr/bin", "/bin"].join(path.delimiter);
-    const r = spawnSync(process.execPath, [cli, ...args, "--loop-fixer", fixer], {
+    let sysDirs = ["/usr/bin", "/bin"];
+    if (process.platform === "win32") {
+      const whereGit = spawnSync("where.exe", ["git"], { encoding: "utf8" });
+      if (whereGit.status === 0 && whereGit.stdout.trim()) {
+        sysDirs = [path.dirname(whereGit.stdout.trim().split(/\r?\n/)[0])];
+      }
+    }
+    const PATH = [mocksDir, nodeBinDir, ...sysDirs].join(path.delimiter);
+    const cliArgs = [...args];
+    if (process.platform === "win32" && !cliArgs.includes("--loop-unsafe")) {
+      cliArgs.push("--loop-unsafe");
+    }
+    const r = spawnSync(process.execPath, [cli, ...cliArgs, "--loop-fixer", fixer], {
       cwd: repoDir,
       encoding: "utf8",
-      // Isolate the global config OUTSIDE the reviewed repo (cwd=repoDir) so it's
-      // hermetic AND not rejected by the repo-containment guard (T23).
       env: { HOME: process.env.HOME, PATH, ADVERSARIAL_REVIEW_CONFIG: path.join(mocksDir, "adv-config.json") }
     });
     const baseShaAfter = git(["rev-parse", "main"]).stdout.trim();

@@ -102,7 +102,11 @@ test("makeGit: a bad cwd (ENOENT, permanent misconfiguration) fails fast and is 
   assert.ok(elapsed < 500, `a permanent misconfiguration should fail fast, took ${elapsed}ms`);
 });
 
+import { _resetTrustRootCache } from "../src/trust-root.js";
+import { writeMockBin } from "./helpers/mock-bin.mjs";
+
 test("makeGit: retries exactly maxAttempts times, not more (kills an off-by-one boundary regression)", () => {
+  _resetTrustRootCache();
   // A fake `git` on PATH counts real invocations and always reports a
   // retryable failure, so this directly measures the loop's stop condition
   // rather than inferring it from elapsed time — a `attempt > maxAttempts`
@@ -110,15 +114,23 @@ test("makeGit: retries exactly maxAttempts times, not more (kills an off-by-one 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-git-retry-count-"));
   const fakeGitDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-fake-git-"));
   const counterPath = path.join(dir, "count.txt");
-  const fakeGitPath = path.join(fakeGitDir, "git");
-  fs.writeFileSync(
-    fakeGitPath,
-    `#!/bin/sh\nprintf 'x' >> ${JSON.stringify(counterPath)}\nprintf 'fatal: Unable to create lock\\n' >&2\nexit 128\n`
-  );
-  fs.chmodSync(fakeGitPath, 0o755);
+  const counterPathPosix = counterPath.replace(/\\/g, "/");
+  const mockCode = `
+import fs from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  console.log("git version 2.40.0");
+  process.exit(0);
+}
+fs.appendFileSync(${JSON.stringify(counterPathPosix)}, "x");
+console.error("fatal: Unable to create lock");
+process.exit(128);
+`;
+  writeMockBin(fakeGitDir, "git", mockCode);
 
   const originalPath = process.env.PATH;
-  process.env.PATH = [fakeGitDir, originalPath].join(path.delimiter);
+  const filteredPath = originalPath.split(path.delimiter).filter(d => !fs.existsSync(path.join(d, "git.exe"))).join(path.delimiter);
+  process.env.PATH = [fakeGitDir, filteredPath].join(path.delimiter);
   try {
     const git = makeGit(dir, { maxAttempts: 4, baseDelayMs: 5, maxDelayMs: 20 });
     const r = git(["status"]);
@@ -127,6 +139,7 @@ test("makeGit: retries exactly maxAttempts times, not more (kills an off-by-one 
     assert.equal(invocations, 4, `expected exactly maxAttempts (4) invocations, got ${invocations}`);
   } finally {
     process.env.PATH = originalPath;
+    _resetTrustRootCache();
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(fakeGitDir, { recursive: true, force: true });
   }

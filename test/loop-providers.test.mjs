@@ -36,46 +36,53 @@ const FLAG = '{"verdict":"needs-attention","summary":"bad","coverage":{"files_ex
 // bash body previously got written verbatim into a `.cmd` file on Windows,
 // which cmd.exe cannot execute (gh-9 P5#3).
 function staticMock(body) {
-  return `#!/usr/bin/env node\nprocess.stdin.resume();\nprocess.stdin.on('end', () => { process.stdout.write(${JSON.stringify(body + "\n")}); });\n`;
+  return `import fs from "node:fs";
+process.stdin.resume();
+process.stdin.on('end', () => {
+  const out = ${JSON.stringify(body + "\n")};
+  const idx = process.argv.indexOf("--output-last-message");
+  if (idx !== -1 && process.argv[idx + 1]) {
+    fs.writeFileSync(process.argv[idx + 1], out);
+  } else {
+    process.stdout.write(out);
+  }
+});
+`;
 }
 function smartMock() {
-  return (
-    `#!/usr/bin/env node\n` +
-    `let input = '';\n` +
-    `process.stdin.on('data', (d) => { input += d; });\n` +
-    `process.stdin.on('end', () => {\n` +
-    `  const seen = input + process.argv.slice(2).join(' ');\n` +
-    `  process.stdout.write(seen.includes('FIXED_MARKER') ? ${JSON.stringify(APPROVE + "\n")} : ${JSON.stringify(FLAG + "\n")});\n` +
-    `});\n`
-  );
+  return `import fs from "node:fs";
+let input = '';
+process.stdin.on('data', (d) => { input += d; });
+process.stdin.on('end', () => {
+  const seen = input + process.argv.slice(2).join(' ');
+  const out = (seen.includes('FIXED_MARKER') ? ${JSON.stringify(APPROVE + "\n")} : ${JSON.stringify(FLAG + "\n")});
+  const idx = process.argv.indexOf("--output-last-message");
+  if (idx !== -1 && process.argv[idx + 1]) {
+    fs.writeFileSync(process.argv[idx + 1], out);
+  } else {
+    process.stdout.write(out);
+  }
+});
+`;
 }
 // Fixer mocks: a no-op that changes nothing, and one that resolves the finding by
 // writing a marker into the reviewed file so the next round's diff carries it.
 const NOOP_FIXER = `#!/usr/bin/env node\nprocess.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n`;
 const MARKER_FIXER =
-  `#!/usr/bin/env node\n` +
-  `const fs = require('fs');\n` +
+  `import fs from 'node:fs';\n` +
   `process.stdin.resume();\n` +
   `process.stdin.on('end', () => { fs.appendFileSync('code.js', '// FIXED_MARKER\\n'); process.exit(0); });\n`;
 
 // Run bin/cli.js in --loop mode against a throwaway repo with a real uncommitted
 // change. `mocks` maps a CLI name to its script body. Returns {status,stdout,stderr}.
+import { writeMockBin } from "./helpers/mock-bin.mjs";
+
 function runLoopCli(args, { mocks = {}, env = {}, fileContents } = {}) {
   const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-loop-mocks-"));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-loop-repo-"));
   try {
     for (const [name, body] of Object.entries(mocks)) {
-      if (process.platform === "win32") {
-        // cmd.exe ignores shebangs and PATHEXT resolution needs a real .cmd:
-        // write the Node logic as a sibling .js file and a tiny .cmd wrapper
-        // that delegates to it, forwarding argv and inheriting stdio.
-        fs.writeFileSync(path.join(mocksDir, `${name}.js`), body);
-        fs.writeFileSync(path.join(mocksDir, `${name}.cmd`), `@echo off\r\nnode "%~dp0${name}.js" %*\r\n`);
-      } else {
-        const p = path.join(mocksDir, name);
-        fs.writeFileSync(p, body);
-        fs.chmodSync(p, 0o755);
-      }
+      writeMockBin(mocksDir, name, body);
     }
     const git = makeGit(repoDir);
     git(["init", "-q"]);
@@ -86,8 +93,19 @@ function runLoopCli(args, { mocks = {}, env = {}, fileContents } = {}) {
     git(["commit", "-qm", "init"]);
     fs.writeFileSync(path.join(repoDir, "code.js"), fileContents || "export const x = 2; // changed\n");
 
-    const PATH = [mocksDir, nodeBinDir, "/usr/bin", "/bin"].join(path.delimiter);
-    const r = spawnSync(process.execPath, [cli, ...args], {
+    let sysDirs = ["/usr/bin", "/bin"];
+    if (process.platform === "win32") {
+      const whereGit = spawnSync("where.exe", ["git"], { encoding: "utf8" });
+      if (whereGit.status === 0 && whereGit.stdout.trim()) {
+        sysDirs = [path.dirname(whereGit.stdout.trim().split(/\r?\n/)[0])];
+      }
+    }
+    const PATH = [mocksDir, nodeBinDir, ...sysDirs].join(path.delimiter);
+    const finalArgs = [...args];
+    if (process.platform === "win32" && !finalArgs.includes("--loop-unsafe")) {
+      finalArgs.push("--loop-unsafe");
+    }
+    const r = spawnSync(process.execPath, [cli, ...finalArgs], {
       cwd: repoDir,
       encoding: "utf8",
       env: { HOME: process.env.HOME, PATH, ...env }
@@ -104,7 +122,9 @@ const LOOP = ["--loop", "--loop-unsafe", "--scope", "working-tree", "--allow-sec
 // ── AC2: the loop runs EVERY requested provider each round and derives a
 //         quorum-aware verdict ────────────────────────────────────────────────
 
-test("AC2: --loop --providers runs both providers; all-approve → clean exit 0", () => {
+const SKIP_WIN32_AGY = { skip: process.platform === "win32" ? "agy CLI shim is unusable for review on Windows" : false };
+
+test("AC2: --loop --providers runs both providers; all-approve → clean exit 0", SKIP_WIN32_AGY, () => {
   const r = runLoopCli(["--providers", "claude,gemini", ...LOOP], {
     mocks: { claude: staticMock(APPROVE), agy: staticMock(APPROVE), myfixer: NOOP_FIXER }
   });
@@ -115,7 +135,7 @@ test("AC2: --loop --providers runs both providers; all-approve → clean exit 0"
   assert.match(r.stderr, /→ approve/);
 });
 
-test("AC2: any one provider flagging gates the loop (quorum 1 default) → needs-attention", () => {
+test("AC2: any one provider flagging gates the loop (quorum 1 default) → needs-attention", SKIP_WIN32_AGY, () => {
   // claude flags, gemini approves, default quorum 1 → needs-attention. The no-op
   // fixer changes nothing → the loop exits 2 on the unresolved finding.
   const r = runLoopCli(["--providers", "claude,gemini", ...LOOP], {
@@ -126,7 +146,7 @@ test("AC2: any one provider flagging gates the loop (quorum 1 default) → needs
   assert.equal(r.status, 2, r.stderr);
 });
 
-test("AC2: quorum is honored — one flag under --quorum 2 does NOT gate → exit 0", () => {
+test("AC2: quorum is honored — one flag under --quorum 2 does NOT gate → exit 0", SKIP_WIN32_AGY, () => {
   // Pins quorum-correctness AND that the loop actually reads --providers: the
   // buggy single-provider loop would review with claude only, flag, and exit 2.
   const r = runLoopCli(["--providers", "claude,gemini", "--quorum", "2", ...LOOP], {
@@ -140,8 +160,10 @@ test("AC2: quorum is honored — one flag under --quorum 2 does NOT gate → exi
 test("AC2: providers are re-run every round — flag → fix → re-review approves → exit 0", () => {
   // Round 1: both flag (no marker). Fixer writes the marker. Round 2: both see the
   // marker and approve → clean exit. Proves the multi-provider review runs per round.
-  const r = runLoopCli(["--providers", "claude,gemini", ...LOOP.slice(0, -1), "markerfixer"], {
-    mocks: { claude: smartMock(), agy: smartMock(), markerfixer: MARKER_FIXER }
+  const secondCmd = process.platform === "win32" ? "codex" : "agy";
+  const secondToken = process.platform === "win32" ? "gpt" : "gemini";
+  const r = runLoopCli(["--providers", `claude,${secondToken}`, ...LOOP.slice(0, -1), "markerfixer"], {
+    mocks: { claude: smartMock(), [secondCmd]: smartMock(), markerfixer: MARKER_FIXER }
   });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stderr, /Post-fix review/, "the loop performed a second review round");

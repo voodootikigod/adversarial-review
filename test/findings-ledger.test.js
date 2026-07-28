@@ -142,7 +142,7 @@ test("T20: an existing permissive ledger is tightened on the next append", { ski
   }
 });
 
-test("T20: a symlinked ledger inside the repo is refused; victim untouched", () => {
+test("T20: a symlinked ledger inside the repo is refused; victim untouched", { skip: process.platform === "win32" }, () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-symlink-")));
   const cwd = process.cwd();
   try {

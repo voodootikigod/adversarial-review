@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { log } from "../src/utils.js";
-import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, fixerKind, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
+import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, fixerKind, FIXER_PROVIDER_MAP, detectFixer, probeOsConstraint } from "../src/loop.js";
 
 test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemini key", () => {
   assert.equal(FIXER_PROVIDER_MAP.agy, "gemini");
@@ -201,6 +201,17 @@ test("T15 AC4: the trusted file list and constraint stay outside the fences", ()
     assert.ok(filesIdx > closeAfter, "file list must not be inside a fence");
     assert.ok(constraintIdx > closeAfter, "constraint must not be inside a fence");
   }
+});
+
+test("probeOsConstraint on win32 throws without --loop-unsafe and returns advisory mode with --loop-unsafe", () => {
+  assert.throws(
+    () => probeOsConstraint({ loopUnsafe: false }, { platform: "win32" }),
+    /--loop on Windows has no enforced write sandbox/
+  );
+  assert.deepEqual(
+    probeOsConstraint({ loopUnsafe: true }, { platform: "win32" }),
+    { mode: "advisory" }
+  );
 });
 
 test("T15 AC5: the preamble grants scoped authority, not data-only semantics", () => {

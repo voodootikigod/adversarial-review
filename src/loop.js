@@ -180,7 +180,11 @@ export function buildLoopSummary({ providers, iterations, exitReason, survivingC
 
 // ─── Recovery command ─────────────────────────────────────────────────────────
 
-function buildRecoveryCmd(stashName) {
+function buildRecoveryCmd(stashName, stashRef = null) {
+  if (process.platform === "win32") {
+    const target = stashRef || `"${stashName}"`;
+    return `# Restore checkpoint:\ngit stash apply --index ${target}`;
+  }
   return (
     `# Restore checkpoint:\n` +
     `REF=$(git stash list --format='%gd %s' | grep '${stashName}' | awk '{print $1}'); ` +
@@ -264,9 +268,17 @@ function probeLinuxConstraint() {
   return null;
 }
 
-function probeOsConstraint(args) {
-  const { platform } = process;
-  if (platform === "win32") throw new Error("--loop is not supported on Windows.");
+export function probeOsConstraint(args, { platform = process.platform } = {}) {
+  if (platform === "win32") {
+    if (!args.loopUnsafe) {
+      throw new Error(
+        "--loop on Windows has no enforced write sandbox.\n" +
+        "Pass --loop-unsafe to proceed, acknowledging the fixer has unrestricted write access."
+      );
+    }
+    log.warn("Windows: running without write sandboxing (--loop-unsafe). Fixer has unrestricted write access.");
+    return { mode: "advisory" };
+  }
 
   if (platform === "darwin") {
     if (!args.loopUnsafe) {
@@ -616,12 +628,13 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
 
   const stderrChunks = [];
   child.stderr?.on("data", chunk => stderrChunks.push(chunk));
+  child.stdin?.on("error", () => {});
 
   try {
     // The argv-prompt fixer already HAS the prompt; writing it again would feed
     // the whole fix instruction to a process that is not reading stdin.
-    if (useStdin) child.stdin.write(prompt, "utf8");
-    child.stdin.end();
+    if (useStdin && child.stdin?.writable) child.stdin.write(prompt, "utf8");
+    child.stdin?.end();
   } catch { /* fixer may not read stdin; that's OK */ }
 
   const promise = new Promise(resolve => {

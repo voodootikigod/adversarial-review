@@ -16,7 +16,12 @@ function appendVia(fd, text) {
   try { fs.writeSync(fd, text); } finally { fs.closeSync(fd); }
 }
 
-test("AC1: a leaf symlink pointing outside the repo is refused; victim untouched", () => {
+function symlinkDir(target, link) {
+  const type = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(target, link, type);
+}
+
+test("AC1: a leaf symlink pointing outside the repo is refused; victim untouched", { skip: process.platform === "win32" ? "File symlinks require elevated privileges on Windows" : false }, () => {
   const root = tmpRoot("leaf");
   try {
     const victim = path.join(root, "victim.txt");
@@ -44,7 +49,7 @@ test("AC2: a parent directory symlink (.adlc -> outside) is refused; victim unto
     fs.writeFileSync(victim, "pre\n");
     const repo = path.join(root, "repo");
     fs.mkdirSync(repo);
-    fs.symlinkSync(outside, path.join(repo, ".adlc"));
+    symlinkDir(outside, path.join(repo, ".adlc"));
 
     assert.throws(
       () => openContainedAppendFd(path.join(repo, ".adlc", "findings.jsonl"), { base: repo }),
@@ -64,7 +69,7 @@ test("AC3: a grandparent symlink two levels up is refused", () => {
     const repo = path.join(root, "repo");
     fs.mkdirSync(repo);
     // repo/a -> outside, target repo/a/b/findings.jsonl escapes via the grandparent.
-    fs.symlinkSync(outside, path.join(repo, "a"));
+    symlinkDir(outside, path.join(repo, "a"));
 
     assert.throws(
       () => openContainedAppendFd(path.join(repo, "a", "b", "findings.jsonl"), { base: repo }),
@@ -87,7 +92,7 @@ test("AC4: a symlink that resolves INSIDE the repo is ALSO refused (revised)", (
     fs.mkdirSync(repo);
     const realDir = path.join(repo, "real-adlc");
     fs.mkdirSync(realDir);
-    fs.symlinkSync(realDir, path.join(repo, ".adlc")); // .adlc -> repo/real-adlc (still inside)
+    symlinkDir(realDir, path.join(repo, ".adlc")); // .adlc -> repo/real-adlc (still inside)
 
     assert.throws(
       () => openContainedAppendFd(path.join(repo, ".adlc", "findings.jsonl"), { base: repo }),
@@ -108,7 +113,7 @@ test("AC3b: mkdir must NOT create directories outside base before the guard fire
     fs.mkdirSync(outside);
     const repo = path.join(root, "repo");
     fs.mkdirSync(repo);
-    fs.symlinkSync(outside, path.join(repo, ".adlc"));
+    symlinkDir(outside, path.join(repo, ".adlc"));
 
     assert.throws(
       () => openContainedAppendFd(path.join(repo, ".adlc", "sub", "findings.jsonl"), { base: repo }),
@@ -127,7 +132,7 @@ test("AC5: a canonical base under a symlinked prefix is NOT a false positive", (
     const realTarget = path.join(root, "real");
     fs.mkdirSync(realTarget);
     const symlinkedBase = path.join(root, "link");
-    fs.symlinkSync(realTarget, symlinkedBase);
+    symlinkDir(realTarget, symlinkedBase);
 
     const fd = openContainedAppendFd(path.join(symlinkedBase, ".adlc", "findings.jsonl"), { base: symlinkedBase });
     appendVia(fd, "ok\n");
@@ -137,7 +142,7 @@ test("AC5: a canonical base under a symlinked prefix is NOT a false positive", (
   }
 });
 
-test("AC6: a first write creates the leaf 0600 with no symlink present", { skip: process.platform === "win32" }, () => {
+test("AC6: a first write creates the leaf 0600 with no symlink present", { skip: process.platform === "win32" ? "POSIX octal mode assertions do not apply to Windows NTFS ACLs" : false }, () => {
   const root = tmpRoot("create");
   try {
     const fd = openContainedAppendFd(path.join(root, ".adlc", "findings.jsonl"), { base: root });
@@ -189,7 +194,7 @@ test("AC (operator intent): an absolute path the operator chose OUTSIDE base is 
   }
 });
 
-test("AC (operator intent): but a symlinked leaf is refused even outside base", () => {
+test("AC (operator intent): but a symlinked leaf is refused even outside base", { skip: process.platform === "win32" }, () => {
   const root = tmpRoot("operator-leaf");
   try {
     const repo = path.join(root, "repo");
@@ -216,7 +221,7 @@ test("AC11: the module documents the TOCTOU / static-threat boundary", () => {
   assert.match(src, /TOCTOU/, "must name the excluded live-race case");
 });
 
-test("AC (predicate): a child whose name starts with '..' is treated as inside base and walked", () => {
+test("AC (predicate): a child whose name starts with '..' is treated as inside base and walked", { skip: process.platform === "win32" }, () => {
   // Regression for the `!rel.startsWith("..")` bug: `..cache` is a legitimate
   // child, not a traversal, and a symlinked `..cache` must be refused, not
   // waved through as an operator-external path.
