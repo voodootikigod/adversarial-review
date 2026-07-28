@@ -1,0 +1,16 @@
+{
+  "body": "The F6 integration wraps only the FIRST raw runReview of each loop (src/loop.js runLoop and runBranchLoop) in withProviderFallback, persists immediately after that first review, and runs --verify AFTERWARD outside the lifecycle. Consequences: (1) persistence happens before the verification pass completes, so a resolution that then fails verification is still cached (not strictly persist-after-full-success); (2) an authentication/session failure DURING verification is only warned, not recovered; (3) later loop rounds call runReview directly and bypass withProviderFallback, so a session that expires mid-loop is neither invalidated nor retried and simply aborts the loop.\n\nChange: factor the complete per-round operation (review + optional verify) into a single unit and run it through the shared lifecycle each round: run under withProviderFallback so a still-cache-sourced configuration can invalidate and re-detect once on a classified auth failure in ANY round, and persist only after the full round (including verify) succeeds. Keep loop-mode tolerance of non-auth verify failures (currently warned) intact.\n\nAcceptance criteria:\n- AC1: a cached provider that fails auth during the first round's verification is invalidated and re-detected once; the loop continues with the recovered provider.\n- AC2: a cached provider that succeeds the first review but fails auth in a later round is invalidated and re-detected once rather than aborting the loop.\n- AC3: persistence occurs only after a full round (review + any verify) succeeds; a round that fails verification for a provider reason does not persist that resolution.\n- AC4: existing loop behavior and loop_summary output are otherwise unchanged; full suite green; both runLoop and runBranchLoop covered.\n\nRelated: T21 (lifecycle), and the F6 first-review integration this extends. Note test/loop-summary.test.mjs and test/loop-providers.test.mjs are T7 rails.",
+  "category": "reliability",
+  "completed": true,
+  "duration": 2,
+  "edges": [],
+  "id": "T25",
+  "rails": [],
+  "scope": [
+    "src/loop.js",
+    "src/resolution-lifecycle.js",
+    "test/loop-providers.test.mjs",
+    "test/branch-loop.test.mjs"
+  ],
+  "title": "Wrap the complete per-round loop operation (review + verify) in the shared resolution lifecycle"
+}

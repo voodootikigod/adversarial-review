@@ -1,0 +1,17 @@
+{
+  "body": "The provider/model resolution cache (src/config-store.js, the configureLLM cache read, and bin/cli.js persistAutoResolution) is written after configureLLM resolves and before runReview and before the summary-only guard. Reachability for a cached entry is validated by presence only: a cached CLI must resolve on PATH; a cached API/gateway provider must have a non-empty credential in the environment. Presence is not liveness.\n\nConsequences:\n- A resolution that never produced a successful review is persisted.\n- A provider whose credential is revoked or expired but still present in the environment, or whose local CLI session has ended, continues to pass the presence check. Runs keep selecting it and returning an error even after another working provider becomes reachable, until the config entry is removed.\n\nReproduction: cache an OpenAI resolution while OPENAI_API_KEY is set but invalid; the first review fails authentication but the entry is already persisted. Add a valid ANTHROPIC_API_KEY while leaving OPENAI_API_KEY set. The cached OpenAI entry passes the presence check and is selected before detection reaches Anthropic; reviews keep failing.\n\nChange:\n1. Persist a resolution only after a review (and any --verify pass) completes successfully.\n2. Track whether the active resolution came from the cache versus a fresh ladder walk.\n3. On an authentication / invalid-model / expired-session failure from a cache-sourced resolution, remove that cache entry and re-run detection once, excluding the failed resolution.\n\nAcceptance criteria:\n- AC1: a run whose review fails does not write or refresh the cache entry; a successful run does.\n- AC2: given a cache entry for provider X and an injected auth failure from X, the run invalidates X and re-detects once, selecting a reachable alternative if present; a subsequent run no longer selects X.\n- AC3: a failure from a fresh-ladder (non-cached) resolution does not trigger the extra re-detect loop and does not write a cache entry.\n- AC4: full suite green; global-only config behavior, malformed-config no-overwrite, newer-version read-only, cached-CLI-defers-to-API, and cliPath identity checks all still hold.\n\nOut of scope for this ticket: network liveness pre-checks (contacting a provider before selection).\n\nRelated: T22 (repository-local CLI executable rejection), T23 (config path containment).",
+  "category": "reliability",
+  "completed": true,
+  "duration": 1,
+  "edges": [],
+  "id": "T21",
+  "rails": [],
+  "scope": [
+    "src/llm.js",
+    "bin/cli.js",
+    "src/config-store.js",
+    "test/llm-config.test.mjs",
+    "test/config-store.test.mjs"
+  ],
+  "title": "Persist a provider resolution only after a successful review; invalidate a cache-sourced entry on auth/session failure"
+}

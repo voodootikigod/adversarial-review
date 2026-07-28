@@ -379,12 +379,7 @@ npx adversarial-review --loop --loop-unsafe --loop-max 3
   incompatible with `--scope branch` / `--base`. (Branch-scoped convergence is not yet
   supported.)
 - **Fixer.** Auto-detected in order `codex → claude → agy`; override with `--loop-fixer`.
-- **No write confinement.** `--loop-unsafe` is required on EVERY platform. macOS has no
-  enforced sandbox (`sandbox-exec` was removed in macOS 14+). On Linux, `unshare --mount`
-  gives a mount namespace but remounts nothing read-only, so it isolates mount operations
-  and confines no writes — the fixer keeps full access to your filesystem (home directory,
-  credentials, `.git` internals, other repositories), and the loop’s git checkpoint can only
-  roll back the worktree. Real confinement (Landlock/bubblewrap) is not implemented.
+- **Write Confinement.** On Linux, kernel-level write confinement via bubblewrap (`bwrap`) restricts fixer writes strictly to the target workspace (blocking `~`, credentials, parent directories, and other repositories). When `bwrap` is active, `--loop` runs securely without requiring `--loop-unsafe`. On macOS or Linux systems without `bwrap`/Landlock, `--loop-unsafe` is required to proceed.
 - **Checkpoints.** The working tree is stashed before each fix; on a fixer error or
   timeout the checkpoint is restored, and the recovery command is always printed.
 - **Stop conditions** (exit `2`): `no-progress` (the gating set repeats), `ceiling`

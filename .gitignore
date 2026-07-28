@@ -5,8 +5,14 @@ blog/
 *.tmp
 .env
 .env.*
-.adlc/*
-!.adlc/tickets.json
 .worktrees/
 .omo/
 .booster/
+
+.adlc/*
+!.adlc/tickets.json
+!.adlc/tickets/
+!.adlc/tickets/**
+!.adlc/ticket-archive/
+!.adlc/ticket-archive/**
+!.adlc/specs/

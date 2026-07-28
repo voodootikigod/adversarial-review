@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { log } from "../src/utils.js";
-import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, fixerKind, FIXER_PROVIDER_MAP, detectFixer, probeOsConstraint } from "../src/loop.js";
+import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, fixerKind, FIXER_PROVIDER_MAP, detectFixer, probeLinuxConstraint, probeOsConstraint } from "../src/loop.js";
 
 test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemini key", () => {
   assert.equal(FIXER_PROVIDER_MAP.agy, "gemini");
@@ -404,4 +404,155 @@ test("T14: bounded stderr keeps the TAIL, where resume commands live", () => {
   assert.ok(kept.includes("codex resume 01JTAILKEPT"), "the resume line must survive truncation");
   assert.ok(kept.length <= 2048, "the bound must still hold");
   assert.equal(tailOf("short", 2048), "short", "shorter input is unchanged");
+});
+
+test("T44: probeLinuxConstraint detects bwrap when installed", () => {
+  if (process.platform !== "linux") return;
+  const mode = probeLinuxConstraint();
+  if (mode === "bwrap") {
+    assert.equal(mode, "bwrap");
+  }
+});
+
+test("T44: probeOsConstraint permits --loop on Linux when bwrap is active without --loop-unsafe", () => {
+  if (process.platform !== "linux") return;
+  const mode = probeLinuxConstraint();
+  if (mode === "bwrap" || mode === "landlock") {
+    const res = probeOsConstraint({ loopUnsafe: false });
+    assert.equal(res.mode, mode);
+  }
+});
+
+test("T44: buildFixerCmd wraps command with bwrap when mode is bwrap", () => {
+  const targetDir = process.cwd();
+  const { cmd, args, useStdin } = buildFixerCmd("agy", { mode: "bwrap" }, {
+    prompt: "P",
+    timeoutMs: 60_000,
+    fixerPath: "/usr/local/bin/agy",
+    cwd: targetDir
+  });
+  assert.equal(cmd, "bwrap");
+  assert.ok(args.includes("--ro-bind"));
+  assert.ok(args.includes("/"));
+  assert.ok(args.includes("--bind"));
+  assert.ok(args.includes(targetDir));
+  assert.ok(args.includes("--tmpfs"));
+  assert.ok(args.includes("/tmp"));
+  assert.ok(args.includes("/usr/local/bin/agy"));
+  assert.equal(args.at(-1), "P");
+  assert.equal(useStdin, false);
+});
+
+test("T44: real bwrap kernel write blocking blocks writes outside workspace", () => {
+  if (process.platform !== "linux") return;
+  const mode = probeLinuxConstraint();
+  if (mode !== "bwrap") return;
+
+  const tmpWorkdir = fs.mkdtempSync(path.join(os.tmpdir(), "bwrap-test-"));
+  try {
+    const script = `
+const fs = require('fs');
+fs.writeFileSync('${tmpWorkdir}/writable.txt', 'ok');
+try {
+  fs.writeFileSync('${os.homedir()}/blocked.txt', 'fail');
+  process.exit(1);
+} catch (e) {
+  if (e.code === 'EROFS') process.exit(0);
+  process.exit(2);
+}
+`;
+    execFileSync("bwrap", [
+      "--ro-bind", "/", "/",
+      "--bind", tmpWorkdir, tmpWorkdir,
+      "--bind", "/tmp", "/tmp",
+      "--dev-bind", "/dev", "/dev",
+      "--proc", "/proc",
+      "--",
+      process.execPath, "-e", script
+    ], { stdio: "ignore" });
+    assert.ok(fs.existsSync(path.join(tmpWorkdir, "writable.txt")));
+  } finally {
+    fs.rmSync(tmpWorkdir, { recursive: true, force: true });
+  }
+});
+
+test("T44: buildFixerCmd refuses bwrap binding if target directory canonicalizes outside repo trust root", () => {
+  const outsideDir = os.homedir();
+  assert.throws(() => {
+    buildFixerCmd("agy", { mode: "bwrap" }, {
+      prompt: "P",
+      timeoutMs: 60_000,
+      fixerPath: "/usr/local/bin/agy",
+      cwd: outsideDir
+    });
+  }, /outside the repository trust root/i);
+});
+
+test("T44: getFixFiles resolves tracked files from repo root when cwd is nested", () => {
+  const repoRoot = process.cwd();
+  const nestedCwd = path.join(repoRoot, "src");
+  const findings = [{ file: "src/loop.js" }, { file: "README.md" }];
+  const files = getFixFiles(nestedCwd, findings, { loopFixerScope: "sc2" });
+  assert.deepEqual(files, ["src/loop.js", "README.md"]);
+});
+
+test("T44: buildFixerCmd masks sensitive host secret directories with tmpfs", () => {
+  const { args } = buildFixerCmd("agy", { mode: "bwrap" }, {
+    prompt: "P",
+    timeoutMs: 60_000,
+    fixerPath: "/usr/local/bin/agy",
+    cwd: process.cwd()
+  });
+  assert.ok(args.includes("--chdir"));
+  const sshDir = path.join(os.homedir(), ".ssh");
+  if (fs.existsSync(sshDir)) {
+    const idx = args.indexOf(sshDir);
+    assert.ok(idx > 0);
+    assert.equal(args[idx - 1], "--tmpfs");
+  }
+});
+
+test("T44: buildFixerCmd fails closed if repository is inside a sensitive secret path", () => {
+  const sshDir = path.join(os.homedir(), ".ssh");
+  const mockWorkdir = path.join(sshDir, "mock-repo");
+  assert.throws(() => {
+    buildFixerCmd("agy", { mode: "bwrap" }, {
+      prompt: "P",
+      timeoutMs: 60_000,
+      fixerPath: "/usr/local/bin/agy",
+      cwd: mockWorkdir
+    });
+  }, /outside the repository trust root|located inside a sensitive host credential/i);
+});
+
+test("T44: getFixFiles in unrestricted capped mode filters out untracked cited paths", () => {
+  const repoRoot = process.cwd();
+  const findings = [{ file: "invented/nonexistent.js" }, { file: "src/loop.js" }];
+  const files = getFixFiles(repoRoot, findings, { loopFixerScope: "unrestricted", loopFixerFileCap: 2 });
+  assert.ok(!files.includes("invented/nonexistent.js"));
+  assert.ok(files.includes("src/loop.js"));
+});
+
+test("T44: probeOsConstraint uses bwrap on Linux when installed", () => {
+  if (process.platform !== "linux" || probeLinuxConstraint() !== "bwrap") return;
+  const res = probeOsConstraint({});
+  assert.equal(res.mode, "bwrap");
+});
+
+test("T44: buildFixerCmd masks UNIX sockets with --ro-bind /dev/null", () => {
+  const { args } = buildFixerCmd("agy", { mode: "bwrap" }, {
+    prompt: "P",
+    timeoutMs: 60_000,
+    fixerPath: "/usr/local/bin/agy",
+    cwd: process.cwd()
+  });
+  const rawSock = "/var/run/docker.sock";
+  if (fs.existsSync(rawSock)) {
+    let realSock = rawSock;
+    try { realSock = fs.realpathSync.native(rawSock); } catch {}
+    const idx = args.indexOf(realSock) !== -1 ? args.indexOf(realSock) : args.indexOf(rawSock);
+    assert.ok(idx > 0);
+    assert.equal(args[idx - 2], "--ro-bind");
+    assert.equal(args[idx - 1], "/dev/null");
+  }
 });
