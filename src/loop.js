@@ -580,17 +580,27 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
       "--proc", "/proc"
     ];
     const home = os.homedir();
-    const secretDirs = [
+    const secretPaths = [
       path.join(home, ".ssh"),
       path.join(home, ".aws"),
       path.join(home, ".gnupg"),
       path.join(home, ".config", "gcloud"),
-      path.join(home, ".azure")
+      path.join(home, ".azure"),
+      path.join(home, ".netrc"),
+      path.join(home, ".npmrc"),
+      path.join(home, ".git-credentials"),
+      path.join(home, ".bash_history"),
+      path.join(home, ".zsh_history")
     ];
-    for (const secretDir of secretDirs) {
-      if (fs.existsSync(secretDir)) {
-        bwrapArgs.push("--tmpfs", secretDir);
-      }
+    for (const secretPath of secretPaths) {
+      try {
+        const stat = fs.statSync(secretPath);
+        if (stat.isDirectory()) {
+          bwrapArgs.push("--tmpfs", secretPath);
+        } else if (stat.isFile()) {
+          bwrapArgs.push("--ro-bind", "/dev/null", secretPath);
+        }
+      } catch {}
     }
     if (exe && exe.startsWith("/tmp/")) {
       const mockDir = path.dirname(exe);
