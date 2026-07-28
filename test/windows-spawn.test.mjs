@@ -67,6 +67,23 @@ test("a shim in a directory containing spaces still executes", windowsOnly, asyn
   }
 });
 
+test("a shim under a parenthesised directory still executes", windowsOnly, async () => {
+  // "C:\Program Files (x86)" is where 32-bit npm installs live. The path policy
+  // permits parentheses precisely so this works; verify that on real cmd.exe
+  // rather than trusting the reasoning.
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "adv-win-"));
+  const dir = path.join(base, "Program Files (x86)");
+  fs.mkdirSync(dir);
+  try {
+    const shim = path.join(dir, "advparen.cmd");
+    fs.writeFileSync(shim, "@echo off\r\necho PAREN-OK\r\n");
+    const out = await spawnWithWatchdog(shim, [], { timeoutMs: 60_000, argsContainUntrusted: false });
+    assert.match(out, /PAREN-OK/, "a parenthesised install path must remain launchable");
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("untrusted argv is refused before any process starts", windowsOnly, async () => {
   await withShimDir("advrefuse.cmd", (dir, shim) => {
     // A marker the payload would create if cmd.exe ever re-parsed this argv.

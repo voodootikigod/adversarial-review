@@ -396,9 +396,10 @@ test("a shim PATH containing cmd.exe syntax is refused, not silently mangled", (
   };
   for (const bad of [
     "C:\\Users\\R&D\\AppData\\Roaming\\npm\\claude.cmd",
-    "C:\\Program Files (x86)\\npm\\claude.cmd",
     "C:\\tools\\100%\\claude.cmd",
-    "C:\\tools\\a^b\\claude.cmd"
+    "C:\\tools\\a^b\\claude.cmd",
+    "C:\\tools\\a|b\\claude.cmd",
+    "C:\\tools\\a\nb\\claude.cmd"
   ]) {
     assert.throws(
       () => buildSpawnTarget(bad, ["-p", "-"], base),
@@ -410,9 +411,53 @@ test("a shim PATH containing cmd.exe syntax is refused, not silently mangled", (
       `${bad} must be refused rather than handed to cmd.exe`
     );
   }
-  // An ordinary path is unaffected.
-  const ok = buildSpawnTarget("C:\\Users\\dev\\AppData\\Roaming\\npm\\claude.cmd", ["-p", "-"], base);
-  assert.equal(ok.viaInterpreter, true);
+  // Parentheses must NOT be refused: "C:\Program Files (x86)" is where 32-bit
+  // npm installs live, and rejecting it would refuse a standard Windows setup.
+  // They are only block syntax to cmd.exe, which a path in command position
+  // is not. The path policy is deliberately narrower than the argument policy.
+  for (const legit of [
+    "C:\\Program Files (x86)\\nodejs\\node_modules\\.bin\\claude.cmd",
+    "C:\\Users\\dev\\AppData\\Roaming\\npm\\claude.cmd"
+  ]) {
+    const ok = buildSpawnTarget(legit, ["-p", "-"], base);
+    assert.equal(ok.viaInterpreter, true, `${legit} must remain launchable`);
+    assert.ok(ok.args.includes(legit));
+  }
+  // But parentheses in an ARGUMENT are still refused — we author those.
+  assert.throws(
+    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["--flag", "a(b)c"], base),
+    (err) => err.code === "EWINARGV"
+  );
+});
+
+test("taskkill is validated like the interpreter, and falls back to a direct kill", () => {
+  // This branch only became reachable on Windows when CLI execution moved to
+  // spawnWithWatchdog, and it had the same unvalidated-SystemRoot defect the
+  // interpreter fix closed: a relative SystemRoot resolves inside the repository.
+  const runs = [];
+  const runCommandImpl = (cmd, args) => { runs.push({ cmd, args }); return { status: 0, error: null, stdout: "", stderr: "" }; };
+
+  const rel = terminateProcessTree(777, {
+    platform: "win32", killImpl: () => {}, runCommandImpl, env: { SystemRoot: "." }
+  });
+  assert.equal(rel.method, "taskkill");
+  assert.ok(path.win32.isAbsolute(runs[0].cmd), `relative SystemRoot must not be used: ${runs[0].cmd}`);
+  assert.match(runs[0].cmd, /System32[\\/]taskkill\.exe$/i);
+
+  // Nothing trustworthy at all: kill the process directly rather than run
+  // whatever the repository happens to have placed there.
+  const killed = [];
+  const res = terminateProcessTree(778, {
+    platform: "win32",
+    killImpl: (pid, sig) => killed.push([pid, sig]),
+    runCommandImpl: () => { throw new Error("must not run an untrusted taskkill"); },
+    env: { SystemRoot: "." },
+    isInsideRoot: () => true
+  });
+  assert.equal(res.method, "kill");
+  assert.equal(res.delivered, true);
+  assert.deepEqual(killed[0], [778, 0], "liveness probe first");
+  assert.ok(killed.some(([p, s]) => p === 778 && s === "SIGTERM"), "then a direct terminate");
 });
 
 test("T12: every supported CLI's PRIMARY invocation still works on a Windows shim", () => {

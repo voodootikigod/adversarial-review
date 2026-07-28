@@ -328,6 +328,16 @@ export function cliUsableForReview(cliCmd, { platform = process.platform, resolv
   return !isWindowsBatchShim(resolved, { platform });
 }
 
+// THE reachability predicate for a local CLI. Installed-and-trusted is not the
+// same as able-to-review, and every selection path must ask the same question:
+// auto-detection, --providers token resolution, the large-diff family downgrade,
+// and cache reuse. Where one of them asks a weaker question, that path selects a
+// provider the spawn site will refuse — and a --providers run aborts instead of
+// continuing with the reviewers that do work.
+export function cliReachableForReview(cliCmd) {
+  return isTrustedCliInstalled(cliCmd) && cliUsableForReview(cliCmd);
+}
+
 export function cliUnusableMessage(cliCmd) {
   return (
     `Local CLI agent "${cliCmd}" is installed as a Windows .cmd shim, which cannot be used for ` +
@@ -678,6 +688,9 @@ export function cachedResolutionUsable(entry) {
     const trusted = resolveTrustedCli(cliCmd);
     if (!trusted) return false;
     if (trusted !== entry.cliPath) return false;
+    // A resolution cached before this CLI became unusable for review (or cached on
+    // another platform) must not be replayed into a guaranteed spawn refusal.
+    if (!cliUsableForReview(cliCmd)) return false;
     return true;
   }
   if (provider === "anthropic") return !!envNonEmpty("ANTHROPIC_API_KEY");
@@ -1080,7 +1093,7 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
 
   // Explicit local-CLI token: resolve to that CLI only, never the family API.
   if (CLI_ONLY_TOKENS.has(id)) {
-    return isTrustedCliInstalled(id) ? build(id) : { id, family, config: null };
+    return cliReachableForReview(id) ? build(id) : { id, family, config: null };
   }
 
   if (family) {
@@ -1110,7 +1123,7 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
           };
         }
       }
-      if (cand.kind === "cli" && isTrustedCliInstalled(cand.cliCmd)) {
+      if (cand.kind === "cli" && cliReachableForReview(cand.cliCmd)) {
         return build(cand.cliCmd);
       }
     }
@@ -1128,7 +1141,7 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
     };
   }
   // Unknown token: treat as a raw local CLI command if installed.
-  if (isTrustedCliInstalled(id)) return build(id);
+  if (cliReachableForReview(id)) return build(id);
   return { id, family: null, config: null };
 }
 
@@ -1139,7 +1152,7 @@ const FAMILY_CLI = { openai: "codex", anthropic: "claude", gemini: "agy" };
 // Return a CLI provider entry for `family` if its local CLI is installed, else null.
 export function cliFallbackForFamily(family, args = {}) {
   const cliCmd = FAMILY_CLI[family];
-  if (cliCmd && isTrustedCliInstalled(cliCmd)) {
+  if (cliCmd && cliReachableForReview(cliCmd)) {
     return { id: cliCmd, family, config: { ...configureLLM({ ...args, provider: cliCmd, providers: undefined, apiKey: null }), id: cliCmd } };
   }
   return null;

@@ -164,6 +164,15 @@ export function interpreterPath(env = process.env, { isInsideRoot = interpreterI
 // printable ASCII, so nothing legitimate is lost by refusing the whole class.
 const CMD_METACHARACTERS = /[&|<>^"%!()]|[\x00-\x1f\x7f]/;
 
+// The shim PATH is held to a NARROWER policy than the flags, because it is not
+// ours to choose: `C:\\Program Files (x86)\\...` is where 32-bit npm installs
+// live, so refusing parentheses would reject a standard Windows installation.
+// Parentheses only carry meaning to cmd.exe as block syntax, which a path in
+// command position is not. The characters that DO still break out of a path —
+// command separators, redirections, quotes, variable and delayed expansion, and
+// control characters — remain refused.
+const CMD_PATH_METACHARACTERS = /[&|<>^"%!]|[\x00-\x1f\x7f]/;
+
 export function buildSpawnTarget(
   resolvedPath,
   args = [],
@@ -189,7 +198,7 @@ export function buildSpawnTarget(
     // parentheses in paths, so an npm prefix under a username like "R&D" would
     // otherwise reach cmd.exe unchecked and split the command. Checked first: a
     // bad path is a compatibility problem with a different remedy than a bad flag.
-    if (CMD_METACHARACTERS.test(resolvedPath)) {
+    if (CMD_PATH_METACHARACTERS.test(resolvedPath)) {
       throw new WindowsArgvUnsafeError(
         `Cannot launch the Windows batch shim "${resolvedPath}" through cmd.exe: its path ` +
         `contains characters cmd.exe treats as command syntax. Install this CLI under a path ` +
@@ -215,13 +224,33 @@ export function buildSpawnTarget(
   return { command: resolvedPath, args, viaInterpreter: false };
 }
 
-// taskkill must be an ABSOLUTE path. Windows resolves a bare executable name
-// against the CURRENT DIRECTORY before PATH, and our current directory is the
-// untrusted repository under review — so a repo shipping taskkill.exe would be
-// executed with the reviewer's privileges the moment a guard fired.
-function taskkillPath(env = process.env) {
-  const root = env.SystemRoot || env.SYSTEMROOT || "C:\\Windows";
-  return path.join(root, "System32", "taskkill.exe");
+// taskkill must be an ABSOLUTE, TRUSTED path, for the same reason the command
+// interpreter must be: Windows resolves a bare executable name against the
+// CURRENT DIRECTORY before PATH, and our current directory is the untrusted
+// repository under review — so a repo shipping taskkill.exe would be executed
+// with the reviewer's privileges the moment a guard fired.
+//
+// SystemRoot is an environment value and gets the same validation as ComSpec: a
+// relative value ('.') resolves inside the repository, and an absolute one can
+// point into it. Returns null when no trusted taskkill can be established;
+// callers fall back to direct process termination rather than guess.
+export function taskkillPath(env = process.env, { isInsideRoot = interpreterInsideTrustRoot } = {}) {
+  const configuredRoot = env.SystemRoot || env.SYSTEMROOT;
+  const candidates = [
+    configuredRoot ? path.win32.join(configuredRoot, "System32", "taskkill.exe") : null,
+    path.win32.join(DEFAULT_SYSTEM_ROOT, "System32", "taskkill.exe")
+  ];
+  for (const candidate of candidates) {
+    if (!candidate || !path.win32.isAbsolute(candidate)) continue;
+    let inside;
+    try {
+      inside = isInsideRoot(candidate);
+    } catch {
+      inside = true;
+    }
+    if (!inside) return candidate;
+  }
+  return null;
 }
 
 /**
@@ -296,7 +325,19 @@ export function terminateProcessTree(pid, options = {}) {
   }
 
   if (platform === "win32") {
-    const result = runCommandImpl(taskkillPath(options.env), ["/PID", String(pid), "/T", "/F"]);
+    const taskkill = taskkillPath(options.env, options.isInsideRoot ? { isInsideRoot: options.isInsideRoot } : {});
+    // No trusted taskkill means no tree kill — terminate the process directly
+    // rather than run whatever the repository happens to have put there.
+    if (!taskkill) {
+      try {
+        killImpl(pid, signal);
+        return { attempted: true, delivered: true, method: "kill" };
+      } catch (error) {
+        if (error?.code === "ESRCH") return { attempted: true, delivered: false, method: "kill" };
+        throw error;
+      }
+    }
+    const result = runCommandImpl(taskkill, ["/PID", String(pid), "/T", "/F"]);
     if (!result.error && result.status === 0) {
       return { attempted: true, delivered: true, method: "taskkill" };
     }
