@@ -513,3 +513,17 @@ test("T44: buildFixerCmd fails closed if repository is inside a sensitive secret
     });
   }, /outside the repository trust root|located inside a sensitive/i);
 });
+
+test("T44: getFixFiles in unrestricted capped mode filters out untracked cited paths", () => {
+  const repoRoot = process.cwd();
+  const findings = [{ file: "invented/nonexistent.js" }, { file: "src/loop.js" }];
+  const files = getFixFiles(repoRoot, findings, { loopFixerScope: "unrestricted", loopFixerFileCap: 2 });
+  assert.ok(!files.includes("invented/nonexistent.js"));
+  assert.ok(files.includes("src/loop.js"));
+});
+
+test("T44: probeOsConstraint honors --loop-unsafe on Linux", () => {
+  if (process.platform !== "linux") return;
+  const res = probeOsConstraint({ loopUnsafe: true });
+  assert.equal(res.mode, "advisory");
+});

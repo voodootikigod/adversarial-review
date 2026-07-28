@@ -299,8 +299,12 @@ export function probeOsConstraint(args) {
   // permission of the invoking user.
   // Real kernel write confinement requires bubblewrap (`bwrap`).
   const linuxMode = probeLinuxConstraint();
+  if (args.loopUnsafe) {
+    log.warn("Linux: running without write sandboxing (--loop-unsafe). Fixer has unrestricted write access.");
+    return { mode: "advisory" };
+  }
   const isConfined = linuxMode === "bwrap";
-  if (!isConfined && !args.loopUnsafe) {
+  if (!isConfined) {
     throw new Error(
       "--loop has no enforced write confinement on Linux.\n" +
       "`unshare --mount` creates a mount namespace but remounts nothing read-only, so the fixer " +
@@ -310,16 +314,8 @@ export function probeOsConstraint(args) {
       "acknowledging the fixer has unrestricted write access."
     );
   }
-  if (isConfined) {
-    log.info(`Linux: ${linuxMode} write confinement active (workspace writable, filesystem read-only).`);
-  } else {
-    log.warn(
-      linuxMode
-        ? `Linux: mount namespace (${linuxMode}) active, but writes are NOT confined (--loop-unsafe). Fixer has unrestricted write access.`
-        : "Linux: running without write confinement (--loop-unsafe). Fixer has unrestricted write access."
-    );
-  }
-  return { mode: linuxMode ?? "none" };
+  log.info(`Linux: ${linuxMode} write confinement active (workspace writable, filesystem read-only).`);
+  return { mode: linuxMode };
 }
 
 // ─── Gating finding helpers ───────────────────────────────────────────────────
@@ -372,9 +368,11 @@ export function getFixFiles(cwd, findings, args) {
         `Repo has ${allFiles.length} tracked files, exceeding --loop-fixer-file-cap ${cap}.\n` +
         `  Listing finding-cited files first, then filling to ${cap} alphabetically.`
       );
-      const cited = new Set(findings.map(f => f.file).filter(Boolean));
-      const rest = allFiles.filter(f => !cited.has(f));
-      return [...cited, ...rest].slice(0, cap);
+      const trackedSet = new Set(allFiles);
+      const citedTracked = findings.map(f => f.file).filter(f => f && trackedSet.has(f));
+      const citedSet = new Set(citedTracked);
+      const rest = allFiles.filter(f => !citedSet.has(f));
+      return [...new Set([...citedTracked, ...rest])].slice(0, cap);
     }
     return allFiles;
   }
