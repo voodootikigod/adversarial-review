@@ -425,6 +425,8 @@ test("T44: buildFixerCmd wraps command with bwrap when mode is bwrap", () => {
   assert.ok(args.includes("/"));
   assert.ok(args.includes("--bind"));
   assert.ok(args.includes(targetDir));
+  assert.ok(args.includes("--tmpfs"));
+  assert.ok(args.includes("/tmp"));
   assert.ok(args.includes("/usr/local/bin/agy"));
   assert.equal(args.at(-1), "P");
   assert.equal(useStdin, false);

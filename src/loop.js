@@ -563,16 +563,21 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
   // Wrap with bwrap / landlock / unshare if available. The prompt stays the LAST argument either way.
   if (constraint.mode === "bwrap") {
     const targetCwd = path.resolve(cwd || process.cwd());
+    const bwrapArgs = [
+      "--ro-bind", "/", "/",
+      "--bind", targetCwd, targetCwd,
+      "--tmpfs", "/tmp",
+      "--dev-bind", "/dev", "/dev",
+      "--proc", "/proc"
+    ];
+    const gitDir = path.join(targetCwd, ".git");
+    if (fs.existsSync(gitDir)) {
+      bwrapArgs.push("--ro-bind", gitDir, gitDir);
+    }
+    bwrapArgs.push("--", cmd, ...args);
     return {
       cmd: "bwrap",
-      args: [
-        "--ro-bind", "/", "/",
-        "--bind", targetCwd, targetCwd,
-        "--bind", "/tmp", "/tmp",
-        "--dev-bind", "/dev", "/dev",
-        "--proc", "/proc",
-        "--", cmd, ...args
-      ],
+      args: bwrapArgs,
       useStdin
     };
   }
