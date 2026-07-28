@@ -501,16 +501,17 @@ test("T44: buildFixerCmd masks sensitive host secret directories with tmpfs", ()
   }
 });
 
-test("T44: buildFixerCmd fails closed if repository is directly inside a sensitive secret path", () => {
+test("T44: buildFixerCmd fails closed if repository is inside a sensitive secret path", () => {
   const sshDir = path.join(os.homedir(), ".ssh");
+  const mockWorkdir = path.join(sshDir, "mock-repo");
   assert.throws(() => {
     buildFixerCmd("agy", { mode: "bwrap" }, {
       prompt: "P",
       timeoutMs: 60_000,
       fixerPath: "/usr/local/bin/agy",
-      cwd: sshDir
+      cwd: mockWorkdir
     });
-  }, /outside the repository trust root|directly inside sensitive host credential/i);
+  }, /outside the repository trust root|located inside a sensitive host credential/i);
 });
 
 test("T44: getFixFiles in unrestricted capped mode filters out untracked cited paths", () => {
@@ -522,7 +523,7 @@ test("T44: getFixFiles in unrestricted capped mode filters out untracked cited p
 });
 
 test("T44: probeOsConstraint uses bwrap on Linux when installed", () => {
-  if (process.platform !== "linux") return;
+  if (process.platform !== "linux" || probeLinuxConstraint() !== "bwrap") return;
   const res = probeOsConstraint({});
   assert.equal(res.mode, "bwrap");
 });

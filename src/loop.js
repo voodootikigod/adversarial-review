@@ -601,14 +601,17 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
         secretPath = fs.realpathSync.native(rawSecretPath);
       } catch {}
 
-      if (realCwd === secretPath || realCwd === rawSecretPath) {
+      if (
+        realCwd === secretPath ||
+        realCwd.startsWith(secretPath + path.sep) ||
+        realCwd === rawSecretPath ||
+        realCwd.startsWith(rawSecretPath + path.sep)
+      ) {
         throw new Error(
-          `Refusing to run --loop with bwrap write confinement directly inside sensitive host credential directory "${secretPath}". ` +
+          `Refusing to run --loop with bwrap write confinement because the repository "${realCwd}" ` +
+          `is located inside a sensitive host credential directory "${secretPath}". ` +
           `Move the repository outside "${secretPath}" or pass --loop-unsafe.`
         );
-      }
-      if (realCwd.startsWith(secretPath + path.sep) || realCwd.startsWith(rawSecretPath + path.sep)) {
-        continue;
       }
       try {
         const stat = fs.statSync(secretPath);

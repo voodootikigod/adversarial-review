@@ -93,7 +93,7 @@ ${colors.bold("Loop mode (--loop):")}
   --loop-fixer-scope    sc2 (default): only finding-cited files. unrestricted: all repo files.
   --loop-fixer-file-cap Max files listed in unrestricted mode (default 100).
   --loop-unsafe         Required when write confinement (bwrap/bubblewrap on Linux)
-                        is unavailable. The fixer runs with write access to your workspace;
+                        is unavailable. The fixer runs with unrestricted host write access;
                         macOS or unconfined Linux require --loop-unsafe to proceed.
   --loop-unsafe-allow-fix-secrets
                         Bypass secret scan on the fix prompt. Verifies same provider
