@@ -278,19 +278,36 @@ function probeOsConstraint(args) {
     return { mode: "advisory" };
   }
 
-  // Linux
+  // Linux.
+  //
+  // `unshare --mount` creates a new MOUNT NAMESPACE. It does not remount anything
+  // read-only and does not restrict writes — the fixer keeps every filesystem
+  // permission of the invoking user. Treating it as a write sandbox told Linux
+  // users they were confined when they were not, and skipped the --loop-unsafe
+  // acknowledgement macOS correctly requires. That matters here because the fixer
+  // runs with --dangerously-skip-permissions on a prompt derived from an
+  // untrusted diff, and the loop's git rollback cannot undo a write to
+  // ~/.ssh/authorized_keys, a shell profile, .git/hooks, or another repository.
+  //
+  // Real write confinement needs Landlock or bubblewrap. Until that exists, Linux
+  // is acknowledged as unconfined too. The namespace is still used when available
+  // — it does contain mount operations — but it is not claimed to be more.
   const linuxMode = probeLinuxConstraint();
-  if (!linuxMode) {
-    if (!args.loopUnsafe) {
-      throw new Error(
-        "--loop on Linux requires write sandboxing (landlock or unshare --mount), but neither is available.\n" +
-        "Pass --loop-unsafe to proceed without sandboxing."
-      );
-    }
-    log.warn("Linux: running without write sandboxing (--loop-unsafe). Fixer has unrestricted write access.");
-    return { mode: "none" };
+  if (!args.loopUnsafe) {
+    throw new Error(
+      "--loop has no enforced write confinement on Linux.\n" +
+      "`unshare --mount` creates a mount namespace but remounts nothing read-only, so the fixer " +
+      "keeps full write access to your filesystem — home directory, credentials, .git internals, " +
+      "other repositories — and the loop's git rollback cannot undo changes outside the worktree.\n" +
+      "Pass --loop-unsafe to proceed, acknowledging the fixer has unrestricted write access."
+    );
   }
-  return { mode: linuxMode };
+  log.warn(
+    linuxMode
+      ? `Linux: mount namespace (${linuxMode}) active, but writes are NOT confined (--loop-unsafe). Fixer has unrestricted write access.`
+      : "Linux: running without write confinement (--loop-unsafe). Fixer has unrestricted write access."
+  );
+  return { mode: linuxMode ?? "none" };
 }
 
 // ─── Gating finding helpers ───────────────────────────────────────────────────
@@ -816,7 +833,7 @@ export async function runLoop(cwd, args) {
 
   // Print loop header
   log.info(
-    `Loop: scope=working-tree, fixer=${fixerCmd}, sandbox=${constraint.mode}, ` +
+    `Loop: scope=working-tree, fixer=${fixerCmd}, write-confinement=none (mount-ns: ${constraint.mode}), ` +
     `max-iterations=${loopMax}`
   );
   log.step(
