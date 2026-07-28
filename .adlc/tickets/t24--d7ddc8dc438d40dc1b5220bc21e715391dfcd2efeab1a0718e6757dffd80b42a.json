@@ -1,0 +1,15 @@
+{
+  "body": "isProviderAuthFailure in src/resolution-lifecycle.js currently returns true only for HTTP 401/403 (and returns immediately for any numeric status). A cached provider whose default model has been retired or is otherwise invalid commonly returns a deterministic 400 or 404. Such a failure is not classified as a stale resolution, so withProviderFallback rethrows without invalidating the cache entry; every later run reselects the same cached provider and repeats the same failure instead of advancing to a reachable alternative.\n\nReproduction: cache a provider whose model id is later retired while its credential remains valid; each review returns an invalid-model 400/404; the cache entry is never invalidated.\n\nChange: extend the classifier to treat provider-specific invalid/unsupported-model responses (relevant 400/404 with a model-not-found/invalid indicator) as stale-resolution failures that invalidate the cache entry and trigger one exclusion-aware re-detect, in addition to 401/403 auth failures. Preserve current behavior for transient failures (timeouts, 5xx, generic 400s not indicating a model problem) so they do NOT invalidate the cache. llmCall already preserves err.status for non-retryable errors; a model-error signal may also need to be preserved (status + a body/message marker).\n\nAcceptance criteria:\n- AC1: a cached provider returning an invalid-model 404 (and a representative 400 model error) is invalidated and re-detected once, selecting a reachable alternative if present.\n- AC2: a transient 500/timeout/generic non-model 400 does NOT invalidate the cache entry.\n- AC3: full suite green.\n\nRelated: T21 (auth-failure recovery, already implemented); shares the classifier and fallback path.",
+  "category": "reliability",
+  "completed": true,
+  "duration": 1,
+  "edges": [],
+  "id": "T24",
+  "rails": [],
+  "scope": [
+    "src/resolution-lifecycle.js",
+    "src/llm.js",
+    "test/persist-lifecycle.test.mjs"
+  ],
+  "title": "Classify invalid/retired-model provider failures as stale-resolution (invalidate + retry)"
+}
