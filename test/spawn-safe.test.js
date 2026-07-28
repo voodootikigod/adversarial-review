@@ -164,7 +164,37 @@ test("T12: Windows .cmd/.bat shims are run through the interpreter, not spawned 
   });
   assert.equal(t.viaInterpreter, true);
   assert.equal(t.command, "C:\\Windows\\System32\\cmd.exe");
-  assert.deepEqual(t.args, ["/d", "/s", "/c", "C:\\npm\\claude.cmd"]);
+  // The command string carries its OWN outer quote pair for /s to strip, so the
+  // quotes around the shim path survive. See the /s note in buildSpawnTarget.
+  assert.deepEqual(t.args, ["/d", "/s", "/c", '""C:\\npm\\claude.cmd""']);
+  assert.equal(t.windowsVerbatimArguments, true, "Node must not re-escape our quoting");
+});
+
+test("cmd.exe /s cannot strip the quotes that protect a spaced shim path", () => {
+  // /s removes the FIRST and LAST quote after /c. With one quote pair — the one
+  // Node would add around the path — that pair IS the one stripped, and cmd.exe
+  // then runs "C:\Program". The outer pair is what makes the inner one survive.
+  const shim = "C:\\Program Files (x86)\\nodejs\\node_modules\\.bin\\claude.cmd";
+  const t = buildSpawnTarget(shim, ["--permission-mode", "plan", "-p", "-"], {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    argsContainUntrusted: false,
+    isInsideRoot: () => false
+  });
+  const commandString = t.args[3];
+  assert.equal(t.args.slice(0, 3).join(" "), "/d /s /c");
+  assert.ok(commandString.startsWith('""'), `must open with an outer quote: ${commandString}`);
+  assert.ok(commandString.endsWith('"'), `must close with an outer quote: ${commandString}`);
+
+  // Simulate what cmd.exe /s does: drop the first and last quote characters.
+  const first = commandString.indexOf('"');
+  const last = commandString.lastIndexOf('"');
+  const afterStripping = commandString.slice(0, first) + commandString.slice(first + 1, last) + commandString.slice(last + 1);
+  assert.equal(
+    afterStripping,
+    `"${shim}" --permission-mode plan -p -`,
+    "after /s stripping the shim path must still be quoted"
+  );
 });
 
 test("T12: a real .exe and any POSIX binary are spawned directly", () => {
@@ -421,7 +451,7 @@ test("a shim PATH containing cmd.exe syntax is refused, not silently mangled", (
   ]) {
     const ok = buildSpawnTarget(legit, ["-p", "-"], base);
     assert.equal(ok.viaInterpreter, true, `${legit} must remain launchable`);
-    assert.ok(ok.args.includes(legit));
+    assert.ok(ok.args[3].includes(`"${legit}"`), `the shim path must stay quoted: ${ok.args[3]}`);
   }
   // But parentheses in an ARGUMENT are still refused — we author those.
   assert.throws(
@@ -477,7 +507,8 @@ test("T12: every supported CLI's PRIMARY invocation still works on a Windows shi
     });
     assert.equal(t.viaInterpreter, true);
     assert.deepEqual(t.args.slice(0, 3), ["/d", "/s", "/c"]);
-    assert.ok(t.args.includes(`C:\\npm\\${cli}.cmd`));
+    assert.ok(t.args[3].includes(`"C:\\npm\\${cli}.cmd"`), `shim path must be quoted: ${t.args[3]}`);
+    for (const flag of flags) assert.ok(t.args[3].includes(flag), `${flag} must reach cmd.exe`);
   }
 });
 

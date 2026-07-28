@@ -246,6 +246,19 @@ test("cliReviewArgs / cliFallbackArgs use per-CLI plan flags for claude and agy"
     ["-p", "PROMPT-BODY"]
   );
   assert.deepEqual(cliFallbackArgs("somecli", "PROMPT-BODY"), ["PROMPT-BODY"]);
+
+  // Cursor Agent CLI is handled by the isCursorAgentCli branch, which returns
+  // BEFORE the `cliCmd !== "claude"` guard. Pinned explicitly because reviewers
+  // have repeatedly read that guard as stripping Cursor's flags — a bare `agent`
+  // would open an interactive session and hang until the watchdog fires.
+  for (const cursor of ["agent", "cursor-agent"]) {
+    assert.deepEqual(
+      cliReviewArgs(cursor, {}),
+      ["-p", "--trust", "--output-format", "text", "--mode", "plan", "-"],
+      `${cursor} must get its non-interactive flags`
+    );
+    assert.notDeepEqual(cliReviewArgs(cursor, {}), [], `${cursor} must never be launched bare`);
+  }
 });
 
 test("cliReviewArgs / cliFallbackArgs forward a resolved model to claude and agy", () => {

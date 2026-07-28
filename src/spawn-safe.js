@@ -173,6 +173,15 @@ const CMD_METACHARACTERS = /[&|<>^"%!()]|[\x00-\x1f\x7f]/;
 // control characters — remain refused.
 const CMD_PATH_METACHARACTERS = /[&|<>^"%!]|[\x00-\x1f\x7f]/;
 
+// Quote one token of a cmd.exe command string. Nothing reaching here contains a
+// quote, a metacharacter, or a control character — both guards above have already
+// run — so wrapping in quotes is sufficient and no escaping is needed. The shim
+// path is quoted unconditionally: it is the token whose boundaries must survive
+// /s stripping, and it is the one we do not choose.
+function quoteForCmd(token, { always = false } = {}) {
+  return always || /\s/.test(token) ? `"${token}"` : token;
+}
+
 export function buildSpawnTarget(
   resolvedPath,
   args = [],
@@ -215,10 +224,21 @@ export function buildSpawnTarget(
         `"${resolvedPath}": it contains cmd.exe metacharacters.`
       );
     }
+    // `/s` removes the FIRST and LAST quote of the string following `/c`. Passing
+    // the path and flags as separate Node arguments produces exactly one quote
+    // pair — the one around the path — so /s strips it and cmd.exe then splits
+    // "C:\Program Files (x86)\...\claude.cmd" at the first space and tries to run
+    // "C:\Program". The fix is the outer pair cmd.exe expects to consume: build
+    // the command string ourselves, wrap the whole thing in quotes, and pass it
+    // verbatim so Node does not re-escape our quoting. This is the same shape
+    // Node itself uses for shell:true on Windows.
+    const command = [quoteForCmd(resolvedPath, { always: true }), ...args.map((a) => quoteForCmd(String(a)))].join(" ");
     return {
       command: interpreterPath(env, { isInsideRoot }),
-      args: ["/d", "/s", "/c", resolvedPath, ...args],
-      viaInterpreter: true
+      args: ["/d", "/s", "/c", `"${command}"`],
+      viaInterpreter: true,
+      // Node must not requote: it would backslash-escape the quotes above.
+      windowsVerbatimArguments: true
     };
   }
   return { command: resolvedPath, args, viaInterpreter: false };

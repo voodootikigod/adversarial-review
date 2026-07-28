@@ -53,15 +53,28 @@ test("a real .cmd shim resolves via PATHEXT and executes through the interpreter
   });
 });
 
-test("a shim in a directory containing spaces still executes", windowsOnly, async () => {
+test("a spaced shim path executes WITH production-shaped arguments", windowsOnly, async () => {
+  // The empty-args case does not reproduce production: cmd.exe /s strips the
+  // first and last quote after /c, and it is the presence of trailing arguments
+  // that moves the last quote off the end of the string. This runs the real
+  // claude flag shape through a real spaced path.
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "adv-win-"));
-  const dir = path.join(base, "dir with spaces");
-  fs.mkdirSync(dir);
+  const dir = path.join(base, "Program Files (x86)", "node modules");
+  fs.mkdirSync(dir, { recursive: true });
   try {
     const shim = path.join(dir, "advspace.cmd");
-    fs.writeFileSync(shim, "@echo off\r\necho SPACED-OK\r\n");
-    const out = await spawnWithWatchdog(shim, [], { timeoutMs: 60_000, argsContainUntrusted: false });
-    assert.match(out, /SPACED-OK/, "a quoted interpreter path must survive spaces");
+    // Echo the args back so a mangled command line is visible, not just a failure.
+    fs.writeFileSync(shim, "@echo off\r\necho SPACED-OK %*\r\n");
+    const flags = ["--permission-mode", "plan", "-p", "-"];
+    const out = await spawnWithWatchdog(shim, flags, {
+      input: "",
+      timeoutMs: 60_000,
+      argsContainUntrusted: false
+    });
+    assert.match(out, /SPACED-OK/, "the shim path must survive cmd.exe /s quote stripping");
+    for (const flag of flags) {
+      assert.ok(out.includes(flag), `${flag} must arrive intact; got: ${out.trim()}`);
+    }
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

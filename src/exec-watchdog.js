@@ -152,6 +152,10 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
       windowsHide: true,
+      // Set only for the cmd.exe shim route, which quotes its own command string
+      // for /s. Node would otherwise backslash-escape those quotes and cmd.exe
+      // would split a spaced shim path at the first space.
+      windowsVerbatimArguments: target.windowsVerbatimArguments === true,
       // Own process group so terminateProcessTree can signal the whole tree.
       detached: process.platform !== "win32"
     });
