@@ -11,6 +11,7 @@ export function tailOf(text, limit) {
   return text.length > limit ? text.slice(-limit) : text;
 }
 import { collectReviewContext } from "./git-context.js";
+import { resolveTrustedGit } from "./trust-root.js";
 import {
   buildPrompt,
   fenceUntrusted,
@@ -53,8 +54,11 @@ function buildReviewRound(args, context, prompt) {
 // ─── Git helpers ──────────────────────────────────────────────────────────────
 
 function gitRun(cwd, args, { allowFail = false } = {}) {
+  // Absolute, trusted git only — see resolveTrustedGit. Resolved outside the try
+  // so an allowFail probe cannot turn a security refusal into an empty string.
+  const gitBin = resolveTrustedGit();
   try {
-    return execFileSync("git", args, {
+    return execFileSync(gitBin, args, {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],

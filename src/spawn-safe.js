@@ -17,46 +17,10 @@ import { spawnSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { isInsideTrustRoot } from "./trust-root.js";
+import { resolveCommand } from "./resolve-command.js";
 
-// Only bare command tokens are resolvable. A path separator or shell
-// metacharacter reaching a spawn site is a bug in the caller, not a lookup to
-// perform — rejecting it here keeps that from becoming an injection.
-const BARE_COMMAND = /^[A-Za-z0-9._-]+$/;
-
-/**
- * Resolve a bare command name to an absolute executable path, or null.
- *
- * The `platform`/`env` seam exists so the Windows PATHEXT behaviour is testable
- * on a POSIX machine; production callers pass neither.
- */
-export function resolveCommand(cmd, { platform = process.platform, env = process.env } = {}) {
-  if (typeof cmd !== "string" || !BARE_COMMAND.test(cmd)) return null;
-
-  const pathDirs = (env.PATH || "").split(path.delimiter).filter(Boolean);
-  // On Windows a bare name does not identify a file: `claude` is `claude.cmd`
-  // for anything installed by npm. Resolving the real filename ourselves is
-  // what lets us drop `shell: true`, which was only ever there to make the
-  // shell perform this lookup for us.
-  const extensions = platform === "win32"
-    ? (env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean).map((e) => e.toLowerCase())
-    : [""];
-
-  for (const dir of pathDirs) {
-    for (const ext of extensions) {
-      const file = ext && cmd.toLowerCase().endsWith(ext) ? cmd : `${cmd}${ext}`;
-      const candidate = path.join(dir, file);
-      try {
-        // On win32 the X_OK bit is not meaningful, so existence + regular file
-        // is the strongest check available there.
-        if (platform !== "win32") fs.accessSync(candidate, fs.constants.X_OK);
-        if (fs.statSync(candidate).isFile()) return path.resolve(candidate);
-      } catch {
-        // Not this candidate; keep looking.
-      }
-    }
-  }
-  return null;
-}
+// Re-exported: this was resolveCommand's original home, and callers import it here.
+export { resolveCommand };
 
 // Windows batch shims (.cmd/.bat) are NOT executable images: CreateProcess
 // cannot run them, they require the command interpreter. npm installs
