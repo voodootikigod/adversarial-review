@@ -593,6 +593,12 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
       path.join(home, ".git-credentials"),
       path.join(home, ".bash_history"),
       path.join(home, ".zsh_history"),
+      path.join(home, ".kube"),
+      path.join(home, ".terraform.d"),
+      path.join(home, ".pypirc"),
+      "/var/run/docker.sock",
+      "/run/docker.sock",
+      "/run/podman",
       ...(uid !== null ? [`/run/user/${uid}`] : [])
     ];
     for (const secretPath of secretPaths) {
