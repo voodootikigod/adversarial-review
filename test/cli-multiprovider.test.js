@@ -27,6 +27,14 @@ function runCli(args, { mocks = {}, env = {}, afterRun } = {}) {
   const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cli-mocks-"));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cli-repo-"));
   try {
+    const nodeExeName = process.platform === "win32" ? "node.exe" : "node";
+    const mockNodePath = path.join(mocksDir, nodeExeName);
+    try {
+      fs.symlinkSync(process.execPath, mockNodePath);
+    } catch {
+      fs.copyFileSync(process.execPath, mockNodePath);
+    }
+
     for (const [name, body] of Object.entries(mocks)) {
       writeMockBin(mocksDir, name, `
 import fs from "node:fs";
@@ -62,7 +70,7 @@ process.stdin.on("end", () => {
         sysDirs = [path.dirname(whereGit.stdout.trim().split(/\r?\n/)[0])];
       }
     }
-    const PATH = [mocksDir, nodeBinDir, ...sysDirs].join(path.delimiter);
+    const PATH = [mocksDir, ...sysDirs].join(path.delimiter);
     const r = spawnSync(process.execPath, [cli, ...args], {
       cwd: repoDir,
       encoding: "utf8",
@@ -235,12 +243,12 @@ test("ledger: records the MERGED findings (shared corroborated once + each uniqu
   // claude: shared + onlyA ; codex: shared + onlyB. Merged = 3 distinct gating
   // findings → 3 ledger lines. This distinguishes "merged" from BOTH "per-provider
   // loop" (would give 4) and "first provider only" (would give 2).
-  const f = (file, title) =>
-    `{"severity":"high","category":"security","title":"${title}","body":"b","exploit_scenario":"e","evidence":"","file":"${file}","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}`;
+  const f = (file, title, cat = "security", line = 1) =>
+    `{"severity":"high","category":"${cat}","title":"${title}","body":"b","exploit_scenario":"e","evidence":"","file":"${file}","line_start":${line},"line_end":${line},"confidence":0.9,"recommendation":"r"}`;
   const res = (findings) =>
     `{"verdict":"needs-attention","summary":"s","coverage":{"files_examined":[],"files_skipped":[]},"findings":[${findings}],"next_steps":["n"]}`;
-  const claudeOut = res([f("shared.js", "Shared issue"), f("a.js", "Only in A")].join(","));
-  const codexOut = res([f("shared.js", "Shared issue"), f("b.js", "Only in B")].join(","));
+  const claudeOut = res([f("code.js", "Shared issue", "security", 1), f("code.js", "Only in A", "auth", 10)].join(","));
+  const codexOut = res([f("code.js", "Shared issue", "security", 1), f("code.js", "Only in B", "correctness", 20)].join(","));
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-ledger-merge-"));
   const ledger = path.join(dir, "f.jsonl");

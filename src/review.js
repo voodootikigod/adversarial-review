@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import { colors, log } from "./utils.js";
 import { llmCall, cleanJsonResponse, cliFallbackForFamily } from "./llm.js";
 import { validateAgainstSchema } from "./schema-validate.js";
+import { isInsideTrustRoot, reviewTrustRoot } from "./trust-root.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -201,38 +202,117 @@ function collapseWhitespace(s) {
 // for gating and the report marks it. In local-CLI mode the reviewer can
 // legitimately inspect untouched files, so the file check only applies to API
 // providers (which saw nothing beyond the prompt).
-export function assessFindings(result, context, { apiMode = true } = {}) {
+export function assessFindings(result, context, { apiMode = true, providerModes = null, cwd = process.cwd() } = {}) {
   const changed = new Set((context.changedFiles || []).map(normalizePath));
-  // Ground against the text the model was actually SHOWN, not the raw content.
-  // Fencing neutralizes sentinel tokens before the diff reaches the model, so a
-  // finding that correctly quotes a neutralized line would otherwise score as
-  // ungrounded — halving its confidence and potentially dropping a real finding
-  // below the gate. Any reviewed file that mentions the sentinel format (this
-  // repository's own source does) triggers it.
-  const haystack = context.includeDiff
-    ? collapseWhitespace(stripFenceSentinels(context.content))
+  const rawContent = context.content || "";
+  
+  let trustRoot = path.resolve(cwd);
+  try {
+    const rootCandidate = reviewTrustRoot({ cwd });
+    if (rootCandidate) trustRoot = path.resolve(rootCandidate);
+  } catch (err) {
+    if (err?.code === "EUNTRUSTEDGIT" || err?.code === "EUNTRUSTEDCLI") {
+      throw err;
+    }
+  }
+
+  const haystackShown = context.includeDiff
+    ? collapseWhitespace(stripFenceSentinels(rawContent))
+    : null;
+  const haystackRaw = context.includeDiff
+    ? collapseWhitespace(rawContent)
     : null;
 
   return result.findings.map((f) => {
     const notes = [];
     let effectiveConfidence = f.confidence;
 
-    if (apiMode && changed.size && !changed.has(normalizePath(f.file))) {
-      notes.push(`cited file is not in the reviewed change set (${f.file})`);
-      effectiveConfidence /= 2;
+    // Determine if finding uses API mode grounding. In multi-provider runs,
+    // caller passes trusted providerModes out-of-band so findings corroborated
+    // by a local CLI provider preserve CLI grounding without trusting untrusted LLM payload fields.
+    let isFindingApi = apiMode;
+    if (providerModes && typeof providerModes.get === "function" && Array.isArray(f.corroborated_by)) {
+      const hasCliCorroborator = f.corroborated_by.some((p) => providerModes.get(p) === "cli");
+      if (hasCliCorroborator) {
+        isFindingApi = false;
+      }
     }
-    if (haystack && f.evidence && f.evidence.trim()) {
-      // Normalize BOTH sides through the same neutralization. Reviewers reach
-      // the source by two different routes: API providers read the fenced
-      // prompt (already neutralized), while local CLI agents read the files on
-      // disk (raw). Neutralizing only one side grounds one route and penalizes
-      // the other. Running both through stripFenceSentinels makes the check
-      // agnostic to which text the reviewer actually quoted.
-      if (!haystack.includes(collapseWhitespace(stripFenceSentinels(f.evidence)))) {
-        notes.push("quoted evidence was not found in the provided context");
+
+    const haystack = isFindingApi ? haystackShown : haystackRaw;
+
+    const normFile = normalizePath(f.file || "");
+    const inChangeSet = !changed.size || changed.has(normFile);
+
+    // Safely check if cited file exists within the repository trust root.
+    // Try resolving relative to trustRoot first (for repo-root-relative citations in subdirectories),
+    // then fall back to resolving relative to cwd.
+    let fileExistsInRepo = false;
+    let targetFilePath = null;
+    if (f.file && typeof f.file === "string") {
+      try {
+        const candidateTrust = path.resolve(trustRoot, f.file);
+        const candidateCwd = path.resolve(cwd, f.file);
+
+        let chosenCandidate = null;
+        if (isInsideTrustRoot(candidateTrust, { root: trustRoot }) && fs.existsSync(candidateTrust)) {
+          chosenCandidate = candidateTrust;
+        } else if (isInsideTrustRoot(candidateCwd, { root: trustRoot }) && fs.existsSync(candidateCwd)) {
+          chosenCandidate = candidateCwd;
+        }
+
+        if (chosenCandidate) {
+          const stat = fs.statSync(chosenCandidate);
+          if (stat.isFile() && stat.size < 2_000_000) {
+            fileExistsInRepo = true;
+            targetFilePath = chosenCandidate;
+          }
+        }
+      } catch {}
+    }
+
+    if (!inChangeSet) {
+      if (isFindingApi) {
+        // API mode: provider was only shown the change set in the prompt.
+        // Prompt-invisible files are penalized as ungrounded for API reviewers.
+        notes.push(`cited file is not in the reviewed change set (${f.file})`);
+        effectiveConfidence /= 2;
+      } else if (fileExistsInRepo) {
+        // Local CLI mode: reviewer can inspect untouched repo files.
+        notes.push(`out-of-diff evidence: pre-existing repository file (${f.file})`);
+      } else {
+        // Local CLI mode: file does not exist in repo.
+        notes.push(`cited file is not in the repository (${f.file})`);
         effectiveConfidence /= 2;
       }
     }
+
+    if (haystack && f.evidence && f.evidence.trim()) {
+      const targetEvidence = isFindingApi
+        ? collapseWhitespace(stripFenceSentinels(f.evidence))
+        : collapseWhitespace(f.evidence);
+
+      const inDiff = haystack.includes(targetEvidence);
+
+      if (!inDiff) {
+        let inRepoFile = false;
+        if (!isFindingApi && fileExistsInRepo && targetFilePath) {
+          try {
+            const fileContent = fs.readFileSync(targetFilePath, "utf8");
+            if (collapseWhitespace(fileContent).includes(targetEvidence)) {
+              inRepoFile = true;
+            }
+          } catch {}
+        }
+
+        if (inRepoFile) {
+          notes.push("out-of-diff evidence: quoted evidence is in existing repository code outside the diff patch");
+        } else {
+          notes.push("quoted evidence was not found in the provided context");
+          effectiveConfidence /= 2;
+        }
+      }
+    }
+
     return { notes, effectiveConfidence };
   });
 }

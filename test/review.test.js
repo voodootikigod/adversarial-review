@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 import { TRUST_POLICY, fenceDirective, validateResult, assessFindings, deriveVerdict, mergeProviderResults, deriveQuorumVerdict, renderReport, apiProvidersCannotReview, buildVerifyPrompt, fenceUntrusted, buildPrompt, buildArtifactPrompt, loadAsset } from "../src/review.js";
 
@@ -118,9 +119,13 @@ test("assessFindings flags files outside the change set and halves confidence", 
   assert.equal(assessments[0].notes.length, 1);
   assert.equal(assessments[0].effectiveConfidence, 0.4);
 
-  // Local CLI reviewers can legitimately inspect untouched files.
-  const cliAssessments = assessFindings(result, context, { apiMode: false });
-  assert.deepEqual(cliAssessments[0].notes, []);
+  // Local CLI reviewers can legitimately inspect untouched existing repo files.
+  const cliRepoResult = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.8, evidence: "" })]
+  });
+  const cliAssessments = assessFindings(cliRepoResult, context, { apiMode: false, cwd: process.cwd() });
+  assert.equal(cliAssessments[0].effectiveConfidence, 0.8);
+  assert.ok(cliAssessments[0].notes.some(n => n.includes("out-of-diff evidence")));
 });
 
 test("assessFindings flags evidence not present in the inlined context", () => {
@@ -136,6 +141,91 @@ test("assessFindings flags evidence not present in the inlined context", () => {
   const assessments = assessFindings(result, context, { apiMode: true });
   assert.equal(assessments[0].notes.length, 1);
   assert.equal(assessments[0].effectiveConfidence, 0.5);
+});
+
+test("T47: assessFindings preserves full confidence for valid out-of-diff repository files in local CLI mode", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.8, evidence: "" })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
+
+  const assessments = assessFindings(result, context, { apiMode: false, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 0.8);
+  assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+});
+
+test("T47: assessFindings penalizes prompt-invisible out-of-diff files in API mode", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.8, evidence: "" })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
+
+  const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 0.4);
+  assert.ok(assessments[0].notes.some(n => n.includes("cited file is not in the reviewed change set")));
+});
+
+test("T47: assessFindings preserves full confidence for evidence present in existing repo code outside diff patch in CLI mode", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 1.0, evidence: "SEVERITY_RANK" })]
+  });
+  const context = {
+    changedFiles: ["src/other.js"],
+    includeDiff: true,
+    content: "## Diff\n```\nconst x = 1;\n```"
+  };
+
+  const assessments = assessFindings(result, context, { apiMode: false, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 1.0);
+  assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+});
+
+test("T47: assessFindings resolves repo-root relative file citations when invoked from nested subdirectories", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.9, evidence: "" })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
+  const nestedCwd = path.join(process.cwd(), "test");
+
+  const assessments = assessFindings(result, context, { apiMode: false, cwd: nestedCwd });
+  assert.equal(assessments[0].effectiveConfidence, 0.9);
+  assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+});
+
+test("T47: assessFindings preserves CLI grounding for local CLI findings via trusted providerModes map", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.9, evidence: "SEVERITY_RANK", corroborated_by: ["gemini"] })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: true, content: "## Diff\n```\nconst x = 1;\n```" };
+  const providerModes = new Map([["gemini", "cli"], ["gpt", "api"]]);
+
+  const assessments = assessFindings(result, context, { apiMode: true, providerModes, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 0.9);
+  assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+});
+
+test("T47: assessFindings prevents untrusted LLM payload spoofing from bypassing API grounding", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.9, evidence: "", corroborated_by: ["claude"] })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
+
+  // In API mode without trusted providerModes, payload metadata is NOT trusted to bypass API grounding
+  const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 0.45);
+  assert.ok(assessments[0].notes.some(n => n.includes("cited file is not in the reviewed change set")));
+});
+
+test("T47: assessFindings handles trust root discovery failures gracefully without crashing", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/nonexistent_file_xyz.js", confidence: 0.8, evidence: "" })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
+
+  assert.doesNotThrow(() => {
+    const assessments = assessFindings(result, context, { apiMode: false, cwd: "/nonexistent/path/xyz" });
+    assert.equal(assessments[0].effectiveConfidence, 0.4);
+  });
 });
 
 test("assessFindings matches evidence with collapsed whitespace", () => {
