@@ -527,3 +527,16 @@ test("T44: probeOsConstraint uses bwrap on Linux when installed", () => {
   const res = probeOsConstraint({});
   assert.equal(res.mode, "bwrap");
 });
+
+test("T44: buildFixerCmd fails closed in advisory mode if repository is inside a sensitive secret path", () => {
+  const sshDir = path.join(os.homedir(), ".ssh");
+  const mockWorkdir = path.join(sshDir, "mock-repo");
+  assert.throws(() => {
+    buildFixerCmd("agy", { mode: "advisory" }, {
+      prompt: "P",
+      timeoutMs: 60_000,
+      fixerPath: "/usr/local/bin/agy",
+      cwd: mockWorkdir
+    });
+  }, /located inside a sensitive host credential/i);
+});

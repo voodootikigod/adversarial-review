@@ -549,15 +549,57 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
     args = ["-"];
   }
 
-  // Wrap with bwrap / landlock / unshare if available. The prompt stays the LAST argument either way.
-  if (constraint.mode === "bwrap") {
-    const rawCwd = cwd || process.cwd();
-    const targetCwd = path.resolve(rawCwd);
-    let realCwd = targetCwd;
+  const rawCwd = cwd || process.cwd();
+  const targetCwd = path.resolve(rawCwd);
+  let realCwd = targetCwd;
+  try {
+    realCwd = fs.realpathSync.native(targetCwd);
+  } catch {}
+
+  const home = os.homedir();
+  const uid = process.getuid ? process.getuid() : null;
+  const rawSecretPaths = [
+    path.join(home, ".ssh"),
+    path.join(home, ".aws"),
+    path.join(home, ".gnupg"),
+    path.join(home, ".docker"),
+    path.join(home, ".config", "gcloud"),
+    path.join(home, ".azure"),
+    path.join(home, ".netrc"),
+    path.join(home, ".npmrc"),
+    path.join(home, ".git-credentials"),
+    path.join(home, ".bash_history"),
+    path.join(home, ".zsh_history"),
+    path.join(home, ".kube"),
+    path.join(home, ".terraform.d"),
+    path.join(home, ".pypirc"),
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/podman",
+    ...(uid !== null ? [`/run/user/${uid}`] : [])
+  ];
+  for (const rawSecretPath of rawSecretPaths) {
+    let secretPath = rawSecretPath;
     try {
-      realCwd = fs.realpathSync.native(targetCwd);
+      secretPath = fs.realpathSync.native(rawSecretPath);
     } catch {}
 
+    if (
+      realCwd === secretPath ||
+      realCwd.startsWith(secretPath + path.sep) ||
+      realCwd === rawSecretPath ||
+      realCwd.startsWith(rawSecretPath + path.sep)
+    ) {
+      throw new Error(
+        `Refusing to run --loop because the repository "${realCwd}" ` +
+        `is located inside a sensitive host credential directory "${secretPath}". ` +
+        `Move the repository outside "${secretPath}".`
+      );
+    }
+  }
+
+  // Wrap with bwrap if available. The prompt stays the LAST argument either way.
+  if (constraint.mode === "bwrap") {
     const root = reviewTrustRoot({ cwd: rawCwd });
     if (root && !isInsideTrustRoot(realCwd, { root })) {
       throw new Error(
@@ -573,46 +615,11 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
       "--dev-bind", "/dev", "/dev",
       "--proc", "/proc"
     ];
-    const home = os.homedir();
-    const uid = process.getuid ? process.getuid() : null;
-    const rawSecretPaths = [
-      path.join(home, ".ssh"),
-      path.join(home, ".aws"),
-      path.join(home, ".gnupg"),
-      path.join(home, ".docker"),
-      path.join(home, ".config", "gcloud"),
-      path.join(home, ".azure"),
-      path.join(home, ".netrc"),
-      path.join(home, ".npmrc"),
-      path.join(home, ".git-credentials"),
-      path.join(home, ".bash_history"),
-      path.join(home, ".zsh_history"),
-      path.join(home, ".kube"),
-      path.join(home, ".terraform.d"),
-      path.join(home, ".pypirc"),
-      "/var/run/docker.sock",
-      "/run/docker.sock",
-      "/run/podman",
-      ...(uid !== null ? [`/run/user/${uid}`] : [])
-    ];
     for (const rawSecretPath of rawSecretPaths) {
       let secretPath = rawSecretPath;
       try {
         secretPath = fs.realpathSync.native(rawSecretPath);
       } catch {}
-
-      if (
-        realCwd === secretPath ||
-        realCwd.startsWith(secretPath + path.sep) ||
-        realCwd === rawSecretPath ||
-        realCwd.startsWith(rawSecretPath + path.sep)
-      ) {
-        throw new Error(
-          `Refusing to run --loop with bwrap write confinement because the repository "${realCwd}" ` +
-          `is located inside a sensitive host credential directory "${secretPath}". ` +
-          `Move the repository outside "${secretPath}" or pass --loop-unsafe.`
-        );
-      }
       try {
         const stat = fs.statSync(secretPath);
         if (stat.isDirectory()) {
