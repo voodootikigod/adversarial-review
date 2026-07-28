@@ -66,6 +66,80 @@ test("resolveCommand skips PATH entries inside an excluded root", () => {
   }
 });
 
+test("the worktree boundary is found without executing anything", async () => {
+  const { findWorktreeBoundary } = await import("../src/trust-root.js");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-boundary-"));
+  try {
+    const nested = path.join(repo, "packages", "app", "src");
+    fs.mkdirSync(nested, { recursive: true });
+    // No .git yet: nothing to find below the temp dir.
+    assert.equal(findWorktreeBoundary(nested), null);
+
+    // A .git DIRECTORY (normal clone) is a boundary...
+    fs.mkdirSync(path.join(repo, ".git"));
+    assert.equal(findWorktreeBoundary(nested), fs.realpathSync(repo));
+    fs.rmSync(path.join(repo, ".git"), { recursive: true });
+
+    // ...and so is a .git FILE (submodule or linked worktree).
+    fs.writeFileSync(path.join(repo, ".git"), "gitdir: /elsewhere\n");
+    assert.equal(findWorktreeBoundary(nested), fs.realpathSync(repo));
+
+    // The nearest boundary wins for a nested repository.
+    const inner = path.join(repo, "packages", "app");
+    fs.writeFileSync(path.join(inner, ".git"), "gitdir: /elsewhere\n");
+    assert.equal(findWorktreeBoundary(nested), fs.realpathSync(inner));
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("an ANCESTOR-owned repo git is not executed when run from a nested package", { skip: process.platform === "win32" ? "posix-only shims" : false }, () => {
+  // The monorepo case: run from /repo/packages/app, where npm/npx put the
+  // ancestor /repo/node_modules/.bin first on PATH. Excluding only cwd leaves
+  // that directory eligible, and the bootstrap executes it before it ever learns
+  // that /repo is the trust root — so containment checks arrive too late.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-nested-"));
+  try {
+    const realGit = resolveCommand("git");
+    assert.ok(realGit, "this test needs a real git on PATH");
+
+    const repoBin = path.join(repo, "node_modules", ".bin");
+    const pkg = path.join(repo, "packages", "app");
+    fs.mkdirSync(repoBin, { recursive: true });
+    fs.mkdirSync(pkg, { recursive: true });
+
+    const marker = path.join(repo, "PWNED");
+    const evil = path.join(repoBin, "git");
+    fs.writeFileSync(evil, `#!/bin/sh\ntouch "${marker}"\nexec "${realGit}" "$@"\n`);
+    fs.chmodSync(evil, 0o755);
+
+    const g = (a) => spawnSync(realGit, a, { cwd: repo, encoding: "utf8" });
+    g(["init", "-q"]);
+    g(["config", "user.email", "t@t.t"]);
+    g(["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(pkg, "code.js"), "export const x = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-qm", "init"]);
+    fs.writeFileSync(path.join(pkg, "code.js"), "export const x = 2;\n");
+
+    // Run from the NESTED package, ancestor .bin first — exactly npx's ordering.
+    const PATH = [repoBin, nodeBinDir, path.dirname(realGit), "/usr/bin", "/bin"].join(path.delimiter);
+    spawnSync(process.execPath, [cli, "--prompt-only", "--scope", "working-tree", "--allow-secrets"], {
+      cwd: pkg,
+      encoding: "utf8",
+      env: { HOME: process.env.HOME, PATH }
+    });
+
+    assert.equal(
+      fs.existsSync(marker),
+      false,
+      "an ancestor-owned repo git ran during the bootstrap — the boundary was computed from cwd, not the worktree"
+    );
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("a git refusal is never swallowed by an allowFail probe or misreported", async () => {
   // The refusal must survive two swallowing layers: git()'s own catch, which
   // turns any failure into "" when allowFail is set, and collectReviewContext's

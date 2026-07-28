@@ -32,16 +32,43 @@ export function canonicalize(p) {
 
 // The canonical git worktree top level (the trust root), or the cwd when not in a
 // git repo. Cached for the process; `git rev-parse` runs at most once.
+// The worktree boundary, found WITHOUT executing anything: walk ancestors for a
+// `.git` entry (a directory in a normal clone, a file in a submodule or linked
+// worktree). Returns null when there is none.
+//
+// This exists because the boundary has to be known BEFORE git runs. Excluding
+// only cwd is not enough: run from /repo/packages/app and the ancestor-owned
+// /repo/node_modules/.bin — which npm and npx put first on PATH — is outside cwd
+// and stays eligible, so the repository picks the git that inspects it, and the
+// containment checks that follow are already too late. A pure filesystem walk
+// cannot be hijacked the way a PATH lookup can.
+export function findWorktreeBoundary(startDir) {
+  let cur = path.resolve(startDir);
+  for (;;) {
+    try {
+      // Canonicalized on the way out, like every other boundary this module
+      // produces: a caller comparing it against a realpath-resolved path must not
+      // have to know which of the two forms it got.
+      if (fs.existsSync(path.join(cur, ".git"))) return canonicalize(cur);
+    } catch {
+      // Unreadable directory — keep walking.
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
 export function reviewTrustRoot({ cwd = process.cwd() } = {}) {
   if (cachedRoot !== undefined) return cachedRoot;
   let root = cwd;
-  // BOOTSTRAP: this call has to run git before the trust root it computes exists,
-  // so it cannot use the full check. It gets the two guarantees available without
-  // one — an absolute path (never a bare name, which Windows resolves from the
-  // CURRENT DIRECTORY, i.e. the repository under review) and no PATH entry inside
-  // cwd (npm/npx prepend ./node_modules/.bin). resolveTrustedGit below applies
-  // the real containment check to every subsequent invocation.
-  const git = resolveCommand("git", { excludeRoots: [path.resolve(cwd)] });
+  // BOOTSTRAP: git must run before the root it reports exists, so the boundary is
+  // established by the exec-free ancestor walk above and the WHOLE boundary is
+  // excluded from PATH resolution. Together with resolving to an absolute path
+  // (never a bare name, which Windows resolves from the current directory — the
+  // repository under review) that closes both hijack routes before anything runs.
+  const boundary = findWorktreeBoundary(cwd) ?? path.resolve(cwd);
+  const git = resolveCommand("git", { excludeRoots: [boundary] });
   if (git) {
     try {
       const out = execFileSync(git, ["rev-parse", "--show-toplevel"], {
@@ -56,6 +83,21 @@ export function reviewTrustRoot({ cwd = process.cwd() } = {}) {
     }
   }
   cachedRoot = canonicalize(root);
+  // The exec-free boundary is at or above the git toplevel in every normal
+  // layout, so the bootstrap git should land outside the final root. If it did
+  // not, the boundary was wrong and repository-supplied code has ALREADY run —
+  // say so loudly instead of continuing on a compromised assumption. cachedRoot
+  // stays assigned so a retry cannot execute it a second time.
+  if (git && isInsideTrustRoot(git, { root: cachedRoot })) {
+    throw Object.assign(
+      new Error(
+        `Refusing to continue: the git used to locate the repository (${git}) resolves INSIDE ` +
+        `the repository under review (${cachedRoot}). A repository must not supply the git that ` +
+        `inspects it. Install git system-wide and remove it from this worktree's PATH entries.`
+      ),
+      { code: "EUNTRUSTEDGIT" }
+    );
+  }
   return cachedRoot;
 }
 
