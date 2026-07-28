@@ -1,4 +1,6 @@
 import { execFileSync, spawn } from "child_process";
+import fs from "fs";
+import os from "os";
 import path from "path";
 import { log, colors } from "./utils.js";
 import { scanForSecrets } from "./secrets.js";
@@ -11,7 +13,7 @@ export function tailOf(text, limit) {
   return text.length > limit ? text.slice(-limit) : text;
 }
 import { collectReviewContext } from "./git-context.js";
-import { resolveTrustedGit } from "./trust-root.js";
+import { resolveTrustedGit, reviewTrustRoot, isInsideTrustRoot } from "./trust-root.js";
 import { resolveTrustedCommand, buildSpawnTarget, terminateProcessTree, sanitizedSpawnEnv } from "./spawn-safe.js";
 import {
   buildPrompt,
@@ -180,7 +182,11 @@ export function buildLoopSummary({ providers, iterations, exitReason, survivingC
 
 // ─── Recovery command ─────────────────────────────────────────────────────────
 
-function buildRecoveryCmd(stashName) {
+function buildRecoveryCmd(stashName, stashRef = null) {
+  if (process.platform === "win32") {
+    const target = stashRef || `"${stashName}"`;
+    return `# Restore checkpoint:\ngit stash apply --index ${target}`;
+  }
   return (
     `# Restore checkpoint:\n` +
     `REF=$(git stash list --format='%gd %s' | grep '${stashName}' | awk '{print $1}'); ` +
@@ -246,7 +252,18 @@ export const FIXER_PROVIDER_MAP = {
 
 // ─── OS write constraint ──────────────────────────────────────────────────────
 
-function probeLinuxConstraint() {
+export function probeLinuxConstraint() {
+  // Check for bubblewrap (bwrap) write confinement first.
+  const bwrap = resolveTrustedCommand("bwrap");
+  if (bwrap) {
+    try {
+      execFileSync(bwrap, ["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc", "true"], {
+        stdio: "ignore", timeout: 3000, env: sanitizedSpawnEnv()
+      });
+      return "bwrap";
+    } catch {}
+  }
+
   // The sandbox helper is itself a spawn, and a repo-supplied `unshare` that
   // exits 0 would report a sandbox that does not exist — then wrap the fixer.
   const unshare = resolveTrustedCommand("unshare");
@@ -264,9 +281,17 @@ function probeLinuxConstraint() {
   return null;
 }
 
-function probeOsConstraint(args) {
-  const { platform } = process;
-  if (platform === "win32") throw new Error("--loop is not supported on Windows.");
+export function probeOsConstraint(args, { platform = process.platform } = {}) {
+  if (platform === "win32") {
+    if (!args.loopUnsafe) {
+      throw new Error(
+        "--loop on Windows has no enforced write sandbox.\n" +
+        "Pass --loop-unsafe to proceed, acknowledging the fixer has unrestricted write access."
+      );
+    }
+    log.warn("Windows: running without write sandboxing (--loop-unsafe). Fixer has unrestricted write access.");
+    return { mode: "advisory" };
+  }
 
   if (platform === "darwin") {
     if (!args.loopUnsafe) {
@@ -283,32 +308,26 @@ function probeOsConstraint(args) {
   //
   // `unshare --mount` creates a new MOUNT NAMESPACE. It does not remount anything
   // read-only and does not restrict writes — the fixer keeps every filesystem
-  // permission of the invoking user. Treating it as a write sandbox told Linux
-  // users they were confined when they were not, and skipped the --loop-unsafe
-  // acknowledgement macOS correctly requires. That matters here because the fixer
-  // runs with --dangerously-skip-permissions on a prompt derived from an
-  // untrusted diff, and the loop's git rollback cannot undo a write to
-  // ~/.ssh/authorized_keys, a shell profile, .git/hooks, or another repository.
-  //
-  // Real write confinement needs Landlock or bubblewrap. Until that exists, Linux
-  // is acknowledged as unconfined too. The namespace is still used when available
-  // — it does contain mount operations — but it is not claimed to be more.
+  // permission of the invoking user.
+  // Real kernel write confinement requires bubblewrap (`bwrap`).
   const linuxMode = probeLinuxConstraint();
-  if (!args.loopUnsafe) {
+  const isConfined = linuxMode === "bwrap";
+  if (!isConfined && !args.loopUnsafe) {
     throw new Error(
       "--loop has no enforced write confinement on Linux.\n" +
       "`unshare --mount` creates a mount namespace but remounts nothing read-only, so the fixer " +
       "keeps full write access to your filesystem — home directory, credentials, .git internals, " +
       "other repositories — and the loop's git rollback cannot undo changes outside the worktree.\n" +
-      "Pass --loop-unsafe to proceed, acknowledging the fixer has unrestricted write access."
+      "Install bubblewrap (`bwrap`) for kernel-level write confinement, or pass --loop-unsafe to proceed, " +
+      "acknowledging the fixer has unrestricted write access."
     );
   }
-  log.warn(
-    linuxMode
-      ? `Linux: mount namespace (${linuxMode}) active, but writes are NOT confined (--loop-unsafe). Fixer has unrestricted write access.`
-      : "Linux: running without write confinement (--loop-unsafe). Fixer has unrestricted write access."
-  );
-  return { mode: linuxMode ?? "none" };
+  if (isConfined) {
+    log.info(`Linux: ${linuxMode} write confinement active (workspace writable, filesystem read-only).`);
+    return { mode: linuxMode };
+  }
+  log.warn("Linux: running without write sandboxing (--loop-unsafe). Fixer has unrestricted write access.");
+  return { mode: "advisory" };
 }
 
 // ─── Gating finding helpers ───────────────────────────────────────────────────
@@ -355,15 +374,17 @@ function redactSecretsInFindings(findings) {
 export function getFixFiles(cwd, findings, args) {
   if (args.loopFixerScope === "unrestricted") {
     const cap = args.loopFixerFileCap || 100;
-    const allFiles = gitRun(cwd, ["ls-files"], { allowFail: true }).split("\n").filter(Boolean);
+    const allFiles = gitRun(cwd, ["ls-files", "--full-name", ":/"], { allowFail: true }).split("\n").filter(Boolean);
     if (allFiles.length > cap) {
       log.warn(
         `Repo has ${allFiles.length} tracked files, exceeding --loop-fixer-file-cap ${cap}.\n` +
         `  Listing finding-cited files first, then filling to ${cap} alphabetically.`
       );
-      const cited = new Set(findings.map(f => f.file).filter(Boolean));
-      const rest = allFiles.filter(f => !cited.has(f));
-      return [...cited, ...rest].slice(0, cap);
+      const trackedSet = new Set(allFiles);
+      const citedTracked = findings.map(f => f.file).filter(f => f && trackedSet.has(f));
+      const citedSet = new Set(citedTracked);
+      const rest = allFiles.filter(f => !citedSet.has(f));
+      return [...new Set([...citedTracked, ...rest])].slice(0, cap);
     }
     return allFiles;
   }
@@ -372,7 +393,7 @@ export function getFixFiles(cwd, findings, args) {
   // intersected with the set git actually tracks rather than trusted as a path.
   // This is what makes the list authoritative — lexical validation alone accepts
   // directories and symlinks that resolve outside the repository.
-  const tracked = gitRun(cwd, ["ls-files"], { allowFail: true }).split("\n").filter(Boolean);
+  const tracked = gitRun(cwd, ["ls-files", "--full-name", ":/"], { allowFail: true }).split("\n").filter(Boolean);
   const cited = [...new Set(findings.map(f => f.file).filter(Boolean))];
   if (tracked.length === 0) {
     // Fail CLOSED. An empty result means either an empty repo or a failed
@@ -510,7 +531,7 @@ export function fixerKind(fixerCmd) {
   return base.replace(/\.(cmd|bat|exe|com)$/, "");
 }
 
-export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs = null, fixerPath = null } = {}) {
+export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs = null, fixerPath = null, cwd = null } = {}) {
   const exe = fixerPath || fixerCmd;
   const kind = fixerKind(fixerCmd);
   let cmd, args;
@@ -540,7 +561,101 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
     args = ["-"];
   }
 
-  // Wrap with unshare if available. The prompt stays the LAST argument either way.
+  const rawCwd = cwd || process.cwd();
+  const targetCwd = path.resolve(rawCwd);
+  let realCwd = targetCwd;
+  try {
+    realCwd = fs.realpathSync.native(targetCwd);
+  } catch {}
+
+  const home = os.homedir();
+  const uid = process.getuid ? process.getuid() : null;
+  const rawSecretPaths = [
+    path.join(home, ".ssh"),
+    path.join(home, ".aws"),
+    path.join(home, ".gnupg"),
+    path.join(home, ".docker"),
+    path.join(home, ".config", "gcloud"),
+    path.join(home, ".azure"),
+    path.join(home, ".netrc"),
+    path.join(home, ".npmrc"),
+    path.join(home, ".git-credentials"),
+    path.join(home, ".bash_history"),
+    path.join(home, ".zsh_history"),
+    path.join(home, ".kube"),
+    path.join(home, ".terraform.d"),
+    path.join(home, ".pypirc"),
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/podman",
+    ...(uid !== null ? [`/run/user/${uid}`] : [])
+  ];
+  for (const rawSecretPath of rawSecretPaths) {
+    let secretPath = rawSecretPath;
+    try {
+      secretPath = fs.realpathSync.native(rawSecretPath);
+    } catch {}
+
+    if (
+      realCwd === secretPath ||
+      realCwd.startsWith(secretPath + path.sep) ||
+      realCwd === rawSecretPath ||
+      realCwd.startsWith(rawSecretPath + path.sep)
+    ) {
+      throw new Error(
+        `Refusing to run --loop because the repository "${realCwd}" ` +
+        `is located inside a sensitive host credential directory "${secretPath}". ` +
+        `Move the repository outside "${secretPath}".`
+      );
+    }
+  }
+
+  // Wrap with bwrap if available. The prompt stays the LAST argument either way.
+  if (constraint.mode === "bwrap") {
+    const root = reviewTrustRoot({ cwd: rawCwd });
+    if (root && !isInsideTrustRoot(realCwd, { root })) {
+      throw new Error(
+        `Directory "${targetCwd}" (resolves to "${realCwd}") is outside the repository trust root "${root}". ` +
+        `Bubblewrap write confinement refuses to bind external target directories.`
+      );
+    }
+
+    const bwrapArgs = [
+      "--ro-bind", "/", "/",
+      "--tmpfs", "/tmp",
+      "--bind", realCwd, realCwd,
+      "--dev-bind", "/dev", "/dev",
+      "--proc", "/proc"
+    ];
+    for (const rawSecretPath of rawSecretPaths) {
+      let secretPath = rawSecretPath;
+      try {
+        secretPath = fs.realpathSync.native(rawSecretPath);
+      } catch {}
+      try {
+        const stat = fs.statSync(secretPath);
+        if (stat.isDirectory()) {
+          bwrapArgs.push("--tmpfs", secretPath);
+        } else if (stat.isFile() || stat.isSocket()) {
+          bwrapArgs.push("--ro-bind", "/dev/null", secretPath);
+        }
+      } catch {}
+    }
+    if (exe && exe.startsWith("/tmp/")) {
+      const mockDir = path.dirname(exe);
+      bwrapArgs.push("--ro-bind", mockDir, mockDir);
+    }
+    const gitDir = path.join(realCwd, ".git");
+    if (fs.existsSync(gitDir)) {
+      bwrapArgs.push("--ro-bind", gitDir, gitDir);
+    }
+    bwrapArgs.push("--chdir", realCwd, "--", cmd, ...args);
+    return {
+      cmd: "bwrap",
+      args: bwrapArgs,
+      useStdin
+    };
+  }
   if (constraint.mode === "unshare-user") {
     return { cmd: "unshare", args: ["--mount", "--user", "--map-root-user", cmd, ...args], useStdin };
   }
@@ -587,12 +702,21 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
     );
   }
 
-  const { cmd, args, useStdin } = buildFixerCmd(fixerCmd, constraint, { prompt, timeoutMs, fixerPath });
+  const { cmd, args, useStdin } = buildFixerCmd(fixerCmd, constraint, { prompt, timeoutMs, fixerPath, cwd });
 
   // `cmd` is the resolved fixer, or the sandbox wrapper when one is in use. The
   // wrapper is a separate binary and gets its own resolution.
   let spawnCmd = cmd;
-  if (cmd === "unshare") {
+  if (cmd === "bwrap") {
+    spawnCmd = resolveTrustedCommand("bwrap");
+    if (!spawnCmd) {
+      throw new Error(
+        "The write sandbox helper \"bwrap\" was not found on PATH outside the repository " +
+        "under review. Re-run with --loop-unsafe to proceed without it, or install " +
+        "bubblewrap system-wide."
+      );
+    }
+  } else if (cmd === "unshare") {
     spawnCmd = resolveTrustedCommand("unshare");
     if (!spawnCmd) {
       throw new Error(
@@ -616,12 +740,13 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
 
   const stderrChunks = [];
   child.stderr?.on("data", chunk => stderrChunks.push(chunk));
+  child.stdin?.on("error", () => {});
 
   try {
     // The argv-prompt fixer already HAS the prompt; writing it again would feed
     // the whole fix instruction to a process that is not reading stdin.
-    if (useStdin) child.stdin.write(prompt, "utf8");
-    child.stdin.end();
+    if (useStdin && child.stdin?.writable) child.stdin.write(prompt, "utf8");
+    child.stdin?.end();
   } catch { /* fixer may not read stdin; that's OK */ }
 
   const promise = new Promise(resolve => {
@@ -744,6 +869,9 @@ export async function runProviderRound(providers, context, prompt, args, reviewF
 // ─── Main loop ────────────────────────────────────────────────────────────────
 
 export async function runLoop(cwd, args) {
+  const root = reviewTrustRoot({ cwd });
+  if (root) cwd = root;
+
   // Branch scope (or --base) drives a pre-merge convergence loop that commits
   // fixes onto the FEATURE branch — a distinct mechanism (commit/reset vs
   // stash/pop) handled by runBranchLoop. The working-tree path below is unchanged.
@@ -1270,6 +1398,9 @@ export function resolveBranchBaseSha(cwd, base) {
 // printed whole-loop recovery). Shares every review/gating/fixer helper with the
 // working-tree loop; only the checkpoint mechanism differs. (T7 / GitHub #12.)
 export async function runBranchLoop(cwd, args) {
+  const root = reviewTrustRoot({ cwd });
+  if (root) cwd = root;
+
   // 1. Clean-tree precondition — the safety keystone. With a clean start, any file
   // that appears mid-loop is fixer-created, so `git add -A` / `reset --hard` /
   // `clean -fd` can never touch the user's pre-existing uncommitted work.

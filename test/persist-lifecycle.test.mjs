@@ -20,29 +20,48 @@ const APPROVE = '{"verdict":"approve","summary":"ok","coverage":{"files_examined
 // mocks: { name: "APPROVE" | "BAD" }. APPROVE emits a valid review; BAD emits
 // non-JSON so runReview fails. seedConfig (optional) is written to the isolated
 // config path before the run. Returns { status, stdout, stderr, configPath, readConfig() }.
+import { writeMockBin } from "./helpers/mock-bin.mjs";
+import { makeGit } from "./helpers/git-retry.mjs";
+
 function runCli(args, { mocks = {}, seedConfig = null, env = {} } = {}) {
   const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-life-mocks-"));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-life-repo-"));
-  const configPath = path.join(mocksDir, "adv-config.json"); // outside cwd=repoDir
+  const configPath = path.join(mocksDir, "adv-config.json");
   try {
     for (const [name, kind] of Object.entries(mocks)) {
-      const p = path.join(mocksDir, name);
       let body;
       if (kind === "APPROVE") {
-        body = `#!/bin/sh\ncat >/dev/null\ncat <<'JSON'\n${APPROVE}\nJSON\n`;
+        body = `
+import fs from "node:fs";
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const out = ${JSON.stringify(APPROVE + "\n")};
+  const idx = process.argv.indexOf("--output-last-message");
+  if (idx !== -1 && process.argv[idx + 1]) {
+    fs.writeFileSync(process.argv[idx + 1], out);
+  } else {
+    process.stdout.write(out);
+  }
+});
+`;
       } else if (kind === "AUTHFAIL") {
-        // Simulate a logged-out CLI session: non-zero exit + an auth-ish stderr.
-        body = `#!/bin/sh\ncat >/dev/null\necho 'error: not logged in; run: login' >&2\nexit 1\n`;
+        body = `
+process.stderr.write("error: not logged in; run: login\\n");
+process.exit(1);
+`;
       } else if (kind === "MODELFAIL") {
-        // Simulate a retired/invalid model: non-zero exit + a model-error stderr.
-        body = `#!/bin/sh\ncat >/dev/null\necho 'error: the model does not exist or is retired' >&2\nexit 1\n`;
+        body = `
+process.stderr.write("error: the model does not exist or is retired\\n");
+process.exit(1);
+`;
       } else {
-        body = `#!/bin/sh\ncat >/dev/null\necho 'not json at all'\n`; // BAD: parse failure
+        body = `
+process.stdout.write("not json at all\\n");
+`;
       }
-      fs.writeFileSync(p, body);
-      fs.chmodSync(p, 0o755);
+      writeMockBin(mocksDir, name, body);
     }
-    const git = (a) => spawnSync("git", a, { cwd: repoDir, encoding: "utf8" });
+    const git = makeGit(repoDir);
     git(["init", "-q"]);
     git(["config", "user.email", "t@t.t"]);
     git(["config", "user.name", "t"]);
@@ -52,23 +71,33 @@ function runCli(args, { mocks = {}, seedConfig = null, env = {} } = {}) {
     fs.writeFileSync(path.join(repoDir, "code.js"), "export const x = 2; // changed\n");
 
     if (seedConfig) {
-      // Fill in the mock's real cliPath so cachedResolutionUsable accepts it.
       seedConfig = JSON.parse(JSON.stringify(seedConfig));
       for (const entry of Object.values(seedConfig.cache || {})) {
         if (entry.provider === "cli" && entry.cliCmd) {
-          entry.cliPath = fs.realpathSync(path.join(mocksDir, entry.cliCmd));
+          const mockName = process.platform === "win32" ? `${entry.cliCmd}.cmd` : entry.cliCmd;
+          entry.cliPath = fs.realpathSync(path.join(mocksDir, mockName));
         }
       }
       fs.writeFileSync(configPath, JSON.stringify(seedConfig));
     }
 
-    const PATH = [mocksDir, nodeBinDir, "/usr/bin", "/bin"].join(path.delimiter);
-    const r = spawnSync(process.execPath, [cli, ...args], {
+    let sysDirs = ["/usr/bin", "/bin"];
+    if (process.platform === "win32") {
+      const whereGit = spawnSync("where.exe", ["git"], { encoding: "utf8" });
+      if (whereGit.status === 0 && whereGit.stdout.trim()) {
+        sysDirs = [path.dirname(whereGit.stdout.trim().split(/\r?\n/)[0])];
+      }
+    }
+    const PATH = [mocksDir, nodeBinDir, ...sysDirs].join(path.delimiter);
+    const finalArgs = [...args];
+    if (process.platform === "win32" && finalArgs.includes("--loop") && !finalArgs.includes("--loop-unsafe")) {
+      finalArgs.push("--loop-unsafe");
+    }
+    const r = spawnSync(process.execPath, [cli, ...finalArgs], {
       cwd: repoDir,
       encoding: "utf8",
       env: { HOME: process.env.HOME, PATH, ...env, ADVERSARIAL_REVIEW_CONFIG: configPath }
     });
-    // Read the config BEFORE the finally block removes mocksDir.
     const config = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : null;
     return { status: r.status, stdout: r.stdout, stderr: r.stderr, config };
   } finally {
@@ -97,12 +126,12 @@ test("AC1: a FAILED review does NOT persist the resolution (persist-after-succes
 });
 
 test("AC2: a cache-sourced provider with an AUTH failure is invalidated, excluded, and a reachable alternative is used", () => {
-  // Seed the cache at a mock 'agy' whose session is dead (auth failure); plant a
+  // Seed the cache at a mock 'codex' whose session is dead (auth failure); plant a
   // working 'claude'. The failed provider is excluded, so re-detection advances to
-  // claude even though the ladder would otherwise reconsider agy.
+  // claude even though the ladder would otherwise reconsider codex.
   const r = runCli(BASE, {
-    mocks: { agy: "AUTHFAIL", claude: "APPROVE" },
-    seedConfig: { version: 1, defaults: { models: {} }, cache: { default: { provider: "cli", cliCmd: "agy", family: "gemini" } } }
+    mocks: { codex: "AUTHFAIL", claude: "APPROVE" },
+    seedConfig: { version: 1, defaults: { models: {} }, cache: { default: { provider: "cli", cliCmd: "codex", family: "openai" } } }
   });
   assert.equal(r.status, 0, `expected recovery to succeed, got ${r.status}: ${r.stderr}`);
   assert.match(r.stderr, /re-detected/, "should log the re-detection after the cached provider failed auth");
@@ -126,8 +155,8 @@ test("F5: after an auth-failure fallback, loop_summary names the provider that a
   const r = runCli(
     ["--loop", "--loop-unsafe", "--scope", "working-tree", "--allow-secrets", "--loop-fixer", "myfixer", "--json"],
     {
-      mocks: { agy: "AUTHFAIL", claude: "APPROVE", myfixer: "APPROVE" },
-      seedConfig: { version: 1, defaults: { models: {} }, cache: { default: { provider: "cli", cliCmd: "agy", family: "gemini" } } }
+      mocks: { codex: "AUTHFAIL", claude: "APPROVE", myfixer: "APPROVE" },
+      seedConfig: { version: 1, defaults: { models: {} }, cache: { default: { provider: "cli", cliCmd: "codex", family: "openai" } } }
     }
   );
   assert.equal(r.status, 0, r.stderr);
@@ -141,8 +170,8 @@ test("F5: after an auth-failure fallback, loop_summary names the provider that a
 
 test("T24: a cache-sourced provider with a RETIRED-MODEL failure is invalidated and recovers", () => {
   const r = runCli(BASE, {
-    mocks: { agy: "MODELFAIL", claude: "APPROVE" },
-    seedConfig: { version: 1, defaults: { models: {} }, cache: { default: { provider: "cli", cliCmd: "agy", family: "gemini" } } }
+    mocks: { codex: "MODELFAIL", claude: "APPROVE" },
+    seedConfig: { version: 1, defaults: { models: {} }, cache: { default: { provider: "cli", cliCmd: "codex", family: "openai" } } }
   });
   assert.equal(r.status, 0, `expected recovery to succeed, got ${r.status}: ${r.stderr}`);
   assert.match(r.stderr, /re-detected/, "a retired-model failure should trigger the same recovery as auth");
@@ -153,11 +182,11 @@ test("AC2b: a NON-auth failure (parse error) does NOT invalidate the cache or re
   // A cached provider that returns garbage is a transient/content failure, not a
   // dead credential — the run must fail (exit 1) without nuking the cache entry.
   const r = runCli(BASE, {
-    mocks: { agy: "BAD" },
-    seedConfig: { version: 1, defaults: { models: {} }, cache: { default: { provider: "cli", cliCmd: "agy", family: "gemini" } } }
+    mocks: { codex: "BAD" },
+    seedConfig: { version: 1, defaults: { models: {} }, cache: { default: { provider: "cli", cliCmd: "codex", family: "openai" } } }
   });
   assert.equal(r.status, 1, "a non-auth failure surfaces as exit 1");
   assert.doesNotMatch(r.stderr || "", /re-detected/, "must not attempt the auth-failure fallback");
   // The cache entry is preserved (not invalidated by a non-auth error).
-  assert.equal(r.config?.cache?.default?.cliCmd, "agy", "cache entry preserved on a non-auth failure");
+  assert.equal(r.config?.cache?.default?.cliCmd, "codex", "cache entry preserved on a non-auth failure");
 });

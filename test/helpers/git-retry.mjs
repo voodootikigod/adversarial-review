@@ -1,4 +1,6 @@
 import { spawnSync } from "node:child_process";
+import { resolveCommand } from "../../src/resolve-command.js";
+import { buildSpawnTarget } from "../../src/spawn-safe.js";
 
 // The loop e2e harnesses (branch-loop, loop-summary, loop-providers) drive many
 // `git` subprocesses per test against throwaway repos. Under parallel CPU load
@@ -41,8 +43,14 @@ function isTransient(result) {
 // production budget.
 export function makeGit(cwd, { maxAttempts = MAX_ATTEMPTS, baseDelayMs = BASE_DELAY_MS, maxDelayMs = MAX_DELAY_MS } = {}) {
   return function git(args) {
+    const gitBin = process.platform === "win32" ? (resolveCommand("git") || "git") : "git";
+    const target = buildSpawnTarget(gitBin, args, { argsContainUntrusted: false });
     for (let attempt = 1; ; attempt++) {
-      const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+      const result = spawnSync(target.command, target.args, {
+        cwd,
+        encoding: "utf8",
+        windowsVerbatimArguments: target.windowsVerbatimArguments === true,
+      });
       if (!isTransient(result) || attempt >= maxAttempts) return result;
       sleepSync(Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs));
     }

@@ -5,6 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { writeMockBin } from "./helpers/mock-bin.mjs";
 
 // T6 / GitHub #10 — end-to-end --input artifact review mode against the real
 // bin/cli.js. Artifact mode skips git entirely, so the harness is just a temp dir
@@ -17,26 +18,33 @@ const nodeBinDir = path.dirname(process.execPath);
 const APPROVE = '{"verdict":"approve","summary":"ok","coverage":{"files_examined":["spec.md"],"files_skipped":[]},"findings":[],"next_steps":[]}';
 const FLAG = '{"verdict":"needs-attention","summary":"gap","coverage":{"files_examined":["spec.md"],"files_skipped":[]},"findings":[{"severity":"high","category":"other","title":"missing acceptance criteria","body":"the spec states no testable acceptance criteria","exploit_scenario":"an implementer ships something that does not match intent and no check catches it","evidence":"","file":"spec.md","line_start":0,"line_end":0,"confidence":0.9,"recommendation":"add concrete, testable acceptance criteria"}],"next_steps":["add ACs"]}';
 
-const staticMock = (body) => `#!/bin/sh\ncat >/dev/null\ncat <<'JSON'\n${body}\nJSON\n`;
+const staticMock = (body) => `
+import fs from "node:fs";
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(${JSON.stringify(body)});
+});
+`;
 
 function runCli(args, { mocks = {}, artifact = "# Spec\n\nBuild the widget.\n" } = {}) {
   const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-input-mocks-"));
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-input-work-"));
   try {
     for (const [name, body] of Object.entries(mocks)) {
-      const binName = process.platform === "win32" ? `${name}.cmd` : name;
-      const p = path.join(mocksDir, binName);
-      fs.writeFileSync(p, body);
-      if (process.platform !== "win32") fs.chmodSync(p, 0o755);
+      writeMockBin(mocksDir, name, body);
     }
     fs.writeFileSync(path.join(workDir, "spec.md"), artifact);
-    const PATH = [mocksDir, nodeBinDir, "/usr/bin", "/bin"].join(path.delimiter);
+    let sysDirs = ["/usr/bin", "/bin"];
+    if (process.platform === "win32") {
+      const whereGit = spawnSync("where.exe", ["git"], { encoding: "utf8" });
+      if (whereGit.status === 0 && whereGit.stdout.trim()) {
+        sysDirs = [path.dirname(whereGit.stdout.trim().split(/\r?\n/)[0])];
+      }
+    }
+    const PATH = [mocksDir, nodeBinDir, ...sysDirs].join(path.delimiter);
     const r = spawnSync(process.execPath, [cli, ...args], {
       cwd: workDir,
       encoding: "utf8",
-      // Isolate the global config to a dir OUTSIDE the reviewed tree (cwd=workDir)
-      // so the CLI never touches the real ~/.config AND the config isn't rejected
-      // by the repo-containment guard (T23). mocksDir is a sibling temp dir.
       env: { HOME: process.env.HOME, PATH, ADVERSARIAL_REVIEW_CONFIG: path.join(mocksDir, "adv-config.json") }
     });
     return { status: r.status, stdout: r.stdout || "", stderr: r.stderr || "" };

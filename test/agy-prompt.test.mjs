@@ -18,7 +18,7 @@ const nodeBinDir = path.dirname(process.execPath);
 
 const APPROVE = '{"verdict":"approve","summary":"ok","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[],"next_steps":[]}';
 
-test("agy receives the review prompt as a -p ARGUMENT (not the stdin sentinel)", () => {
+test("agy receives the review prompt as a -p ARGUMENT (not the stdin sentinel)", { skip: process.platform === "win32" ? "agy CLI shim is refused on Windows for security" : false }, () => {
   const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-agy-mocks-"));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-agy-repo-"));
   const argvOut = path.join(mocksDir, "agy-argv.txt");

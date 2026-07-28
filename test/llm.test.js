@@ -6,6 +6,7 @@ import os from "node:os";
 import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 import { buildSpawnTarget } from "../src/spawn-safe.js";
+import { writeMockBin, writeSimpleMockBin } from "./helpers/mock-bin.mjs";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
   const input = '{"verdict": "approve", "summary": "good"}';
@@ -79,10 +80,7 @@ test("configureLLM maps cursor provider to the Cursor Agent CLI (not a localhost
   delete process.env.AI_GATEWAY_API_KEY;
   delete process.env.VERCEL_OIDC_TOKEN;
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cursor-"));
-  const binName = process.platform === "win32" ? "agent.cmd" : "agent";
-  const binPath = path.join(tempDir, binName);
-  fs.writeFileSync(binPath, "#!/bin/sh\necho mock");
-  if (process.platform !== "win32") fs.chmodSync(binPath, 0o755);
+  writeSimpleMockBin(tempDir, "agent");
   process.env.PATH = tempDir;
   try {
     const config = configureLLM({ provider: "cursor" });
@@ -130,10 +128,7 @@ test("configureLLM auto-detects Cursor context when no provider/key specified", 
   delete process.env.CLAUDE_CODE;
   process.env.TERM_PROGRAM = "cursor";
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-cursor-auto-"));
-  const binName = process.platform === "win32" ? "agent.cmd" : "agent";
-  const binPath = path.join(tempDir, binName);
-  fs.writeFileSync(binPath, "#!/bin/sh\necho mock");
-  if (process.platform !== "win32") fs.chmodSync(binPath, 0o755);
+  writeSimpleMockBin(tempDir, "agent");
   process.env.PATH = tempDir;
 
   try {
@@ -157,13 +152,7 @@ test("configureLLM auto-detects Claude Code context when no provider/key specifi
   process.env.CLAUDE_CODE = "1";
   
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adversarial-test-"));
-  const binName = process.platform === "win32" ? "claude.cmd" : "claude";
-  const binPath = path.join(tempDir, binName);
-  
-  fs.writeFileSync(binPath, "#!/bin/sh\necho mock");
-  if (process.platform !== "win32") {
-    fs.chmodSync(binPath, 0o755);
-  }
+  writeSimpleMockBin(tempDir, "claude");
   
   process.env.PATH = tempDir; // Isolate PATH so only mock claude is available
 
@@ -174,8 +163,7 @@ test("configureLLM auto-detects Claude Code context when no provider/key specifi
   } finally {
     process.env = oldEnv;
     try {
-      fs.unlinkSync(binPath);
-      fs.rmdirSync(tempDir);
+      fs.rmSync(tempDir, { recursive: true, force: true });
     } catch {}
   }
 });
@@ -197,7 +185,7 @@ test("configureLLM prioritizes non-Anthropic critic in Claude Code if key is pre
   }
 });
 
-test("configureLLM auto-detects agy CLI when only agy is installed and no API keys", () => {
+test("configureLLM auto-detects agy CLI when only agy is installed and no API keys", { skip: process.platform === "win32" ? "agy .cmd shim is not usable for review on Windows" : false }, () => {
   const oldEnv = { ...process.env };
   delete process.env.OPENAI_API_KEY;
   delete process.env.ANTHROPIC_API_KEY;
@@ -208,12 +196,7 @@ test("configureLLM auto-detects agy CLI when only agy is installed and no API ke
   process.env.CLAUDE_CODE = "1";
 
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adversarial-agy-"));
-  const binName = process.platform === "win32" ? "agy.cmd" : "agy";
-  const binPath = path.join(tempDir, binName);
-  fs.writeFileSync(binPath, "#!/bin/sh\necho mock");
-  if (process.platform !== "win32") {
-    fs.chmodSync(binPath, 0o755);
-  }
+  writeSimpleMockBin(tempDir, "agy");
   process.env.PATH = tempDir; // Isolate PATH so only the mock agy is available
 
   try {
@@ -223,8 +206,7 @@ test("configureLLM auto-detects agy CLI when only agy is installed and no API ke
   } finally {
     process.env = oldEnv;
     try {
-      fs.unlinkSync(binPath);
-      fs.rmdirSync(tempDir);
+      fs.rmSync(tempDir, { recursive: true, force: true });
     } catch {}
   }
 });
@@ -439,14 +421,12 @@ test("isCliPrintTimeoutStderr recognizes agy giving up on its own wait", () => {
   assert.equal(isCliPrintTimeoutStderr(null), false);
 });
 
-test("agy's own print-timeout surfaces as a --timeout overrun, not an opaque exit 1", async () => {
+test("agy's own print-timeout surfaces as a --timeout overrun, not an opaque exit 1", { skip: process.platform === "win32" ? "Windows batch shims refuse argv-prompt CLIs by design" : false }, async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-print-timeout-"));
-  const binPath = path.join(tmpDir, "agy");
-  fs.writeFileSync(binPath, '#!/bin/sh\necho "Error: timeout waiting for response" >&2\nexit 1\n');
-  fs.chmodSync(binPath, 0o755);
+  writeMockBin(tmpDir, "agy", `process.stderr.write("Error: timeout waiting for response\\n"); process.exit(1);`);
 
   const oldPath = process.env.PATH;
-  process.env.PATH = `${tmpDir}:${oldPath}`;
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
   try {
     await assert.rejects(
       () => llmCall({ provider: "cli", cliCmd: "agy", timeoutMs: 900 * 1000 }, "review this", "sys"),
@@ -566,67 +546,41 @@ test("parseRetryAfterMs parses seconds and HTTP-date, capped", () => {
   assert.equal(parseRetryAfterMs(null), null);
 });
 
-test("agy CLI review path delivers the prompt as the -p argument (no stdin sentinel)", async () => {
+test("agy CLI review path delivers the prompt as the -p argument (no stdin sentinel)", { skip: process.platform === "win32" ? "Windows batch shims refuse argv-prompt CLIs by design" : false }, async () => {
   const { llmCall } = await import("../src/llm.js");
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-"));
-  const binName = process.platform === "win32" ? "agy.cmd" : "agy";
-  const binPath = path.join(tmpDir, binName);
   const sentinelSystem = "be adversarial sentinel";
   const sentinelPrompt = "review this sentinel";
   const expectedResponse = '{"verdict":"approve","summary":"ok"}';
 
-  // Mock agy enforcing the CORRECT contract (agy's -p takes the prompt as a VALUE):
-  //   1. `-p`/`--print` must be present — bare agy would hang.
-  //   2. `--mode plan` must be present (review isolation).
-  //   3. `--permission-mode` (a claude flag) must NOT be passed.
-  //   4. The bare `-` stdin sentinel must NOT be passed (agy would read it as the
-  //      prompt "-" and ignore stdin, returning prose — the bug this guards).
-  //   5. The `-p` VALUE must carry both the system instruction and the user prompt.
-  fs.writeFileSync(
-    binPath,
-    `#!/bin/sh
-has_print=false
-has_plan=false
-has_bad_flag=false
-has_stdin_dash=false
-prompt_arg=""
-prev=""
-for arg in "$@"; do
-  if [ "$arg" = "-p" ] || [ "$arg" = "--print" ] || [ "$arg" = "--prompt" ]; then has_print=true; fi
-  if [ "$arg" = "-" ]; then has_stdin_dash=true; fi
-  if [ "$arg" = "--permission-mode" ]; then has_bad_flag=true; fi
-  if [ "$prev" = "--mode" ] && [ "$arg" = "plan" ]; then has_plan=true; fi
-  if [ "$prev" = "-p" ] || [ "$prev" = "--print" ] || [ "$prev" = "--prompt" ]; then prompt_arg="$arg"; fi
-  prev="$arg"
-done
-if [ "$has_print" = "false" ]; then
-  echo "FAIL: -p/--print not passed (would hang interactively)" >&2; exit 1
-fi
-if [ "$has_plan" = "false" ]; then
-  echo "FAIL: --mode plan not passed (review isolation required)" >&2; exit 1
-fi
-if [ "$has_bad_flag" = "true" ]; then
-  echo "FAIL: --permission-mode must not be passed to agy" >&2; exit 1
-fi
-if [ "$has_stdin_dash" = "true" ]; then
-  echo "FAIL: agy must NOT be passed the stdin sentinel '-' (it reads it as the prompt)" >&2; exit 1
-fi
-case "$prompt_arg" in
-  *"${sentinelSystem}"*) : ;;
-  *) echo "FAIL: system instruction missing from the -p argument value" >&2; exit 1 ;;
-esac
-case "$prompt_arg" in
-  *"${sentinelPrompt}"*) : ;;
-  *) echo "FAIL: prompt content missing from the -p argument value" >&2; exit 1 ;;
-esac
-printf '%s' '${expectedResponse}'
-`
-  );
-  fs.chmodSync(binPath, 0o755);
+  const mockCode = `
+const args = process.argv.slice(2);
+let hasPrint = false;
+let hasPlan = false;
+let hasBadFlag = false;
+let hasStdinDash = false;
+let promptArg = "";
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
+  if (arg === "-p" || arg === "--print" || arg === "--prompt") hasPrint = true;
+  if (arg === "-") hasStdinDash = true;
+  if (arg === "--permission-mode") hasBadFlag = true;
+  if (i > 0 && args[i-1] === "--mode" && arg === "plan") hasPlan = true;
+  if (i > 0 && (args[i-1] === "-p" || args[i-1] === "--print" || args[i-1] === "--prompt")) promptArg = arg;
+}
+if (!hasPrint) { console.error("FAIL: -p/--print not passed"); process.exit(1); }
+if (!hasPlan) { console.error("FAIL: --mode plan not passed"); process.exit(1); }
+if (hasBadFlag) { console.error("FAIL: --permission-mode must not be passed"); process.exit(1); }
+if (hasStdinDash) { console.error("FAIL: stdin dash passed"); process.exit(1); }
+if (!promptArg.includes(${JSON.stringify(sentinelSystem)})) { console.error("FAIL: missing system"); process.exit(1); }
+if (!promptArg.includes(${JSON.stringify(sentinelPrompt)})) { console.error("FAIL: missing prompt"); process.exit(1); }
+process.stdout.write(${JSON.stringify(expectedResponse)});
+`;
+  writeMockBin(tmpDir, "agy", mockCode);
 
   const oldPath = process.env.PATH;
-  process.env.PATH = `${tmpDir}:${oldPath}`;
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
 
   try {
     const config = { provider: "cli", cliCmd: "agy", timeoutMs: 10000 };
@@ -634,8 +588,7 @@ printf '%s' '${expectedResponse}'
     assert.equal(result, expectedResponse, "should return agy's stdout from print mode");
   } finally {
     process.env.PATH = oldPath;
-    try { fs.unlinkSync(binPath); } catch {}
-    try { fs.rmdirSync(tmpDir); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -643,69 +596,39 @@ test("codex CLI path uses exec --output-last-message and delivers full prompt vi
   const { llmCall } = await import("../src/llm.js");
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-test-"));
-  const binPath = path.join(tmpDir, "codex");
   const sentinelSystem = "be adversarial sentinel";
   const sentinelPrompt = "review this sentinel";
   const expectedResponse = '{"verdict":"approve","summary":"ok"}';
 
-  // Mock codex binary that enforces the full invocation contract:
-  //   1. --output-last-message <file> must be present (reliable output capture)
-  //   2. Isolation flags --sandbox read-only, --ignore-rules, --ephemeral must be present
-  //   3. `-` must appear as the positional prompt (stdin mode, not argv mode)
-  //   4. Stdin must contain both the system instruction and the user prompt
-  // The mock exits non-zero on any violation so the test fails if the contract breaks.
-  fs.writeFileSync(
-    binPath,
-    `#!/bin/sh
-output_file=""
-read_stdin=false
-has_sandbox=false
-has_ignore_rules=false
-has_ephemeral=false
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "--output-last-message" ]; then
-    output_file="$arg"
-  fi
-  if [ "$prev" = "--sandbox" ] && [ "$arg" = "read-only" ]; then
-    has_sandbox=true
-  fi
-  if [ "$arg" = "--ignore-rules" ]; then
-    has_ignore_rules=true
-  fi
-  if [ "$arg" = "--ephemeral" ]; then
-    has_ephemeral=true
-  fi
-  if [ "$arg" = "-" ]; then
-    read_stdin=true
-  fi
-  prev="$arg"
-done
-if [ -z "$output_file" ]; then
-  echo "FAIL: --output-last-message not passed" >&2; exit 1
-fi
-if [ "$has_sandbox" = "false" ]; then
-  echo "FAIL: --sandbox read-only not passed" >&2; exit 1
-fi
-if [ "$has_ignore_rules" = "false" ]; then
-  echo "FAIL: --ignore-rules not passed" >&2; exit 1
-fi
-if [ "$has_ephemeral" = "false" ]; then
-  echo "FAIL: --ephemeral not passed" >&2; exit 1
-fi
-if [ "$read_stdin" = "false" ]; then
-  echo "FAIL: stdin indicator (-) not passed as positional" >&2; exit 1
-fi
-stdin_content=$(cat)
-echo "$stdin_content" | grep -q "${sentinelSystem}" || { echo "FAIL: system instruction missing from stdin" >&2; exit 1; }
-echo "$stdin_content" | grep -q "${sentinelPrompt}" || { echo "FAIL: prompt content missing from stdin" >&2; exit 1; }
-printf '%s' '${expectedResponse}' > "$output_file"
-`
-  );
-  fs.chmodSync(binPath, 0o755);
+  const mockCode = `
+import fs from "node:fs";
+const args = process.argv.slice(2);
+let outputFile = "";
+let readStdin = false;
+let hasSandbox = false;
+let hasIgnoreRules = false;
+let hasEphemeral = false;
+for (let i = 0; i < args.length; i++) {
+  if (i > 0 && args[i-1] === "--output-last-message") outputFile = args[i];
+  if (i > 0 && args[i-1] === "--sandbox" && args[i] === "read-only") hasSandbox = true;
+  if (args[i] === "--ignore-rules") hasIgnoreRules = true;
+  if (args[i] === "--ephemeral") hasEphemeral = true;
+  if (args[i] === "-") readStdin = true;
+}
+if (!outputFile) { console.error("FAIL: --output-last-message not passed"); process.exit(1); }
+if (!hasSandbox) { console.error("FAIL: --sandbox read-only not passed"); process.exit(1); }
+if (!hasIgnoreRules) { console.error("FAIL: --ignore-rules not passed"); process.exit(1); }
+if (!hasEphemeral) { console.error("FAIL: --ephemeral not passed"); process.exit(1); }
+if (!readStdin) { console.error("FAIL: stdin indicator (-) not passed"); process.exit(1); }
+const stdinContent = fs.readFileSync(0, "utf8");
+if (!stdinContent.includes(${JSON.stringify(sentinelSystem)})) { console.error("FAIL: system instruction missing"); process.exit(1); }
+if (!stdinContent.includes(${JSON.stringify(sentinelPrompt)})) { console.error("FAIL: prompt content missing"); process.exit(1); }
+fs.writeFileSync(outputFile, ${JSON.stringify(expectedResponse)});
+`;
+  writeMockBin(tmpDir, "codex", mockCode);
 
   const oldPath = process.env.PATH;
-  process.env.PATH = `${tmpDir}:${oldPath}`;
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
 
   try {
     const config = { provider: "cli", cliCmd: "codex", timeoutMs: 10000 };
@@ -713,8 +636,7 @@ printf '%s' '${expectedResponse}' > "$output_file"
     assert.equal(result, expectedResponse, "should return the content written to --output-last-message");
   } finally {
     process.env.PATH = oldPath;
-    try { fs.unlinkSync(binPath); } catch {}
-    try { fs.rmdirSync(tmpDir); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -722,28 +644,12 @@ test("codex CLI path sanitizes the schema written to --output-schema (matches th
   const { llmCall } = await import("../src/llm.js");
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-schema-test-"));
-  const binPath = path.join(tmpDir, "codex");
   const sentinelSystem = "be adversarial sentinel";
   const sentinelPrompt = "review this sentinel";
   const expectedResponse = '{"verdict":"approve","summary":"sanitized ok"}';
 
-  // Mock codex binary written in Node (not sh) because the check requires real
-  // JSON structural comparison: every key in properties.findings.items.properties
-  // must also appear in properties.findings.items.required. A shell/grep
-  // string-match substitute would be a hollow check that stays green even if the
-  // sanitize call regresses (P1 parallax resolution R1 for ticket T4).
-  //
-  // Also asserts constraint keywords (minLength/minimum/maximum) are stripped,
-  // not just that corroborated_by is gone: corroborated_by is unconditionally
-  // dropped by ALWAYS_DROP regardless of the `keepConstraints` option, so a
-  // wrong-but-plausible fix that reaches for the Anthropic call site's
-  // `{ keepConstraints: true }` (instead of the OpenAI-mirroring default) would
-  // still pass a properties/required-only check. This closes that blind spot
-  // (found during P5 prosecution of ticket T4).
-  fs.writeFileSync(
-    binPath,
-    `#!/usr/bin/env node
-const fs = require("fs");
+  const mockCode = `
+import fs from "node:fs";
 const args = process.argv.slice(2);
 let outputFile = null;
 let schemaFile = null;
@@ -775,27 +681,22 @@ process.stdin.on("end", () => {
     );
     process.exit(1);
   }
-  fs.writeFileSync(outputFile, '${expectedResponse}');
+  fs.writeFileSync(outputFile, ${JSON.stringify(expectedResponse)});
 });
-`
-  );
-  fs.chmodSync(binPath, 0o755);
+`;
+  writeMockBin(tmpDir, "codex", mockCode);
 
   const oldPath = process.env.PATH;
-  process.env.PATH = `${tmpDir}:${oldPath}`;
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
 
   try {
     const config = { provider: "cli", cliCmd: "codex", timeoutMs: 10000 };
-    // Real repo schema.json: findings.items has corroborated_by in properties
-    // but not in required (merge-time-only annotation). This is the actual
-    // shape that triggered the OpenAI strict json_schema 400 via codex.
     const schema = loadSchema();
     const result = await llmCall(config, sentinelPrompt, sentinelSystem, schema);
     assert.equal(result, expectedResponse, "should return the content written to --output-last-message");
   } finally {
     process.env.PATH = oldPath;
-    try { fs.unlinkSync(binPath); } catch {}
-    try { fs.rmdirSync(tmpDir); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -805,34 +706,31 @@ test("claude CLI review path uses -p, stdin sentinel, and plan mode (same contra
   const { llmCall } = await import("../src/llm.js");
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-test-"));
-  const binName = process.platform === "win32" ? "claude.cmd" : "claude";
-  const binPath = path.join(tmpDir, binName);
   const expectedResponse = '{"verdict":"approve","summary":"ok"}';
 
-  fs.writeFileSync(
-    binPath,
-    `#!/bin/sh
-has_print=false
-read_stdin=false
-has_plan=false
-prev=""
-for arg in "$@"; do
-  if [ "$arg" = "-p" ] || [ "$arg" = "--print" ]; then has_print=true; fi
-  if [ "$arg" = "-" ]; then read_stdin=true; fi
-  if [ "$prev" = "--permission-mode" ] && [ "$arg" = "plan" ]; then has_plan=true; fi
-  prev="$arg"
-done
-if [ "$has_print" = "false" ]; then echo "FAIL: -p missing" >&2; exit 1; fi
-if [ "$read_stdin" = "false" ]; then echo "FAIL: - missing" >&2; exit 1; fi
-if [ "$has_plan" = "false" ]; then echo "FAIL: plan mode missing" >&2; exit 1; fi
-cat >/dev/null
-printf '%s' '${expectedResponse}'
-`
-  );
-  fs.chmodSync(binPath, 0o755);
+  const mockCode = `
+import fs from "node:fs";
+const args = process.argv.slice(2);
+let hasPrint = false;
+let readStdin = false;
+let hasPlan = false;
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "-p" || args[i] === "--print") hasPrint = true;
+  if (args[i] === "-") readStdin = true;
+  if (i > 0 && args[i-1] === "--permission-mode" && args[i] === "plan") hasPlan = true;
+}
+if (!hasPrint) { console.error("FAIL: -p missing"); process.exit(1); }
+if (!readStdin) { console.error("FAIL: - missing"); process.exit(1); }
+if (!hasPlan) { console.error("FAIL: plan mode missing"); process.exit(1); }
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(${JSON.stringify(expectedResponse)});
+});
+`;
+  writeMockBin(tmpDir, "claude", mockCode);
 
   const oldPath = process.env.PATH;
-  process.env.PATH = `${tmpDir}:${oldPath}`;
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
   try {
     const result = await llmCall(
       { provider: "cli", cliCmd: "claude", timeoutMs: 10000 },
@@ -842,28 +740,26 @@ printf '%s' '${expectedResponse}'
     assert.equal(result, expectedResponse);
   } finally {
     process.env.PATH = oldPath;
-    try { fs.unlinkSync(binPath); } catch {}
-    try { fs.rmdirSync(tmpDir); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 
 test("allowUnsandboxedCli omits plan-mode sandbox flags for claude/agy review", async () => {
   const { llmCall } = await import("../src/llm.js");
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-unsandbox-"));
-  const binPath = path.join(tmpDir, "claude");
-  fs.writeFileSync(
-    binPath,
-    `#!/bin/sh
-for arg in "$@"; do
-  if [ "$arg" = "plan" ]; then echo "FAIL: plan mode present" >&2; exit 1; fi
-done
-cat >/dev/null
-printf '%s' '{"ok":true}'
-`
-  );
-  fs.chmodSync(binPath, 0o755);
+  const mockCode = `
+import fs from "node:fs";
+const args = process.argv.slice(2);
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "plan") { console.error("FAIL: plan mode present"); process.exit(1); }
+}
+fs.readFileSync(0, "utf8");
+process.stdout.write('{"ok":true}');
+`;
+  writeMockBin(tmpDir, "claude", mockCode);
+
   const oldPath = process.env.PATH;
-  process.env.PATH = `${tmpDir}:${oldPath}`;
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
   try {
     const result = await llmCall(
       { provider: "cli", cliCmd: "claude", timeoutMs: 10000, allowUnsandboxedCli: true },
@@ -873,54 +769,47 @@ printf '%s' '{"ok":true}'
     assert.equal(result, '{"ok":true}');
   } finally {
     process.env.PATH = oldPath;
-    try { fs.unlinkSync(binPath); } catch {}
-    try { fs.rmdirSync(tmpDir); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 
-test("unknown-flag CLI rejection is reported as rejected flag, not prompt-size error", async () => {
+test("unknown-flag CLI rejection is reported as rejected flag, not prompt-size error", { skip: process.platform === "win32" ? "agy CLI shim is refused on Windows" : false }, async () => {
   const { llmCall } = await import("../src/llm.js");
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-badflag-"));
-  const binPath = path.join(tmpDir, "agy");
-  // Mimic agy 1.1.2 Go flag rejection for an unrecognized flag.
-  fs.writeFileSync(
-    binPath,
-    `#!/bin/sh
-echo "flags provided but not defined: -permission-mode" >&2
-echo "Usage of agy:" >&2
-exit 2
-`
-  );
-  fs.chmodSync(binPath, 0o755);
+  const mockCode = `
+console.error("flags provided but not defined: -mode\\nUsage of agy:");
+process.exit(2);
+`;
+  writeMockBin(tmpDir, "agy", mockCode);
+
   const oldPath = process.env.PATH;
-  process.env.PATH = `${tmpDir}:${oldPath}`;
-  // Prompt larger than the old hardcoded 100 KiB guard — previously this path
-  // masked the flag rejection as a "prompt is too large" error.
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
   const hugePrompt = "x".repeat(110 * 1024);
   try {
     await assert.rejects(
       () => llmCall({ provider: "cli", cliCmd: "agy", timeoutMs: 10000 }, hugePrompt, "sys"),
       (err) => {
-        assert.match(err.message, /provider "agy" rejected flag "--permission-mode"/);
+        assert.match(err.message, /provider "agy" rejected flag "--mode"/);
         assert.doesNotMatch(err.message, /prompt is too large/);
         return true;
       }
     );
   } finally {
     process.env.PATH = oldPath;
-    try { fs.unlinkSync(binPath); } catch {}
-    try { fs.rmdirSync(tmpDir); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 
 test("CLI provider honors config.timeoutMs (fails faster than the 10m hardcode)", async () => {
   const { llmCall } = await import("../src/llm.js");
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cli-timeout-"));
-  const binPath = path.join(tmpDir, "slowcli");
-  fs.writeFileSync(binPath, "#!/bin/sh\nsleep 5\necho ok\n");
-  fs.chmodSync(binPath, 0o755);
+  writeMockBin(tmpDir, "slowcli", `
+await new Promise(r => setTimeout(r, 5000));
+process.stdout.write("ok");
+`);
+
   const oldPath = process.env.PATH;
-  process.env.PATH = `${tmpDir}:${oldPath}`;
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
   const started = Date.now();
   try {
     await assert.rejects(
@@ -930,8 +819,7 @@ test("CLI provider honors config.timeoutMs (fails faster than the 10m hardcode)"
     assert.ok(Date.now() - started < 4000, "should time out well under 4s");
   } finally {
     process.env.PATH = oldPath;
-    try { fs.unlinkSync(binPath); } catch {}
-    try { fs.rmdirSync(tmpDir); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -968,15 +856,12 @@ test("maxArgvPromptBytes derives from platform ARG_MAX, not a 100 KiB constant",
   assert.equal(winLimit, 16 * 1024);
 });
 
-test("114 KB prompt falls back to argv on stdin rejection instead of refusing", async () => {
+test("114 KB prompt falls back to argv on stdin rejection instead of refusing", { skip: process.platform === "win32" ? "Windows batch shims refuse argv prompts by design" : false }, async () => {
   const { llmCall } = await import("../src/llm.js");
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-argv-114k-"));
-  const binPath = path.join(tmpDir, "agy");
   const expected = '{"verdict":"approve","summary":"argv ok"}';
-  // Reject stdin (`-`) but accept a large positional prompt via argv.
-  fs.writeFileSync(
-    binPath,
-    `#!/usr/bin/env node
+  const mockCode = `
+import fs from "node:fs";
 const args = process.argv.slice(2);
 if (args.includes("-")) {
   console.error("stdin not supported in this mock");
@@ -988,12 +873,11 @@ if (Buffer.byteLength(prompt) < 100000) {
   process.exit(1);
 }
 process.stdout.write(${JSON.stringify(expected)});
-`
-  );
-  fs.chmodSync(binPath, 0o755);
+`;
+  writeMockBin(tmpDir, "agy", mockCode);
+
   const oldPath = process.env.PATH;
-  process.env.PATH = `${tmpDir}:${oldPath}`;
-  // 114711 mirrors the size that issue #27 observed being refused.
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
   const largeBody = "y".repeat(114_711);
   try {
     const result = await llmCall(
@@ -1004,27 +888,21 @@ process.stdout.write(${JSON.stringify(expected)});
     assert.equal(result, expected);
   } finally {
     process.env.PATH = oldPath;
-    try { fs.unlinkSync(binPath); } catch {}
-    try { fs.rmdirSync(tmpDir); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 
 test("argv refusal names the platform limit, not a generic CLI failure", async () => {
   const { llmCall } = await import("../src/llm.js");
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-too-big-"));
-  const binPath = path.join(tmpDir, "agy");
-  fs.writeFileSync(
-    binPath,
-    `#!/bin/sh
-echo "stdin rejected" >&2
-exit 2
-`
-  );
-  fs.chmodSync(binPath, 0o755);
+  const mockCode = `
+console.error("stdin rejected");
+process.exit(2);
+`;
+  writeMockBin(tmpDir, "agy", mockCode);
+
   const oldPath = process.env.PATH;
-  process.env.PATH = `${tmpDir}:${oldPath}`;
-  // Larger than any realistic single-arg budget (macOS ~1 MiB ARG_MAX,
-  // Linux 128 KiB MAX_ARG_STRLEN) so the pre-check refuses before argv spawn.
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
   const enormous = "z".repeat(3 * 1024 * 1024);
   try {
     await assert.rejects(
@@ -1037,8 +915,7 @@ exit 2
     );
   } finally {
     process.env.PATH = oldPath;
-    try { fs.unlinkSync(binPath); } catch {}
-    try { fs.rmdirSync(tmpDir); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 

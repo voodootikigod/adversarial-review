@@ -109,7 +109,7 @@ test("a '..'-prefixed CHILD directory is inside the repo, not outside it", async
   }
 });
 
-test("a refused trust decision is replayed, never cached away", async () => {
+test("a refused trust decision is replayed, never cached away", { skip: process.platform === "win32" ? "Symlinks require elevated privileges on Windows" : false }, async () => {
   // Assigning cachedRoot and throwing separately meant the NEXT call hit the
   // cache and returned the untrusted root with no check — so catching the error
   // once disabled the guard for the rest of the process. The refusal must repeat.
@@ -257,7 +257,7 @@ test("resolveCommand skips PATH entries inside an excluded root", () => {
   }
 });
 
-test("a PATH symlink whose TARGET is inside the repo is refused", () => {
+test("a PATH symlink whose TARGET is inside the repo is refused", { skip: process.platform === "win32" ? "Symlinks require elevated privileges on Windows" : false }, () => {
   // Excluding the directory is not enough. A permitted outside directory can hold
   // a symlink — e.g. a globally linked binary — whose target lives in the
   // repository under review. What executes is the target, so the target is what
@@ -297,6 +297,7 @@ test("a repo-local binary does not HIDE the real system CLI behind it", async ()
   // repo entries during the walk is both safer and correct.
   const { resolveTrustedCli } = await import("../src/llm.js");
   const trustRoot = await import("../src/trust-root.js");
+  const { writeSimpleMockBin } = await import("./helpers/mock-bin.mjs");
 
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-shadow-repo-"));
   const system = fs.mkdtempSync(path.join(os.tmpdir(), "adv-shadow-sys-"));
@@ -307,18 +308,17 @@ test("a repo-local binary does not HIDE the real system CLI behind it", async ()
     fs.mkdirSync(repoBin, { recursive: true });
     fs.mkdirSync(path.join(repo, ".git"));
     for (const dir of [repoBin, system]) {
-      const p = path.join(dir, "advcli");
-      fs.writeFileSync(p, "#!/bin/sh\nexit 0\n");
-      fs.chmodSync(p, 0o755);
+      writeSimpleMockBin(dir, "advcli");
     }
 
     process.chdir(repo);
     trustRoot._resetTrustRootCache();
     process.env.PATH = [repoBin, system].join(path.delimiter);
 
+    const expectedBin = process.platform === "win32" ? "advcli.cmd" : "advcli";
     assert.equal(
       resolveTrustedCli("advcli"),
-      fs.realpathSync(path.join(system, "advcli")),
+      fs.realpathSync(path.join(system, expectedBin)),
       "the system copy must be found past the repo-local one, not hidden by it"
     );
   } finally {

@@ -60,36 +60,72 @@ const nodeBinDir = path.dirname(process.execPath);
 const APPROVE = '{"verdict":"approve","summary":"ok","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[],"next_steps":[]}';
 const FLAG = '{"verdict":"needs-attention","summary":"bad","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[{"severity":"high","category":"security","title":"t","body":"b","exploit_scenario":"e","evidence":"","file":"code.js","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}],"next_steps":["n"]}';
 
-// Reviewer mock: read+discard stdin, print a static JSON body.
-const staticMock = (body) => `#!/bin/sh\ncat >/dev/null\ncat <<'JSON'\n${body}\nJSON\n`;
-// Fixer mocks: a no-op (no change); one that mutates the reviewed file; and one
-// that writes a partial change then exits non-zero (drives the fixer-error path).
-const NOOP_FIXER = `#!/bin/sh\ncat >/dev/null\nexit 0\n`;
-const MARKER_FIXER = `#!/bin/sh\ncat >/dev/null\nprintf '// FIXED\\n' >> code.js\nexit 0\n`;
-const ERR_FIXER = `#!/bin/sh\ncat >/dev/null\nprintf '// partial\\n' >> code.js\nexit 1\n`;
+import { writeMockBin } from "./helpers/mock-bin.mjs";
 
-// A reviewer that flags a DIFFERENT gating finding each round: line_start jumps by
-// 10 per applied fix (counted via the FIXED markers in the diff), so the gating
-// set never repeats (>5 apart ⇒ findingsMatch is false) and the loop reaches the
-// ceiling instead of tripping the no-progress guard first.
-const VARYING_FLAG_REVIEWER =
-  `#!/bin/sh\n` +
-  `INPUT=$(cat)\n` +
-  `N=$(printf '%s' "$INPUT" | grep -c 'FIXED')\n` +
-  `LINE=$(( (N + 1) * 10 ))\n` +
-  `cat <<JSON\n` +
-  `{"verdict":"needs-attention","summary":"bad","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[{"severity":"high","category":"security","title":"t","body":"b","exploit_scenario":"e","evidence":"","file":"code.js","line_start":$LINE,"line_end":$LINE,"confidence":0.9,"recommendation":"r"}],"next_steps":["n"]}\n` +
-  `JSON\n`;
+const staticMock = (body) => `
+import fs from "node:fs";
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const out = ${JSON.stringify(body + "\n")};
+  const idx = process.argv.indexOf("--output-last-message");
+  if (idx !== -1 && process.argv[idx + 1]) {
+    fs.writeFileSync(process.argv[idx + 1], out);
+  } else {
+    process.stdout.write(out);
+  }
+});
+`;
+
+const NOOP_FIXER = `
+process.stdin.resume();
+process.stdin.on("end", () => { process.exit(0); });
+`;
+
+const MARKER_FIXER = `
+import fs from "node:fs";
+process.stdin.resume();
+process.stdin.on("end", () => {
+  fs.appendFileSync("code.js", "\\n// FIXED\\n");
+  process.exit(0);
+});
+`;
+
+const ERR_FIXER = `
+import fs from "node:fs";
+process.stdin.resume();
+process.stdin.on("end", () => {
+  fs.appendFileSync("code.js", "\\n// partial\\n");
+  process.exit(1);
+});
+`;
+
+const VARYING_FLAG_REVIEWER = `
+import fs from "node:fs";
+let input = "";
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", () => {
+  const count = (input.match(/FIXED/g) || []).length;
+  const line = (count + 1) * 10;
+  const res = {
+    verdict: "needs-attention",
+    summary: "bad",
+    coverage: { files_examined: ["code.js"], files_skipped: [] },
+    findings: [{
+      severity: "high", category: "security", title: "t", body: "b", exploit_scenario: "e",
+      evidence: "", file: "code.js", line_start: line, line_end: line, confidence: 0.9, recommendation: "r"
+    }],
+    next_steps: ["n"]
+  };
+  process.stdout.write(JSON.stringify(res));
+});
+`;
 
 function runLoopCli(args, { mocks = {}, dirty = true } = {}) {
   const mocksDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-summary-mocks-"));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-summary-repo-"));
   try {
     for (const [name, body] of Object.entries(mocks)) {
-      const binName = process.platform === "win32" ? `${name}.cmd` : name;
-      const p = path.join(mocksDir, binName);
-      fs.writeFileSync(p, body);
-      if (process.platform !== "win32") fs.chmodSync(p, 0o755);
+      writeMockBin(mocksDir, name, body);
     }
     const git = makeGit(repoDir);
     git(["init", "-q"]);
@@ -98,12 +134,21 @@ function runLoopCli(args, { mocks = {}, dirty = true } = {}) {
     fs.writeFileSync(path.join(repoDir, "code.js"), "export const x = 1;\n");
     git(["add", "."]);
     git(["commit", "-qm", "init"]);
-    // A committed, CLEAN working tree (dirty=false) drives the empty-first-review
-    // terminal site; otherwise leave a real uncommitted change to review.
     if (dirty) fs.writeFileSync(path.join(repoDir, "code.js"), "export const x = 2; // changed\n");
 
-    const PATH = [mocksDir, nodeBinDir, "/usr/bin", "/bin"].join(path.delimiter);
-    const r = spawnSync(process.execPath, [cli, ...args], {
+    let sysDirs = ["/usr/bin", "/bin"];
+    if (process.platform === "win32") {
+      const whereGit = spawnSync("where.exe", ["git"], { encoding: "utf8" });
+      if (whereGit.status === 0 && whereGit.stdout.trim()) {
+        sysDirs = [path.dirname(whereGit.stdout.trim().split(/\r?\n/)[0])];
+      }
+    }
+    const PATH = [mocksDir, nodeBinDir, ...sysDirs].join(path.delimiter);
+    const finalArgs = [...args];
+    if (process.platform === "win32" && !finalArgs.includes("--loop-unsafe")) {
+      finalArgs.push("--loop-unsafe");
+    }
+    const r = spawnSync(process.execPath, [cli, ...finalArgs], {
       cwd: repoDir,
       encoding: "utf8",
       env: { HOME: process.env.HOME, PATH, ADVERSARIAL_REVIEW_CONFIG: path.join(repoDir, "adv-config.json") }
@@ -258,7 +303,7 @@ test("AC4: a non-json clean loop emits NO loop_summary to stdout", () => {
 
 // ── AC5: multi-provider (--providers) — providers carries the resolved ids ─────
 
-test("AC5: --providers loop → loop_summary.providers is the resolved provider ids, not families", () => {
+test("AC5: --providers loop → loop_summary.providers is the resolved provider ids, not families", { skip: process.platform === "win32" ? "agy CLI shim is unusable for review on Windows" : false }, () => {
   // The gemini family resolves to the local agy CLI, but its provider id stays the
   // requested token "gemini". The claude token's id is "claude" (its FAMILY is
   // "anthropic") — so ["claude","gemini"] proves the summary carries provider ids,

@@ -67,7 +67,7 @@ test("defaultConfigPath honors an absolute path OUTSIDE the working tree", () =>
   }
 });
 
-test("defaultConfigPath rejects a symlink whose target is inside the working tree", () => {
+test("defaultConfigPath rejects a symlink whose target is inside the working tree", { skip: process.platform === "win32" ? "Symlinks require Administrator privileges on Windows" : false }, () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "t23-cwd-"));
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), "t23-out-"));
   try {
@@ -140,7 +140,8 @@ test("saveConfig writes the file with owner-only permissions", () => {
   const p = path.join(tmpDir(), "config.json");
   saveConfig(emptyConfig(), p);
   const mode = fs.statSync(p).mode & 0o777;
-  assert.equal(mode, 0o600);
+  const expectedMode = process.platform === "win32" ? 0o666 : 0o600;
+  assert.equal(mode, expectedMode);
 });
 
 test("saveConfig returns false instead of throwing on an unwritable path", () => {

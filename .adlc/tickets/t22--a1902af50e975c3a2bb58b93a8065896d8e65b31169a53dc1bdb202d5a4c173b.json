@@ -1,0 +1,17 @@
+{
+  "body": "Local CLI providers (claude, codex, agy, agent) are resolved by bare command name via resolveCommand and then spawned by execCli. Two paths resolve by name: (1) fresh detection in configureLLM (the ladder + isCmdInstalled), and (2) cache reuse in cachedResolutionUsable. As of feat/provider-model-config, the cache-reuse path canonicalizes the resolved executable and returns false when it is inside the current working directory; fresh detection does not perform that containment check.\n\nnpm and npx prepend ./node_modules/.bin to PATH. A repository can therefore expose a bin named claude/codex/agy that fresh detection selects and execCli spawns with the invoking process's privileges and environment.\n\nReproduction: in a repository that has node_modules/.bin/codex present, with no API credentials set, run the tool (e.g. via an npm script). Auto-detection selects codex and execCli spawns the repository-local binary.\n\nChange: introduce a single CLI resolver used by fresh detection, cache reuse, and spawn. It canonicalizes the executable path (resolving symlinks), returns null/refuses when the resolved path is contained within the working-tree root, and returns the validated absolute path. Spawn that exact validated path rather than re-resolving the bare name at execCli time.\n\nAcceptance criteria:\n- AC1: with a repo-local node_modules/.bin/<cli> present and no API keys, detection does not select or spawn the repo-local binary (it either selects a CLI resolved outside the tree or reports no provider).\n- AC2: a globally installed CLI whose path is outside the working tree is still selected and spawned.\n- AC3: fresh detection and cache reuse call the same resolver; the spawn uses the validated absolute path.\n- AC4: integration test with a fabricated repo-local CLI on PATH proves AC1; full suite green.\n\nRelated: T21 (persist-after-success), T23 (config path containment). Some CLI-harness test files are declared as T7 rails; coordinate edits accordingly.",
+  "category": "security",
+  "completed": true,
+  "duration": 2,
+  "edges": [],
+  "id": "T22",
+  "rails": [],
+  "scope": [
+    "src/llm.js",
+    "src/spawn-safe.js",
+    "bin/cli.js",
+    "test/llm-config.test.mjs",
+    "test/cli-multiprovider.test.js"
+  ],
+  "title": "Reject repository-local CLI executables in both fresh detection and cache reuse (single shared resolver)"
+}

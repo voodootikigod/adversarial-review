@@ -1,0 +1,16 @@
+{
+  "body": "Implement Linux process confinement for loop fixer execution using bubblewrap (bwrap) / Landlock LSM. Restrict filesystem write access strictly to workspace target directory, blocking home, credentials, parent dirs, and other repos. Allow loop execution on Linux without --loop-unsafe when bwrap/landlock is active.",
+  "category": "feature",
+  "completed": true,
+  "duration": 1,
+  "edges": [],
+  "id": "T44",
+  "rails": [],
+  "scope": [
+    "src/loop.js",
+    "test/loop.test.js",
+    "README.md",
+    "skills/adversarial-review/SKILL.md"
+  ],
+  "title": "Implement Linux process confinement (Landlock/bubblewrap) for loop fixer execution"
+}

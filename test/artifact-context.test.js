@@ -64,7 +64,7 @@ test("AC2: a binary input (NUL at byte 0) throws — never reviewed as text (no 
   }
 });
 
-test("AC2: an oversize target reached through a symlink throws (statSync follows the link, no partial drop)", () => {
+test("AC2: an oversize target reached through a symlink throws (statSync follows the link, no partial drop)", { skip: process.platform === "win32" ? "Symlinks require Administrator privileges on Windows" : false }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-artifact-link-"));
   try {
     // Target exceeds the per-file cap; the size guard must see the TARGET, not the
