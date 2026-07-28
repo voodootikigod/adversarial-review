@@ -480,7 +480,7 @@ test("T44: buildFixerCmd refuses bwrap binding if target directory canonicalizes
 test("T44: getFixFiles resolves tracked files from repo root when cwd is nested", () => {
   const repoRoot = process.cwd();
   const nestedCwd = path.join(repoRoot, "src");
-  const findings = [{ file: "src/loop.js" }];
+  const findings = [{ file: "src/loop.js" }, { file: "README.md" }];
   const files = getFixFiles(nestedCwd, findings, { loopFixerScope: "sc2" });
-  assert.deepEqual(files, ["src/loop.js"]);
+  assert.deepEqual(files, ["src/loop.js", "README.md"]);
 });

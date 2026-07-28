@@ -365,7 +365,7 @@ function redactSecretsInFindings(findings) {
 export function getFixFiles(cwd, findings, args) {
   if (args.loopFixerScope === "unrestricted") {
     const cap = args.loopFixerFileCap || 100;
-    const allFiles = gitRun(cwd, ["ls-files", "--full-name"], { allowFail: true }).split("\n").filter(Boolean);
+    const allFiles = gitRun(cwd, ["ls-files", "--full-name", ":/"], { allowFail: true }).split("\n").filter(Boolean);
     if (allFiles.length > cap) {
       log.warn(
         `Repo has ${allFiles.length} tracked files, exceeding --loop-fixer-file-cap ${cap}.\n` +
@@ -382,7 +382,7 @@ export function getFixFiles(cwd, findings, args) {
   // intersected with the set git actually tracks rather than trusted as a path.
   // This is what makes the list authoritative — lexical validation alone accepts
   // directories and symlinks that resolve outside the repository.
-  const tracked = gitRun(cwd, ["ls-files", "--full-name"], { allowFail: true }).split("\n").filter(Boolean);
+  const tracked = gitRun(cwd, ["ls-files", "--full-name", ":/"], { allowFail: true }).split("\n").filter(Boolean);
   const cited = [...new Set(findings.map(f => f.file).filter(Boolean))];
   if (tracked.length === 0) {
     // Fail CLOSED. An empty result means either an empty repo or a failed
@@ -802,6 +802,9 @@ export async function runProviderRound(providers, context, prompt, args, reviewF
 // ─── Main loop ────────────────────────────────────────────────────────────────
 
 export async function runLoop(cwd, args) {
+  const root = reviewTrustRoot({ cwd });
+  if (root) cwd = root;
+
   // Branch scope (or --base) drives a pre-merge convergence loop that commits
   // fixes onto the FEATURE branch — a distinct mechanism (commit/reset vs
   // stash/pop) handled by runBranchLoop. The working-tree path below is unchanged.
@@ -1328,6 +1331,9 @@ export function resolveBranchBaseSha(cwd, base) {
 // printed whole-loop recovery). Shares every review/gating/fixer helper with the
 // working-tree loop; only the checkpoint mechanism differs. (T7 / GitHub #12.)
 export async function runBranchLoop(cwd, args) {
+  const root = reviewTrustRoot({ cwd });
+  if (root) cwd = root;
+
   // 1. Clean-tree precondition — the safety keystone. With a clean start, any file
   // that appears mid-loop is fixer-created, so `git add -A` / `reset --hard` /
   // `clean -fd` can never touch the user's pre-existing uncommitted work.
