@@ -484,3 +484,18 @@ test("T44: getFixFiles resolves tracked files from repo root when cwd is nested"
   const files = getFixFiles(nestedCwd, findings, { loopFixerScope: "sc2" });
   assert.deepEqual(files, ["src/loop.js", "README.md"]);
 });
+
+test("T44: buildFixerCmd masks sensitive host secret directories with tmpfs", () => {
+  const { args } = buildFixerCmd("agy", { mode: "bwrap" }, {
+    prompt: "P",
+    timeoutMs: 60_000,
+    fixerPath: "/usr/local/bin/agy",
+    cwd: process.cwd()
+  });
+  const sshDir = path.join(os.homedir(), ".ssh");
+  if (fs.existsSync(sshDir)) {
+    const idx = args.indexOf(sshDir);
+    assert.ok(idx > 0);
+    assert.equal(args[idx - 1], "--tmpfs");
+  }
+});

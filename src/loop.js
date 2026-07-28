@@ -1,5 +1,6 @@
 import { execFileSync, spawn } from "child_process";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { log, colors } from "./utils.js";
 import { scanForSecrets } from "./secrets.js";
@@ -578,6 +579,19 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
       "--dev-bind", "/dev", "/dev",
       "--proc", "/proc"
     ];
+    const home = os.homedir();
+    const secretDirs = [
+      path.join(home, ".ssh"),
+      path.join(home, ".aws"),
+      path.join(home, ".gnupg"),
+      path.join(home, ".config", "gcloud"),
+      path.join(home, ".azure")
+    ];
+    for (const secretDir of secretDirs) {
+      if (fs.existsSync(secretDir)) {
+        bwrapArgs.push("--tmpfs", secretDir);
+      }
+    }
     if (exe && exe.startsWith("/tmp/")) {
       const mockDir = path.dirname(exe);
       bwrapArgs.push("--ro-bind", mockDir, mockDir);
