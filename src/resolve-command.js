@@ -7,6 +7,7 @@
 
 import fs from "fs";
 import path from "path";
+import { isPathInside } from "./path-containment.js";
 
 // Only bare command tokens are resolvable. A path separator or shell
 // metacharacter reaching a spawn site is a bug in the caller, not a lookup to
@@ -28,8 +29,7 @@ function realpathOrSelf(p) {
 }
 
 function isInside(target, root) {
-  const rel = path.relative(realpathOrSelf(root), realpathOrSelf(target));
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return isPathInside(realpathOrSelf(target), realpathOrSelf(root));
 }
 
 /**

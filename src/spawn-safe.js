@@ -14,9 +14,11 @@
 // is the hang it exists to end.
 
 import { spawnSync } from "child_process";
+import fs from "fs";
 import path from "path";
 import { isInsideTrustRoot, reviewTrustRoot } from "./trust-root.js";
 import { resolveCommand } from "./resolve-command.js";
+import { isPathInside } from "./path-containment.js";
 
 // Re-exported: this was resolveCommand's original home, and callers import it here.
 export { resolveCommand };
@@ -35,6 +37,41 @@ export { resolveCommand };
  */
 export function resolveTrustedCommand(cmd) {
   return resolveCommand(cmd, { excludeRoots: [reviewTrustRoot()] });
+}
+
+/**
+ * The environment to hand every child process.
+ *
+ * Resolving the executable we spawn is not the end of the trust decision,
+ * because the thing we spawn does its OWN lookups from the environment it
+ * inherits. An npm `.cmd` wrapper falls back to a bare `node`; a POSIX script
+ * with `#!/usr/bin/env node` resolves its interpreter from PATH. Both would pick
+ * a repository-supplied runtime out of ./node_modules/.bin — a trusted wrapper
+ * executing untrusted code, before any plan/read-only flag applies.
+ *
+ * So the child gets a PATH with trust-root entries removed. On Windows it also
+ * gets NoDefaultCurrentDirectoryInExePath, which stops the command interpreter
+ * searching the current directory — the repository — ahead of PATH.
+ */
+export function sanitizedSpawnEnv(env = process.env) {
+  const root = reviewTrustRoot();
+  const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  const kept = (env[key] || "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .filter((dir) => !isPathInside(realpathOrSelf(dir), root));
+
+  const out = { ...env, [key]: kept.join(path.delimiter) };
+  if (process.platform === "win32") out.NoDefaultCurrentDirectoryInExePath = "1";
+  return out;
+}
+
+function realpathOrSelf(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
 }
 
 // Windows batch shims (.cmd/.bat) are NOT executable images: CreateProcess

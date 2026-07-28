@@ -53,6 +53,70 @@ test("no source file spawns git by bare name", () => {
   assert.deepEqual(offenders, [], `these files spawn git by bare name: ${offenders.join(", ")}`);
 });
 
+test("a '..'-prefixed CHILD directory is inside the repo, not outside it", async () => {
+  // `!rel.startsWith("..")` treats a legitimate child named "..cache" as a
+  // traversal: path.relative(root, root + "/..cache/x") is "..cache/x". Every
+  // caller uses this to decide TRUST, so the error runs the wrong way — a real
+  // descendant measures as OUTSIDE and becomes trusted. A repo reaches that
+  // state by committing an executable under a "..name" directory.
+  const { isPathInside } = await import("../src/path-containment.js");
+  const root = "/repo";
+  for (const inside of ["/repo", "/repo/src", "/repo/..cache", "/repo/..cache/git", "/repo/...x/y"]) {
+    assert.equal(isPathInside(inside, root), true, `${inside} must be inside ${root}`);
+  }
+  for (const outside of ["/repo2", "/", "/other/bin", "/repo/../evil"]) {
+    assert.equal(isPathInside(outside, root), false, `${outside} must be outside ${root}`);
+  }
+
+  // End to end through the resolver: the payload lives under a "..cache" child
+  // that a naive predicate reads as an escape.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-dotdot-"));
+  try {
+    const sneaky = path.join(repo, "..cache");
+    fs.mkdirSync(sneaky);
+    const p = path.join(sneaky, "advgit");
+    fs.writeFileSync(p, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(p, 0o755);
+    assert.equal(
+      resolveCommand("advgit", { platform: "linux", env: { PATH: sneaky }, excludeRoots: [repo] }),
+      null,
+      "a '..'-prefixed child of the repo must not resolve as trusted"
+    );
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("the sanitized child environment drops repo PATH entries", async () => {
+  // Resolving what we spawn is not the end of it: an npm .cmd wrapper falls back
+  // to a bare `node`, and `#!/usr/bin/env node` resolves from PATH. Both would
+  // pick a repo-supplied runtime out of node_modules/.bin — a trusted wrapper
+  // executing untrusted code.
+  const { sanitizedSpawnEnv } = await import("../src/spawn-safe.js");
+  const trustRoot = await import("../src/trust-root.js");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-env-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "adv-env-out-"));
+  const oldCwd = process.cwd();
+  try {
+    fs.mkdirSync(path.join(repo, ".git"));
+    const repoBin = path.join(repo, "node_modules", ".bin");
+    fs.mkdirSync(repoBin, { recursive: true });
+    process.chdir(repo);
+    trustRoot._resetTrustRootCache();
+
+    const env = sanitizedSpawnEnv({ PATH: [repoBin, outside].join(path.delimiter), KEEP: "yes" });
+    const entries = env.PATH.split(path.delimiter);
+    assert.ok(!entries.includes(repoBin), `repo PATH entry survived: ${env.PATH}`);
+    assert.ok(entries.includes(outside), "non-repo entries must be preserved");
+    assert.equal(env.KEEP, "yes", "unrelated variables pass through");
+  } finally {
+    process.chdir(oldCwd);
+    trustRoot._resetTrustRootCache();
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test("resolveCommand skips PATH entries inside an excluded root", () => {
   // The npm/npx node_modules/.bin vector: a repo-local dir on PATH must not win.
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-git-repo-"));

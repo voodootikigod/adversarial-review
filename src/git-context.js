@@ -2,6 +2,7 @@ import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { resolveTrustedGit } from "./trust-root.js";
+import { isPathInside } from "./path-containment.js";
 
 const MAX_INLINE_FILE_BYTES = 256 * 1024;
 
@@ -47,8 +48,7 @@ function resolveCommit(cwd, ref, label = "ref") {
 }
 
 function isInsideDir(parent, child) {
-  const rel = path.relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return isPathInside(child, parent);
 }
 
 function section(title, body) {

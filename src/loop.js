@@ -12,7 +12,7 @@ export function tailOf(text, limit) {
 }
 import { collectReviewContext } from "./git-context.js";
 import { resolveTrustedGit } from "./trust-root.js";
-import { resolveTrustedCommand, buildSpawnTarget, terminateProcessTree } from "./spawn-safe.js";
+import { resolveTrustedCommand, buildSpawnTarget, terminateProcessTree, sanitizedSpawnEnv } from "./spawn-safe.js";
 import {
   buildPrompt,
   fenceUntrusted,
@@ -592,6 +592,7 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
     stdio: ["pipe", "ignore", "pipe"],
     shell: false,
     windowsVerbatimArguments: target.windowsVerbatimArguments === true,
+    env: sanitizedSpawnEnv(),
     detached: process.platform !== "win32" // own process group for the timeout kill
   });
 
@@ -614,7 +615,12 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
       // The fixer's own children (a CLI's model subprocess) outlive a bare
       // process-group kill on Windows, which has no process groups at all —
       // terminateProcessTree is the cross-platform tree kill.
-      try { terminateProcessTree(child.pid, { signal: "SIGKILL" }); } catch {}
+      // requireAlive:false is load-bearing. The default gates the kill on the
+      // LEADER being alive, and a fixer whose leader exits just before the
+      // timeout — while a worker still holds the pipes and keeps editing —
+      // probes as ESRCH, so no kill is attempted at all. Rollback would then
+      // race a live writer and recreate changes after the checkpoint restore.
+      try { terminateProcessTree(child.pid, { signal: "SIGKILL", requireAlive: false }); } catch {}
       const stderr = tailOf(Buffer.concat(stderrChunks).toString("utf8"), 2048);
       resolve({ timedOut: true, stderr });
     }, timeoutMs);

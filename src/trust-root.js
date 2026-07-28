@@ -2,6 +2,7 @@ import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { resolveCommand } from "./resolve-command.js";
+import { isPathInside } from "./path-containment.js";
 
 // The TRUST BOUNDARY for a review is the whole git worktree under review, NOT
 // process.cwd(). Running from a nested package (e.g. /repo/packages/app) must not
@@ -160,8 +161,5 @@ export function _resetTrustRootCache() {
 // True when `target` is contained within the trust root (symlink-resolved). An
 // explicit `root` overrides the git detection (used by unit tests).
 export function isInsideTrustRoot(target, { root } = {}) {
-  const r = canonicalize(root ?? reviewTrustRoot());
-  const t = canonicalize(target);
-  const rel = path.relative(r, t);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return isPathInside(canonicalize(target), canonicalize(root ?? reviewTrustRoot()));
 }
