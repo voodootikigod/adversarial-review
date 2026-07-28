@@ -1,0 +1,18 @@
+{
+  "body": "defaultConfigPath honors an absolute ADVERSARIAL_REVIEW_CONFIG or XDG_CONFIG_HOME and ignores relative values. An absolute path can still resolve to a location inside the repository under review (for example $GITHUB_WORKSPACE/adv-config.json in CI), so repository content can supply model pins and cache entries through such a path or through a symlink that resolves into the tree.\n\nReproduction: set ADVERSARIAL_REVIEW_CONFIG to an absolute path inside a repository that commits that file with a cache entry; the tool loads it during auto-detection.\n\nChange: canonicalize the resolved config path (resolving symlinks on the existing prefix) and ignore any target contained within the working-tree/repository root, falling back to the home/XDG default. Keep the default home/XDG behavior unchanged.\n\nSubprocess test harnesses currently isolate config via ADVERSARIAL_REVIEW_CONFIG placed inside the throwaway repo dir; under this change those would be rejected, so move the isolated config to a temporary directory OUTSIDE the throwaway repo dir.\n\nAcceptance criteria:\n- AC1: an absolute config path inside the working tree is not loaded (falls back to the default).\n- AC2: a config outside the tree (home/XDG, or an unrelated absolute directory) loads normally.\n- AC3: a symlink whose target is inside the tree is rejected.\n- AC4: subprocess test harnesses isolate config outside the repo dir; full suite green.\n\nRelated: T22 (CLI path containment). Some harness test files (test/loop-summary.test.mjs, test/loop-providers.test.mjs) are T7 rails; coordinate edits accordingly.",
+  "category": "security",
+  "completed": true,
+  "duration": 1,
+  "edges": [],
+  "id": "T23",
+  "rails": [],
+  "scope": [
+    "src/config-store.js",
+    "bin/cli.js",
+    "test/config-store.test.mjs",
+    "test/cli-multiprovider.test.js",
+    "test/input-mode.test.mjs",
+    "test/branch-loop.test.mjs"
+  ],
+  "title": "Reject config paths contained within the reviewed working tree (repo-containment, not just absolute)"
+}

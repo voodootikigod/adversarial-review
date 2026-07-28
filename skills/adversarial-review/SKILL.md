@@ -59,6 +59,7 @@ npx adversarial-review --base main           # review current branch vs main (me
 npx adversarial-review --base main --json    # machine-readable output for CI
 npx adversarial-review "focus on the token refresh path"   # weighted focus area
 npx adversarial-review --verify --passes 2   # higher recall + refute-pass precision
+npx adversarial-review --loop                # autonomous fix loop (bwrap kernel-confined on Linux)
 ```
 
 Exit codes: `0` = approve, `2` = needs-attention (report the findings), `1` = error
@@ -67,6 +68,7 @@ failed).
 
 Useful hardening flags:
 
+- `--loop` — autonomous fix loop that re-reviews findings and invokes a fixer CLI until clean. On Linux, kernel-level write confinement via bubblewrap (`bwrap`) restricts fixer write access strictly to the target workspace. `--loop-unsafe` is required when write confinement is unavailable (e.g. macOS).
 - `--fail-on <severity>` / `--min-confidence <x>` — the deterministic gate: exit 2 iff any
   finding is at/above the severity threshold (default `medium`) with confidence at/above
   the floor (default `0.5`). The model's own verdict is advisory; disagreement is reported.

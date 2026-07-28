@@ -14,7 +14,7 @@ license: Apache-2.0
 user-invocable: true
 argument-hint: "[--base <ref>] [--scope auto|working-tree|branch] [--fail-on <sev>] [--verify] [--passes <n>] [focus...]"
 metadata:
-  version: 2.7.0
+  version: 2.9.1
   author: Chris Williams (@voodootikigod)
   homepage: https://github.com/voodootikigod/adversarial-review
 ---
@@ -59,6 +59,7 @@ npx adversarial-review --base main           # review current branch vs main (me
 npx adversarial-review --base main --json    # machine-readable output for CI
 npx adversarial-review "focus on the token refresh path"   # weighted focus area
 npx adversarial-review --verify --passes 2   # higher recall + refute-pass precision
+npx adversarial-review --loop                # autonomous fix loop (bwrap kernel-confined on Linux)
 ```
 
 Exit codes: `0` = approve, `2` = needs-attention (report the findings), `1` = error
@@ -67,6 +68,7 @@ failed).
 
 Useful hardening flags:
 
+- `--loop` — autonomous fix loop that re-reviews findings and invokes a fixer CLI until clean. On Linux, kernel-level write confinement via bubblewrap (`bwrap`) restricts fixer write access strictly to the target workspace. `--loop-unsafe` is required when write confinement is unavailable (e.g. macOS).
 - `--fail-on <severity>` / `--min-confidence <x>` — the deterministic gate: exit 2 iff any
   finding is at/above the severity threshold (default `medium`) with confidence at/above
   the floor (default `0.5`). The model's own verdict is advisory; disagreement is reported.
@@ -151,6 +153,17 @@ not a localhost proxy. `--provider vercel|gateway` uses Vercel AI Gateway
 Force with `--provider <name>`; override the model with `--model <name>`. Gate quality
 tracks model tier — defaults are the strong tier of each provider; use `--model` to trade
 quality for cost deliberately.
+
+Provider and model resolution is handled by the CLI: it auto-detects the provider, caches
+the resolution in a global config (`$XDG_CONFIG_HOME/adversarial-review/config.json`),
+re-validates it cheaply, and reuses it on subsequent runs, so a batch of reviews doesn't
+re-learn the environment each time. To pin a model per provider across runs, add it to that
+file under `defaults.models`
+(e.g. `{ "defaults": { "models": { "cli:agy": "gemini-3.1-pro-high" } } }`); precedence is
+`--model` > config pin > built-in default. The file is read only from an absolute path
+outside the git worktree under review (default: your home/XDG dir); an explicit
+`ADVERSARIAL_REVIEW_CONFIG` that is relative or inside the repo disables config rather than
+supplying it, so a reviewed repository can't influence the reviewer.
 
 ## Large changes
 
