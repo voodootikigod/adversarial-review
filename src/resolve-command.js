@@ -71,7 +71,15 @@ export function resolveCommand(
         // On win32 the X_OK bit is not meaningful, so existence + regular file
         // is the strongest check available there.
         if (platform !== "win32") fs.accessSync(candidate, fs.constants.X_OK);
-        if (fs.statSync(candidate).isFile()) return path.resolve(candidate);
+        if (!fs.statSync(candidate).isFile()) continue;
+        // Excluding the DIRECTORY is not enough: a permitted directory can hold a
+        // symlink whose target lives inside an excluded root — a globally linked
+        // binary pointing back into the repository under review. What executes is
+        // the target, so the target is what must be checked, and the canonical
+        // path is what we return so callers spawn the thing we actually vetted.
+        const real = realpathOrSelf(candidate);
+        if (excludeRoots.some((root) => root && isInside(real, root))) continue;
+        return real;
       } catch {
         // Not this candidate; keep looking.
       }

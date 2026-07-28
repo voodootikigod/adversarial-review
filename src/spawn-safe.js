@@ -14,7 +14,6 @@
 // is the hang it exists to end.
 
 import { spawnSync } from "child_process";
-import fs from "fs";
 import path from "path";
 import { isInsideTrustRoot } from "./trust-root.js";
 import { resolveCommand } from "./resolve-command.js";
@@ -118,32 +117,28 @@ export function interpreterPath(env = process.env, { isInsideRoot = interpreterI
   );
 }
 
-// What may cross a cmd.exe command line. Our own invocation flags are authored
-// here and contain none of it; the reviewed prompt is the untrusted value, and
-// on the primary path it travels over stdin, which cmd.exe never parses.
-// CR and LF are command SEPARATORS to cmd.exe, not merely punctuation: an
-// argument containing one ends the current command and starts another, so
-// omitting them from this set would let `--flag\ncalc.exe` execute. Every other
-// control character is rejected on the same principle — our flags are plain
-// printable ASCII, so nothing legitimate is lost by refusing the whole class.
-const CMD_METACHARACTERS = /[&|<>^"%!()]|[\x00-\x1f\x7f]/;
+// What may cross a cmd.exe command line, for a token that is ALWAYS quoted.
+//
+// Quoting neutralizes the separators and redirections (& | < > ^) and block
+// syntax (parentheses) — they are literal inside a quoted token. Three things
+// survive quoting and so remain refused: the quote character itself (it ends the
+// token), % (variable expansion happens inside quotes), and ! (delayed expansion
+// when it is enabled). Control characters go too: CR and LF END a command to
+// cmd.exe, so an argument containing one starts another command outright.
+//
+// One policy now covers the shim path and the arguments, because both are quoted
+// the same way. Splitting them was what rejected "C:\\Program Files (x86)" and,
+// on the argument side, Codex's own --output-last-message path under a TEMP
+// directory like "C:\\Users\\Jane (Work)\\AppData\\Local\\Temp".
+const CMD_UNSAFE_IN_QUOTES = /["%!]|[\x00-\x1f\x7f]/;
 
-// The shim PATH is held to a NARROWER policy than the flags, because it is not
-// ours to choose: `C:\\Program Files (x86)\\...` is where 32-bit npm installs
-// live, so refusing parentheses would reject a standard Windows installation.
-// Parentheses only carry meaning to cmd.exe as block syntax, which a path in
-// command position is not. The characters that DO still break out of a path —
-// command separators, redirections, quotes, variable and delayed expansion, and
-// control characters — remain refused.
-const CMD_PATH_METACHARACTERS = /[&|<>^"%!]|[\x00-\x1f\x7f]/;
-
-// Quote one token of a cmd.exe command string. Nothing reaching here contains a
-// quote, a metacharacter, or a control character — both guards above have already
-// run — so wrapping in quotes is sufficient and no escaping is needed. The shim
-// path is quoted unconditionally: it is the token whose boundaries must survive
-// /s stripping, and it is the one we do not choose.
-function quoteForCmd(token, { always = false } = {}) {
-  return always || /\s/.test(token) ? `"${token}"` : token;
+// Quote one token of a cmd.exe command string. EVERY token is quoted, not just
+// the ones containing spaces: the quoting is what makes the permitted characters
+// (& | < > ^ parentheses) literal, so a token that skipped it would be parsed as
+// command syntax. Nothing reaching here contains a quote or a control character —
+// the guard above has already run — so wrapping is sufficient with no escaping.
+function quoteForCmd(token) {
+  return `"${token}"`;
 }
 
 export function buildSpawnTarget(
@@ -166,26 +161,26 @@ export function buildSpawnTarget(
         `or install this CLI as a native executable rather than an npm .cmd shim.`
       );
     }
-    // The SHIM PATH itself lands on the command line after /c, so it is subject
-    // to exactly the same parsing as the flags. Windows permits &, ^, %, !, and
-    // parentheses in paths, so an npm prefix under a username like "R&D" would
-    // otherwise reach cmd.exe unchecked and split the command. Checked first: a
-    // bad path is a compatibility problem with a different remedy than a bad flag.
-    if (CMD_PATH_METACHARACTERS.test(resolvedPath)) {
+    // The shim path and every argument land on the same command line after /c and
+    // are quoted the same way, so one policy governs both. Checked separately only
+    // to report the right remedy: a bad path is where the CLI is installed, a bad
+    // argument is something we generated.
+    if (CMD_UNSAFE_IN_QUOTES.test(resolvedPath)) {
       throw new WindowsArgvUnsafeError(
         `Cannot launch the Windows batch shim "${resolvedPath}" through cmd.exe: its path ` +
-        `contains characters cmd.exe treats as command syntax. Install this CLI under a path ` +
-        `without & ^ % ! ( ) or control characters, install it as a native executable rather ` +
-        `than an npm .cmd shim, or use an API provider.`
+        `contains a quote, %, !, or a control character, which survive quoting and are read ` +
+        `as command syntax. Install this CLI under a path without them, install it as a ` +
+        `native executable rather than an npm .cmd shim, or use an API provider.`
       );
     }
-    // Belt and braces: even "trusted" flags must be metacharacter-free, so a
-    // future edit to the flag builders cannot quietly reintroduce the hole.
-    const offender = args.find((a) => CMD_METACHARACTERS.test(String(a)));
+    // Belt and braces: a future edit to the flag builders must not be able to
+    // reintroduce the hole just by declaring its arguments trusted.
+    const offender = args.find((a) => CMD_UNSAFE_IN_QUOTES.test(String(a)));
     if (offender !== undefined) {
       throw new WindowsArgvUnsafeError(
         `Refusing to pass argument ${JSON.stringify(offender)} to the Windows batch shim ` +
-        `"${resolvedPath}": it contains cmd.exe metacharacters.`
+        `"${resolvedPath}": it contains a quote, %, !, or a control character, which survive ` +
+        `cmd.exe quoting.`
       );
     }
     // `/s` removes the FIRST and LAST quote of the string following `/c`. Passing
@@ -196,7 +191,7 @@ export function buildSpawnTarget(
     // the command string ourselves, wrap the whole thing in quotes, and pass it
     // verbatim so Node does not re-escape our quoting. This is the same shape
     // Node itself uses for shell:true on Windows.
-    const command = [quoteForCmd(resolvedPath, { always: true }), ...args.map((a) => quoteForCmd(String(a)))].join(" ");
+    const command = [resolvedPath, ...args.map(String)].map(quoteForCmd).join(" ");
     return {
       command: interpreterPath(env, { isInsideRoot }),
       args: ["/d", "/s", "/c", `"${command}"`],

@@ -192,7 +192,7 @@ test("cmd.exe /s cannot strip the quotes that protect a spaced shim path", () =>
   const afterStripping = commandString.slice(0, first) + commandString.slice(first + 1, last) + commandString.slice(last + 1);
   assert.equal(
     afterStripping,
-    `"${shim}" --permission-mode plan -p -`,
+    `"${shim}" "--permission-mode" "plan" "-p" "-"`,
     "after /s stripping the shim path must still be quoted"
   );
 });
@@ -388,11 +388,12 @@ test("no trustworthy interpreter at all fails closed", () => {
   );
 });
 
-test("cmd.exe command separators are rejected in trusted flags", () => {
-  // CR/LF END a command to cmd.exe: `--flag\ncalc.exe` would run calc.exe. The
-  // metacharacter guard exists to stop a future flag-builder edit from doing
-  // exactly that, so the separator class must be part of it.
-  for (const payload of ["a\ncalc.exe", "a\r\ncalc.exe", "a\rb", "a\tb", "a\u0000b", "a&b"]) {
+test("characters that survive cmd.exe quoting are rejected in trusted flags", () => {
+  // Every token is quoted, which makes & | < > ^ and parentheses literal. What
+  // quoting does NOT stop: a quote (it ends the token), % (variable expansion
+  // happens inside quotes), ! (delayed expansion), and CR/LF, which END the
+  // command outright — `--flag\ncalc.exe` would run calc.exe.
+  for (const payload of ["a\ncalc.exe", "a\r\ncalc.exe", "a\rb", "a\tb", "a\u0000b", 'a"b', "a%PATH%b", "a!x!b"]) {
     assert.throws(
       () => buildSpawnTarget("C:\\npm\\claude.cmd", ["--flag", payload], {
         platform: "win32",
@@ -425,11 +426,10 @@ test("a shim PATH containing cmd.exe syntax is refused, not silently mangled", (
     isInsideRoot: () => false
   };
   for (const bad of [
-    "C:\\Users\\R&D\\AppData\\Roaming\\npm\\claude.cmd",
     "C:\\tools\\100%\\claude.cmd",
-    "C:\\tools\\a^b\\claude.cmd",
-    "C:\\tools\\a|b\\claude.cmd",
-    "C:\\tools\\a\nb\\claude.cmd"
+    "C:\\tools\\a!x!b\\claude.cmd",
+    "C:\\tools\\a\nb\\claude.cmd",
+    "C:\\tools\\a\rb\\claude.cmd"
   ]) {
     assert.throws(
       () => buildSpawnTarget(bad, ["-p", "-"], base),
@@ -441,23 +441,29 @@ test("a shim PATH containing cmd.exe syntax is refused, not silently mangled", (
       `${bad} must be refused rather than handed to cmd.exe`
     );
   }
-  // Parentheses must NOT be refused: "C:\Program Files (x86)" is where 32-bit
-  // npm installs live, and rejecting it would refuse a standard Windows setup.
-  // They are only block syntax to cmd.exe, which a path in command position
-  // is not. The path policy is deliberately narrower than the argument policy.
+  // Quoting makes these literal, so they must NOT be refused:
+  // "C:\Program Files (x86)" is where 32-bit npm installs live, and a username
+  // like "R&D" is perfectly legal. Refusing them rejects standard installations.
   for (const legit of [
     "C:\\Program Files (x86)\\nodejs\\node_modules\\.bin\\claude.cmd",
+    "C:\\Users\\R&D\\AppData\\Roaming\\npm\\claude.cmd",
+    "C:\\tools\\a^b\\claude.cmd",
     "C:\\Users\\dev\\AppData\\Roaming\\npm\\claude.cmd"
   ]) {
     const ok = buildSpawnTarget(legit, ["-p", "-"], base);
     assert.equal(ok.viaInterpreter, true, `${legit} must remain launchable`);
     assert.ok(ok.args[3].includes(`"${legit}"`), `the shim path must stay quoted: ${ok.args[3]}`);
   }
-  // But parentheses in an ARGUMENT are still refused — we author those.
-  assert.throws(
-    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["--flag", "a(b)c"], base),
-    (err) => err.code === "EWINARGV"
-  );
+  // The same policy governs ARGUMENTS, because they are quoted the same way.
+  // Codex passes its own --output-last-message path, so a TEMP directory like
+  // "C:\Users\Jane (Work)\AppData\Local\Temp" must not make the provider
+  // unusable — that was the regression a path-only exemption introduced.
+  const codexShaped = buildSpawnTarget("C:\\npm\\codex.cmd", [
+    "exec", "--sandbox", "read-only",
+    "--output-last-message", "C:\\Users\\Jane (Work)\\AppData\\Local\\Temp\\out.txt"
+  ], base);
+  assert.equal(codexShaped.viaInterpreter, true);
+  assert.ok(codexShaped.args[3].includes('"C:\\Users\\Jane (Work)\\AppData\\Local\\Temp\\out.txt"'));
 });
 
 test("taskkill is validated like the interpreter, and falls back to a direct kill", () => {
@@ -516,9 +522,9 @@ test("T12: trusted flags are still rejected if they ever gain cmd metacharacters
   // Defence in depth: a future edit to the flag builders must not be able to
   // reintroduce the hole just by declaring its arguments trusted.
   assert.throws(
-    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["--flag", "a&b"], {
+    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["--flag", "a%PATH%b"], {
       platform: "win32", env: {}, argsContainUntrusted: false
     }),
-    (e) => e.code === "EWINARGV" && /metacharacters/.test(e.message)
+    (e) => e.code === "EWINARGV" && /survive cmd\.exe quoting/.test(e.message)
   );
 });

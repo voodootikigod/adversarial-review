@@ -26,7 +26,7 @@ import {
   renderReport,
   SEVERITY_RANK
 } from "./review.js";
-import { configureLLM, isCmdInstalled, selectProviders, underSatisfiedNotice } from "./llm.js";
+import { configureLLM, isCmdInstalled, selectProviders, underSatisfiedNotice, cliPrintTimeoutArgs, cliRequiresArgvPrompt, cliUsableForReview, cliUnusableMessage, maxArgvPromptBytes } from "./llm.js";
 import { persistAutoResolution, withProviderFallback, isStaleResolutionFailure } from "./resolution-lifecycle.js";
 
 // Build the per-round review operation (review + optional --verify) as a single
@@ -454,14 +454,26 @@ export function buildFixPrompt(findings, files) {
 // ─── Fixer spawning ───────────────────────────────────────────────────────────
 
 // Build the command + args for the write-capable fixer invocation.
-export function buildFixerCmd(fixerCmd, constraint) {
+export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs = null } = {}) {
   let cmd, args;
+  // Whether the prompt travels over stdin. agy is the exception on BOTH paths:
+  // its -p takes the prompt as a VALUE and it has no `-` sentinel, so `-p -`
+  // makes it answer the literal "-" and ignore the piped fix entirely. The review
+  // path already accounts for that; this one has to as well.
+  let useStdin = true;
 
   if (fixerCmd === "codex") {
     cmd = "codex";
     args = ["exec", "--ephemeral", "--ignore-rules", "-"];
-  } else if (fixerCmd === "claude" || fixerCmd === "agy") {
-    // agy is Claude-Code-compatible: same write-capable print-mode invocation.
+  } else if (fixerCmd === "agy") {
+    cmd = "agy";
+    args = ["--dangerously-skip-permissions"];
+    // Before the -p pair: agy parses with Go's flag package, which stops at the
+    // first non-flag argument, so anything after the prompt is dropped.
+    args.push(...cliPrintTimeoutArgs("agy", timeoutMs));
+    args.push("-p", prompt ?? "");
+    useStdin = false;
+  } else if (fixerCmd === "claude") {
     cmd = fixerCmd;
     args = ["--dangerously-skip-permissions", "-p", "-"];
   } else {
@@ -470,21 +482,38 @@ export function buildFixerCmd(fixerCmd, constraint) {
     args = ["-"];
   }
 
-  // Wrap with unshare if available
+  // Wrap with unshare if available. The prompt stays the LAST argument either way.
   if (constraint.mode === "unshare-user") {
-    return { cmd: "unshare", args: ["--mount", "--user", "--map-root-user", cmd, ...args] };
+    return { cmd: "unshare", args: ["--mount", "--user", "--map-root-user", cmd, ...args], useStdin };
   }
   if (constraint.mode === "unshare") {
-    return { cmd: "unshare", args: ["--mount", cmd, ...args] };
+    return { cmd: "unshare", args: ["--mount", cmd, ...args], useStdin };
   }
 
-  return { cmd, args };
+  return { cmd, args, useStdin };
 }
 
 // Spawn the fixer and return { promise, child }.
 // Promise resolves to { success, timedOut, error, code, stderr }.
 function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
-  const { cmd, args } = buildFixerCmd(fixerCmd, constraint);
+  // An argv-delivered prompt has a hard platform ceiling, and exceeding it fails
+  // as an opaque spawn error. Check before spawning so the message is actionable.
+  if (cliRequiresArgvPrompt(fixerCmd)) {
+    const promptBytes = Buffer.byteLength(prompt);
+    const argvLimit = maxArgvPromptBytes();
+    if (promptBytes > argvLimit) {
+      throw new Error(
+        `Fixer "${fixerCmd}" takes the fix prompt as a command-line argument, and this prompt ` +
+        `(${promptBytes} bytes) exceeds this platform's argv limit (~${argvLimit} bytes). ` +
+        `Narrow --loop-fixer-scope, lower --max-bytes, or use --loop-fixer codex.`
+      );
+    }
+    if (!cliUsableForReview(fixerCmd)) {
+      throw new Error(cliUnusableMessage(fixerCmd));
+    }
+  }
+
+  const { cmd, args, useStdin } = buildFixerCmd(fixerCmd, constraint, { prompt, timeoutMs });
 
   const child = spawn(cmd, args, {
     cwd,
@@ -496,7 +525,9 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
   child.stderr?.on("data", chunk => stderrChunks.push(chunk));
 
   try {
-    child.stdin.write(prompt, "utf8");
+    // The argv-prompt fixer already HAS the prompt; writing it again would feed
+    // the whole fix instruction to a process that is not reading stdin.
+    if (useStdin) child.stdin.write(prompt, "utf8");
     child.stdin.end();
   } catch { /* fixer may not read stdin; that's OK */ }
 

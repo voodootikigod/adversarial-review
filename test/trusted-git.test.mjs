@@ -48,17 +48,54 @@ test("resolveCommand skips PATH entries inside an excluded root", () => {
     const env = { PATH: [repoBin, outside].join(path.delimiter) };
 
     // Without the exclusion the repo-local copy wins simply by being first.
-    assert.equal(resolveCommand("advgit", { platform: "linux", env }), path.join(repoBin, "advgit"));
+    // Compared against realpath: resolveCommand returns the CANONICAL target, so
+    // a caller always spawns the executable that was actually vetted.
+    assert.equal(
+      resolveCommand("advgit", { platform: "linux", env }),
+      fs.realpathSync(path.join(repoBin, "advgit"))
+    );
     // With it, resolution skips past the repository entirely.
     assert.equal(
       resolveCommand("advgit", { platform: "linux", env, excludeRoots: [repo] }),
-      path.join(outside, "advgit")
+      fs.realpathSync(path.join(outside, "advgit"))
     );
     // And when the ONLY candidate is repo-local, nothing is returned — the
     // caller fails closed rather than running the repository's binary.
     assert.equal(
       resolveCommand("advgit", { platform: "linux", env: { PATH: repoBin }, excludeRoots: [repo] }),
       null
+    );
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("a PATH symlink whose TARGET is inside the repo is refused", () => {
+  // Excluding the directory is not enough. A permitted outside directory can hold
+  // a symlink — e.g. a globally linked binary — whose target lives in the
+  // repository under review. What executes is the target, so the target is what
+  // must be checked; checking only the link's own location lets the payload run.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-symlink-repo-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "adv-symlink-bin-"));
+  try {
+    const payload = path.join(repo, "evil-git");
+    fs.writeFileSync(payload, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(payload, 0o755);
+    fs.symlinkSync(payload, path.join(outside, "advgit"));
+
+    const env = { PATH: outside };
+    // The link itself sits outside, so a directory-only check would allow it.
+    assert.equal(
+      resolveCommand("advgit", { platform: "linux", env }),
+      fs.realpathSync(payload),
+      "without exclusion it resolves to the canonical target"
+    );
+    // With the repo excluded, the target's location disqualifies it.
+    assert.equal(
+      resolveCommand("advgit", { platform: "linux", env, excludeRoots: [repo] }),
+      null,
+      "a symlink into the reviewed repository must not resolve"
     );
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });

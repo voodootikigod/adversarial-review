@@ -15,10 +15,43 @@ test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemi
   assert.equal(FIXER_PROVIDER_MAP.claude, "anthropic");
 });
 
-test("buildFixerCmd invokes agy with claude-style write args, not the generic stdin passthrough", () => {
-  const { cmd, args } = buildFixerCmd("agy", { mode: "none" });
+test("buildFixerCmd gives agy the fix prompt as the -p VALUE, never the stdin sentinel", () => {
+  // agy has no `-` stdin sentinel: `-p -` makes it answer the literal "-" and
+  // ignore the piped fix entirely, so the loop would report no-diff while the
+  // requested edit was never attempted. Same defect the review path had.
+  const { cmd, args, useStdin } = buildFixerCmd("agy", { mode: "none" }, {
+    prompt: "FIX-PROMPT-BODY",
+    timeoutMs: 600 * 1000
+  });
   assert.equal(cmd, "agy");
-  assert.deepEqual(args, ["--dangerously-skip-permissions", "-p", "-"]);
+  assert.deepEqual(args, [
+    "--dangerously-skip-permissions",
+    "--print-timeout", "600s",
+    "-p", "FIX-PROMPT-BODY"
+  ]);
+  assert.equal(useStdin, false, "the prompt is already in argv; stdin must not repeat it");
+  // Go's flag package stops at the first non-flag argument, so the prompt must
+  // stay last or --print-timeout would be silently dropped.
+  assert.equal(args.at(-1), "FIX-PROMPT-BODY");
+  assert.equal(args.at(-2), "-p");
+  assert.notEqual(args.at(-1), "-");
+});
+
+test("buildFixerCmd keeps the prompt last when wrapped in unshare", () => {
+  const { cmd, args } = buildFixerCmd("agy", { mode: "unshare" }, { prompt: "P", timeoutMs: 60_000 });
+  assert.equal(cmd, "unshare");
+  assert.deepEqual(args.slice(0, 3), ["--mount", "agy", "--dangerously-skip-permissions"]);
+  assert.equal(args.at(-1), "P");
+  assert.equal(args.at(-2), "-p");
+});
+
+test("buildFixerCmd still pipes claude and codex over stdin", () => {
+  for (const cli of ["claude", "codex"]) {
+    const { useStdin, args } = buildFixerCmd(cli, { mode: "none" }, { prompt: "P", timeoutMs: 60_000 });
+    assert.equal(useStdin, true, `${cli} reads the prompt from stdin`);
+    assert.equal(args.at(-1), "-", `${cli} keeps its stdin sentinel`);
+    assert.ok(!args.includes("P"), `${cli} must not get the prompt in argv`);
+  }
 });
 
 test("buildFixerCmd still routes truly-unknown custom CLIs through bare stdin", () => {
