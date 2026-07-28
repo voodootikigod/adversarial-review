@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { budgetSeconds, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall } from "../src/llm.js";
+import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 import { buildSpawnTarget } from "../src/spawn-safe.js";
 
@@ -399,6 +399,37 @@ test("an argv-prompt CLI installed as a Windows .cmd shim is not offered for rev
   assert.match(msg, /\.cmd shim/);
   assert.match(msg, /--provider claude|--provider codex/);
   assert.doesNotMatch(msg, /not installed/);
+});
+
+test("a CLI named by PATH gets its own calling convention, not the generic one", () => {
+  // Accepting a path for --provider meant every dispatch that compared the raw
+  // string to "agy"/"claude"/"codex" mismatched, so "/opt/tools/agy" configured
+  // cleanly and then reached the wrong branch — losing --mode plan, the argv
+  // prompt, and --print-timeout. Same defect as the loop fixer, second surface.
+  for (const named of ["/opt/tools/agy", "C:\\tools\\agy.cmd", "/usr/local/bin/agy"]) {
+    assert.equal(cliRequiresArgvPrompt(named), true, `${named} must still be argv-prompt`);
+    assert.deepEqual(
+      cliFallbackArgs(named, "PROMPT-BODY", { timeoutMs: 900 * 1000 }),
+      ["--mode", "plan", "--print-timeout", "900s", "-p", "PROMPT-BODY"],
+      `${named} lost its agy convention`
+    );
+    assert.deepEqual(cliReviewArgs(named), [], `${named} must have no stdin review form`);
+  }
+  for (const named of ["/opt/tools/claude", "C:\\npm\\claude.CMD"]) {
+    assert.equal(cliRequiresArgvPrompt(named), false);
+    assert.deepEqual(
+      cliReviewArgs(named),
+      ["--permission-mode", "plan", "-p", "-"],
+      `${named} lost its claude convention`
+    );
+  }
+  // Cursor's alias forms travel by path too.
+  assert.deepEqual(
+    cliReviewArgs("/opt/tools/cursor-agent"),
+    ["-p", "--trust", "--output-format", "text", "--mode", "plan", "-"]
+  );
+  // A genuinely unknown CLI still gets the generic form.
+  assert.deepEqual(cliFallbackArgs("/opt/tools/somecli", "PROMPT-BODY"), ["PROMPT-BODY"]);
 });
 
 test("isCliPrintTimeoutStderr recognizes agy giving up on its own wait", () => {

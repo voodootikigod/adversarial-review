@@ -1,5 +1,6 @@
 import { execFileSync } from "child_process";
 import { resolveCommand, resolveTrustedCommand, sanitizedSpawnEnv, isWindowsBatchShim } from "./spawn-safe.js";
+import { commandKind } from "./resolve-command.js";
 import { spawnWithWatchdog } from "./exec-watchdog.js";
 import fs from "fs";
 import os from "os";
@@ -263,17 +264,21 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
   // reviewed repo could otherwise ship a shim that runs as the reviewer. Detection
   // already avoids selecting such a binary; this makes execution impossible even
   // if one slipped through.
-  const resolved = resolveCommand(cliCmd);
-  if (!resolved) {
+  // Path-aware: configureLLM accepts a CLI named by path (--provider
+  // /opt/tools/agy), and re-checking with the bare-name-only resolver rejected
+  // every one of them, so a provider that configured cleanly failed at the first
+  // review call with "not found on PATH". Ask the same resolver configuration
+  // asked, then distinguish the two failures for the message.
+  const trusted = resolveTrustedCli(cliCmd);
+  if (!trusted && !resolvesAtAll(cliCmd)) {
     throw new Error(
       `Local CLI agent "${cliCmd}" was not found on PATH. Install it, or pass --provider <other>.`
     );
   }
-  const trusted = resolveTrustedCli(cliCmd);
   if (!trusted) {
     throw new Error(
       `Refusing to run local CLI agent "${cliCmd}": it resolves to an executable inside the ` +
-        `working tree (${resolved}). A review provider must not be a repository-local binary — ` +
+        `working tree. A review provider must not be a repository-local binary — ` +
         `install it outside the repo, or pass --provider with a trusted provider.`
     );
   }
@@ -291,8 +296,23 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
 // diff cannot prompt-inject writes (mirrors Codex --sandbox read-only). Flag name
 // is per-CLI: claude uses --permission-mode; agy uses --mode. Opt out with
 // --allow-unsandboxed-cli when an older CLI rejects plan mode.
+// Does this name identify an executable at all, trusted or not? Used only to
+// tell "you have not installed it" apart from "it is inside the repository" —
+// two very different problems that must not share one message.
+function resolvesAtAll(cliCmd) {
+  if (typeof cliCmd === "string" && (path.isAbsolute(cliCmd) || cliCmd.includes("/") || cliCmd.includes("\\"))) {
+    try {
+      return fs.statSync(path.resolve(cliCmd)).isFile();
+    } catch {
+      return false;
+    }
+  }
+  return resolveCommand(cliCmd) !== null;
+}
+
 export function isCursorAgentCli(cliCmd) {
-  return cliCmd === "agent" || cliCmd === "cursor-agent";
+  const kind = commandKind(cliCmd);
+  return kind === "agent" || kind === "cursor-agent";
 }
 
 // agy's `-p`/`--print`/`--prompt` takes the prompt as its VALUE — it has NO stdin
@@ -301,7 +321,7 @@ export function isCursorAgentCli(cliCmd) {
 // conversational prose ("Hello! How can I help you today?") instead of the review
 // JSON. So agy must always receive the prompt as the `-p` argument value.
 export function cliRequiresArgvPrompt(cliCmd) {
-  return cliCmd === "agy";
+  return commandKind(cliCmd) === "agy";
 }
 
 // agy's print mode has its OWN wait budget (`--print-timeout`, default 5m0s) that
@@ -311,7 +331,7 @@ export function cliRequiresArgvPrompt(cliCmd) {
 // silently does not apply. Pass the resolved budget through so agy honours it.
 // Returns [] for CLIs without the flag, and when no budget is known.
 export function cliPrintTimeoutArgs(cliCmd, timeoutMs) {
-  if (cliCmd !== "agy") return [];
+  if (commandKind(cliCmd) !== "agy") return [];
   const seconds = budgetSeconds(timeoutMs);
   if (seconds === null) return [];
   // Go duration literal; seconds granularity is enough for a review budget.
@@ -358,8 +378,9 @@ export function cliUnusableMessage(cliCmd) {
 /** Plan/read-only sandbox flags for a local CLI (empty when unsandboxed or unknown). */
 export function cliSandboxArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
   if (allowUnsandboxedCli) return [];
-  if (cliCmd === "claude") return ["--permission-mode", "plan"];
-  if (cliCmd === "agy" || isCursorAgentCli(cliCmd)) return ["--mode", "plan"];
+  const kind = commandKind(cliCmd);
+  if (kind === "claude") return ["--permission-mode", "plan"];
+  if (kind === "agy" || isCursorAgentCli(cliCmd)) return ["--mode", "plan"];
   return [];
 }
 
@@ -412,7 +433,7 @@ export function cliReviewArgs(cliCmd, { allowUnsandboxedCli = false, model = nul
   // Only claude uses the stdin `-` review form here. agy has no stdin sentinel
   // (see cliRequiresArgvPrompt) and is invoked with the prompt as the -p value via
   // cliFallbackArgs; it must NOT get a `-p -` form, which agy reads as the prompt "-".
-  if (cliCmd !== "claude") return [];
+  if (commandKind(cliCmd) !== "claude") return [];
   const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
   if (model) args.push("--model", model);
   args.push("-p", "-");
@@ -434,7 +455,8 @@ export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = fals
   }
   // claude and agy are Claude-Code-compatible: they need -p (print mode) when
   // the prompt is passed as a command-line argument.
-  if (cliCmd === "claude" || cliCmd === "agy") {
+  const kind = commandKind(cliCmd);
+  if (kind === "claude" || kind === "agy") {
     const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
     if (model) args.push("--model", model);
     args.push(...cliPrintTimeoutArgs(cliCmd, timeoutMs));
@@ -540,7 +562,7 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
 
   log.step(`Invoking local subscription agent via command: "${cliCmd}"...`);
 
-  if (cliCmd === "codex") {
+  if (commandKind(cliCmd) === "codex") {
     return callCodexCli(fullPrompt, schema, timeoutMs, { stream, model });
   }
 

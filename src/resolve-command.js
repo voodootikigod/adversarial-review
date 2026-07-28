@@ -112,3 +112,18 @@ export function resolveCommand(
   }
   return null;
 }
+
+/**
+ * The CLI's KIND — which calling convention it needs — separate from WHERE it
+ * lives.
+ *
+ * Once a provider or fixer may be named by path, every dispatch that compares the
+ * raw string to "agy"/"claude"/"codex" silently mismatches: "/opt/tools/agy" is
+ * not "agy", so it falls through to a generic branch and loses the flags that
+ * make it work. Split on BOTH separators explicitly — path.basename follows the
+ * host's rules, so a Windows path reads as one filename on POSIX.
+ */
+export function commandKind(cmd) {
+  const base = String(cmd || "").split(/[/\\]/).pop().toLowerCase();
+  return base.replace(/\.(cmd|bat|exe|com)$/, "");
+}
