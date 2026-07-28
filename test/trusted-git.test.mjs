@@ -164,6 +164,56 @@ test("a repo-local binary does not HIDE the real system CLI behind it", async ()
   }
 });
 
+test("a failed or missing bootstrap git does not SHRINK the trust root", async () => {
+  // The failure path has to stay at least as wide as the success path. Falling
+  // back to cwd discarded the discovered boundary exactly when the tool could
+  // verify least — no git on PATH, or one that failed — and from a nested package
+  // that shrinks the root to /repo/packages/app, at which point the ancestor
+  // /repo/node_modules/.bin measures as OUTSIDE the repository and its git counts
+  // as trusted. Making the bootstrap fail would then be a way to open the hijack.
+  const trustRoot = await import("../src/trust-root.js");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-shrink-"));
+  const emptyBin = fs.mkdtempSync(path.join(os.tmpdir(), "adv-shrink-bin-"));
+  const oldPath = process.env.PATH;
+  const oldCwd = process.cwd();
+  try {
+    fs.mkdirSync(path.join(repo, ".git"));
+    const nested = path.join(repo, "packages", "app");
+    fs.mkdirSync(nested, { recursive: true });
+    const repoBin = path.join(repo, "node_modules", ".bin");
+    fs.mkdirSync(repoBin, { recursive: true });
+    const evil = path.join(repoBin, "advgit");
+    fs.writeFileSync(evil, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(evil, 0o755);
+
+    // No git reachable at all: the bootstrap cannot run.
+    process.chdir(nested);
+    trustRoot._resetTrustRootCache();
+    process.env.PATH = emptyBin;
+
+    assert.equal(
+      trustRoot.reviewTrustRoot(),
+      fs.realpathSync(repo),
+      "the trust root must stay the whole worktree, not the nested cwd"
+    );
+    // And with the root intact, the ancestor-owned repo binary is still refused.
+    trustRoot._resetTrustRootCache();
+    process.env.PATH = repoBin;
+    process.chdir(nested);
+    assert.equal(
+      (await import("../src/spawn-safe.js")).resolveTrustedCommand("advgit"),
+      null,
+      "an ancestor-owned repo binary must not become trusted when the bootstrap fails"
+    );
+  } finally {
+    process.chdir(oldCwd);
+    process.env.PATH = oldPath;
+    trustRoot._resetTrustRootCache();
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(emptyBin, { recursive: true, force: true });
+  }
+});
+
 test("the worktree boundary is found without executing anything", async () => {
   const { findWorktreeBoundary } = await import("../src/trust-root.js");
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-boundary-"));

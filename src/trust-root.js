@@ -61,13 +61,20 @@ export function findWorktreeBoundary(startDir) {
 
 export function reviewTrustRoot({ cwd = process.cwd() } = {}) {
   if (cachedRoot !== undefined) return cachedRoot;
-  let root = cwd;
   // BOOTSTRAP: git must run before the root it reports exists, so the boundary is
   // established by the exec-free ancestor walk above and the WHOLE boundary is
   // excluded from PATH resolution. Together with resolving to an absolute path
   // (never a bare name, which Windows resolves from the current directory — the
   // repository under review) that closes both hijack routes before anything runs.
-  const boundary = findWorktreeBoundary(cwd) ?? path.resolve(cwd);
+  const boundary = findWorktreeBoundary(cwd) ?? canonicalize(cwd);
+  // The FALLBACK is the boundary, not cwd. Falling back to cwd discarded the
+  // boundary exactly when the tool was least able to verify anything — no git on
+  // PATH, or a git that failed or timed out — and from a nested package that
+  // shrinks the trust root to /repo/packages/app, at which point the ancestor
+  // /repo/node_modules/.bin measures as OUTSIDE the repository and its git is
+  // treated as trusted. The failure path has to stay at least as wide as the
+  // success path, or a hijack becomes easier by making the bootstrap fail.
+  let root = boundary;
   const git = resolveCommand("git", { excludeRoots: [boundary] });
   if (git) {
     try {
@@ -77,9 +84,16 @@ export function reviewTrustRoot({ cwd = process.cwd() } = {}) {
         timeout: 2000,
         stdio: ["ignore", "pipe", "ignore"]
       }).trim();
-      if (out) root = out;
+      // A git-reported root may only WIDEN the filesystem boundary. The walk
+      // cannot be hijacked; a git invocation can be steered (GIT_DIR, a planted
+      // .git, a wrapper), so a report that narrows or moves the boundary is
+      // ignored rather than trusted to shrink what we protect.
+      if (out) {
+        const reported = canonicalize(out);
+        if (isInsideTrustRoot(boundary, { root: reported })) root = reported;
+      }
     } catch {
-      // not a git repo → cwd is the best available boundary
+      // not a git repo, or git failed → the filesystem boundary stands
     }
   }
   cachedRoot = canonicalize(root);
