@@ -12,6 +12,7 @@ export function tailOf(text, limit) {
 }
 import { collectReviewContext } from "./git-context.js";
 import { resolveTrustedGit } from "./trust-root.js";
+import { resolveTrustedCommand, buildSpawnTarget, terminateProcessTree } from "./spawn-safe.js";
 import {
   buildPrompt,
   fenceUntrusted,
@@ -26,7 +27,7 @@ import {
   renderReport,
   SEVERITY_RANK
 } from "./review.js";
-import { configureLLM, isCmdInstalled, selectProviders, underSatisfiedNotice, cliPrintTimeoutArgs, cliRequiresArgvPrompt, cliUsableForReview, cliUnusableMessage, maxArgvPromptBytes } from "./llm.js";
+import { configureLLM, selectProviders, underSatisfiedNotice, cliPrintTimeoutArgs, cliRequiresArgvPrompt, cliUsableForReview, cliUnusableMessage, maxArgvPromptBytes } from "./llm.js";
 import { persistAutoResolution, withProviderFallback, isStaleResolutionFailure } from "./resolution-lifecycle.js";
 
 // Build the per-round review operation (review + optional --verify) as a single
@@ -188,29 +189,40 @@ function buildRecoveryCmd(stashName) {
 
 // ─── Fixer detection ─────────────────────────────────────────────────────────
 
+// Probing EXECUTES the candidate. Detection therefore has to resolve it to a
+// trusted absolute path first: under npx a reviewed repository can put its own
+// `codex`/`claude`/`agy` at the front of PATH, and the --version probe would run
+// it — before probeOsConstraint has established or rejected the write sandbox, so
+// even a loop that is about to be refused would already have run repository code.
 function probeFixer(cmd) {
+  const resolved = resolveTrustedCommand(cmd);
+  if (!resolved) return false;
   try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore", timeout: 5000 });
+    execFileSync(resolved, ["--version"], { stdio: "ignore", timeout: 5000 });
     return true;
   } catch {
     try {
-      execFileSync(cmd, ["-h"], { stdio: "ignore", timeout: 5000 });
+      execFileSync(resolved, ["-h"], { stdio: "ignore", timeout: 5000 });
       return true;
     } catch {
-      return isCmdInstalled(cmd);
+      // It exists and is trusted; it just has no probe-friendly flag.
+      return true;
     }
   }
 }
 
 export function detectFixer(args) {
   if (args.loopFixer) {
-    if (!isCmdInstalled(args.loopFixer)) {
-      throw new Error(`--loop-fixer "${args.loopFixer}" not found in PATH.`);
+    if (!resolveTrustedCommand(args.loopFixer)) {
+      throw new Error(
+        `--loop-fixer "${args.loopFixer}" was not found on PATH outside the repository under ` +
+        `review. A repository must not supply the tool that edits it.`
+      );
     }
     return args.loopFixer;
   }
   for (const cmd of ["codex", "claude", "agy"]) {
-    if (isCmdInstalled(cmd) && probeFixer(cmd)) return cmd;
+    if (probeFixer(cmd)) return cmd;
   }
   throw new Error(
     "No fixer CLI found (tried codex, claude, agy).\n" +
@@ -234,14 +246,18 @@ export const FIXER_PROVIDER_MAP = {
 // ─── OS write constraint ──────────────────────────────────────────────────────
 
 function probeLinuxConstraint() {
+  // The sandbox helper is itself a spawn, and a repo-supplied `unshare` that
+  // exits 0 would report a sandbox that does not exist — then wrap the fixer.
+  const unshare = resolveTrustedCommand("unshare");
+  if (!unshare) return null;
   try {
-    execFileSync("unshare", ["--mount", "--user", "--map-root-user", "true"], {
+    execFileSync(unshare, ["--mount", "--user", "--map-root-user", "true"], {
       stdio: "ignore", timeout: 3000
     });
     return "unshare-user";
   } catch {}
   try {
-    execFileSync("unshare", ["--mount", "true"], { stdio: "ignore", timeout: 3000 });
+    execFileSync(unshare, ["--mount", "true"], { stdio: "ignore", timeout: 3000 });
     return "unshare";
   } catch {}
   return null;
@@ -515,10 +531,26 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
 
   const { cmd, args, useStdin } = buildFixerCmd(fixerCmd, constraint, { prompt, timeoutMs });
 
-  const child = spawn(cmd, args, {
+  // The fixer runs WITH WRITE ACCESS in the reviewed repository's directory, so
+  // this is the last place a bare name should survive: on Windows the current
+  // directory is searched first, and npx puts ./node_modules/.bin at the head of
+  // PATH everywhere. Resolve to a trusted absolute path, then route through
+  // buildSpawnTarget so a Windows .cmd shim reaches its interpreter correctly.
+  const resolved = resolveTrustedCommand(cmd);
+  if (!resolved) {
+    throw new Error(
+      `Fixer command "${cmd}" was not found on PATH outside the repository under review. ` +
+      `A repository must not supply the tool that edits it.`
+    );
+  }
+  const target = buildSpawnTarget(resolved, args, { argsContainUntrusted: !useStdin });
+
+  const child = spawn(target.command, target.args, {
     cwd,
     stdio: ["pipe", "ignore", "pipe"],
-    detached: true // own process group for SIGKILL
+    shell: false,
+    windowsVerbatimArguments: target.windowsVerbatimArguments === true,
+    detached: process.platform !== "win32" // own process group for the timeout kill
   });
 
   const stderrChunks = [];
@@ -537,7 +569,10 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
-      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+      // The fixer's own children (a CLI's model subprocess) outlive a bare
+      // process-group kill on Windows, which has no process groups at all —
+      // terminateProcessTree is the cross-platform tree kill.
+      try { terminateProcessTree(child.pid, { signal: "SIGKILL" }); } catch {}
       const stderr = tailOf(Buffer.concat(stderrChunks).toString("utf8"), 2048);
       resolve({ timedOut: true, stderr });
     }, timeoutMs);

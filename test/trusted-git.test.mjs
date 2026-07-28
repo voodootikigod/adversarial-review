@@ -18,6 +18,26 @@ const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "bin", "cli.js");
 const nodeBinDir = path.dirname(process.execPath);
 
+test("no source file spawns ANY command by bare name", () => {
+  // One trusted-absolute-path API, enforced by scan. A bare name is not a
+  // command, it is a lookup in an environment the reviewed repository can
+  // influence — Windows searches the current directory first, npx puts
+  // ./node_modules/.bin at the head of PATH. This catches probes and helpers,
+  // which is where it kept regressing: git, then getconf, then the fixer
+  // --version probe, then unshare.
+  const offenders = [];
+  for (const file of fs.readdirSync(path.join(root, "src"))) {
+    if (!file.endsWith(".js")) continue;
+    const raw = fs.readFileSync(path.join(root, "src", file), "utf8");
+    const code = raw.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+    // A quoted first argument to a spawn call is a bare name; a resolved path
+    // arrives in a variable.
+    const bare = code.match(/(?:execFileSync|spawnSync|spawn)\(\s*["'`][^"'`]+["'`]/g) || [];
+    for (const hit of bare) offenders.push(`${file}: ${hit}`);
+  }
+  assert.deepEqual(offenders, [], `bare-name spawns found:\n${offenders.join("\n")}`);
+});
+
 test("no source file spawns git by bare name", () => {
   // The whole defence is that an absolute path reaches execFileSync. A single
   // bare "git" anywhere in src/ reopens the current-directory search.
@@ -252,6 +272,51 @@ test("a repository-supplied git on PATH is never executed during a review", { sk
       false,
       "the repository's own git was executed — current-directory/PATH hijack is open"
     );
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("no repository-supplied helper on PATH is executed during a review", { skip: process.platform === "win32" ? "posix-only shims" : false }, () => {
+  // Every helper the review path may spawn, planted at once in the repo's own
+  // node_modules/.bin with npx's PATH ordering. Each drops a marker naming
+  // itself, so a regression says exactly which spawn site lost its resolver.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-helpers-"));
+  try {
+    const realGit = resolveCommand("git");
+    assert.ok(realGit, "this test needs a real git on PATH");
+
+    const repoBin = path.join(repo, "node_modules", ".bin");
+    fs.mkdirSync(repoBin, { recursive: true });
+    const markerDir = path.join(repo, "markers");
+    fs.mkdirSync(markerDir);
+
+    const helpers = ["git", "getconf", "unshare", "codex", "claude", "agy"];
+    for (const name of helpers) {
+      const p = path.join(repoBin, name);
+      // Exit non-zero so nothing downstream mistakes these for working tools.
+      fs.writeFileSync(p, `#!/bin/sh\ntouch "${path.join(markerDir, name)}"\nexit 1\n`);
+      fs.chmodSync(p, 0o755);
+    }
+
+    const g = (a) => spawnSync(realGit, a, { cwd: repo, encoding: "utf8" });
+    g(["init", "-q"]);
+    g(["config", "user.email", "t@t.t"]);
+    g(["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "code.js"), "export const x = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-qm", "init"]);
+    fs.writeFileSync(path.join(repo, "code.js"), "export const x = 2;\n");
+
+    const PATH = [repoBin, nodeBinDir, path.dirname(realGit), "/usr/bin", "/bin"].join(path.delimiter);
+    spawnSync(process.execPath, [cli, "--prompt-only", "--scope", "working-tree", "--allow-secrets"], {
+      cwd: repo,
+      encoding: "utf8",
+      env: { HOME: process.env.HOME, PATH }
+    });
+
+    const executed = fs.readdirSync(markerDir);
+    assert.deepEqual(executed, [], `repository-supplied helpers were executed: ${executed.join(", ")}`);
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }

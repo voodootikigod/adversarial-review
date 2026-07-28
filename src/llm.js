@@ -1,5 +1,5 @@
 import { execFileSync } from "child_process";
-import { resolveCommand, isWindowsBatchShim } from "./spawn-safe.js";
+import { resolveCommand, resolveTrustedCommand, isWindowsBatchShim } from "./spawn-safe.js";
 import { spawnWithWatchdog } from "./exec-watchdog.js";
 import fs from "fs";
 import os from "os";
@@ -34,8 +34,17 @@ function environmentBlockBytes(env = process.env) {
 
 function probeArgMax() {
   if (cachedProbedArgMax !== undefined) return cachedProbedArgMax;
+  // Even a helper that only reads a number is a spawn. This one runs early — the
+  // agy path calls it before execCli reaches the trusted-CLI check — so a bare
+  // name here would execute a repository-supplied getconf ahead of every guard on
+  // the branch. Without a trusted one, fall back to the platform default.
+  const getconf = resolveTrustedCommand("getconf");
+  if (!getconf) {
+    cachedProbedArgMax = null;
+    return cachedProbedArgMax;
+  }
   try {
-    const out = execFileSync("getconf", ["ARG_MAX"], {
+    const out = execFileSync(getconf, ["ARG_MAX"], {
       encoding: "utf8",
       timeout: 2000,
       stdio: ["ignore", "pipe", "ignore"],

@@ -15,11 +15,27 @@
 
 import { spawnSync } from "child_process";
 import path from "path";
-import { isInsideTrustRoot } from "./trust-root.js";
+import { isInsideTrustRoot, reviewTrustRoot } from "./trust-root.js";
 import { resolveCommand } from "./resolve-command.js";
 
 // Re-exported: this was resolveCommand's original home, and callers import it here.
 export { resolveCommand };
+
+/**
+ * Resolve a command to a canonical absolute path OUTSIDE the repository under
+ * review, or null.
+ *
+ * THE resolver for every child process this tool starts. A bare name is not a
+ * command, it is a lookup performed in an environment the reviewed repository can
+ * influence: Windows searches the current directory (the repo) before PATH, and
+ * npm/npx put ./node_modules/.bin at the front of PATH on every platform. Any
+ * spawn site that skips this — including probes, version checks, and helpers that
+ * "just" read a number — hands the repository a way to run code as the reviewer,
+ * usually before the sandbox meant to contain it exists.
+ */
+export function resolveTrustedCommand(cmd) {
+  return resolveCommand(cmd, { excludeRoots: [reviewTrustRoot()] });
+}
 
 // Windows batch shims (.cmd/.bat) are NOT executable images: CreateProcess
 // cannot run them, they require the command interpreter. npm installs
