@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { resolveCommand } from "../src/resolve-command.js";
+import { resolveCommand, sanitizePathEnv } from "../src/resolve-command.js";
 
 // A repository must never supply the git used to inspect it. Two ways it could:
 //   1. Windows resolves a BARE executable name from the CURRENT DIRECTORY before
@@ -377,6 +377,74 @@ test("a failed or missing bootstrap git does not SHRINK the trust root", async (
     trustRoot._resetTrustRootCache();
     fs.rmSync(repo, { recursive: true, force: true });
     fs.rmSync(emptyBin, { recursive: true, force: true });
+  }
+});
+
+test("with no .git anywhere, the bootstrap runs nothing at all", async () => {
+  // findWorktreeBoundary walks UP, so from inside a real repo it finds the root.
+  // The hole needed NO .git up the tree: boundary fell back to cwd, so an
+  // ANCESTOR's node_modules/.bin stayed eligible and its git executed before the
+  // containment check could reject it. The review fails as "not a git repository"
+  // either way — it must fail without running anything first.
+  const trustRoot = await import("../src/trust-root.js");
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "adv-nogit-"));
+  const oldPath = process.env.PATH;
+  const oldCwd = process.cwd();
+  try {
+    const ancestorBin = path.join(base, "node_modules", ".bin");
+    const nested = path.join(base, "sub", "deeper");
+    fs.mkdirSync(ancestorBin, { recursive: true });
+    fs.mkdirSync(nested, { recursive: true });
+
+    const marker = path.join(base, "PWNED");
+    const evil = path.join(ancestorBin, "git");
+    // Redirection, not `touch`: PATH here is the evil directory ALONE, so an
+    // external command would not resolve and the marker would never appear —
+    // the test would pass whether or not the payload ran.
+    fs.writeFileSync(evil, `#!/bin/sh\n: > "${marker}"\necho "${base}"\n`);
+    fs.chmodSync(evil, 0o755);
+
+    process.chdir(nested);
+    trustRoot._resetTrustRootCache();
+    process.env.PATH = ancestorBin;
+
+    const root = trustRoot.reviewTrustRoot();
+    assert.equal(
+      fs.existsSync(marker),
+      false,
+      "an ancestor-owned git executed during the bootstrap of a non-repository directory"
+    );
+    assert.equal(root, fs.realpathSync(nested), "with no worktree, cwd is the boundary");
+  } finally {
+    process.chdir(oldCwd);
+    process.env.PATH = oldPath;
+    trustRoot._resetTrustRootCache();
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("PATH is read case-insensitively, as Windows supplies it", () => {
+  // sanitizePathEnv preserves the ORIGINAL key casing, so on Windows it returns
+  // { Path: ... }. process.env papers over case only for the live object, not a
+  // plain copy — so reading env.PATH from a sanitized env yielded undefined and
+  // every command silently resolved to nothing.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-pathcase-"));
+  try {
+    const bin = path.join(dir, "advcase");
+    fs.writeFileSync(bin, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(bin, 0o755);
+    for (const key of ["PATH", "Path", "path"]) {
+      assert.equal(
+        resolveCommand("advcase", { platform: "linux", env: { [key]: dir } }),
+        fs.realpathSync(bin),
+        `env key ${key} must resolve`
+      );
+    }
+    // And the sanitized env round-trips through the resolver whatever the casing.
+    const sanitized = sanitizePathEnv({ Path: dir }, "/nowhere-outside");
+    assert.equal(resolveCommand("advcase", { platform: "linux", env: sanitized }), fs.realpathSync(bin));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

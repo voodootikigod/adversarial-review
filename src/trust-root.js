@@ -75,7 +75,7 @@ export function reviewTrustRoot({ cwd = process.cwd() } = {}) {
   // excluded from PATH resolution. Together with resolving to an absolute path
   // (never a bare name, which Windows resolves from the current directory — the
   // repository under review) that closes both hijack routes before anything runs.
-  const boundary = findWorktreeBoundary(cwd) ?? canonicalize(cwd);
+  const boundary = findWorktreeBoundary(cwd);
   // The FALLBACK is the boundary, not cwd. Falling back to cwd discarded the
   // boundary exactly when the tool was least able to verify anything — no git on
   // PATH, or a git that failed or timed out — and from a nested package that
@@ -83,8 +83,15 @@ export function reviewTrustRoot({ cwd = process.cwd() } = {}) {
   // /repo/node_modules/.bin measures as OUTSIDE the repository and its git is
   // treated as trusted. The failure path has to stay at least as wide as the
   // success path, or a hijack becomes easier by making the bootstrap fail.
-  let root = boundary;
-  const git = resolveCommand("git", { excludeRoots: [boundary] });
+  let root = boundary ?? canonicalize(cwd);
+  // NO BOUNDARY, NO BOOTSTRAP. With no `.git` anywhere up the tree there is no
+  // worktree to locate, so running git buys nothing — and it cannot be run
+  // safely: the exclusion would cover only cwd, leaving an ANCESTOR's
+  // node_modules/.bin eligible, so a git from a directory above cwd executes
+  // before the containment check that would have rejected it. The review fails
+  // as "not a git repository" either way; this makes it fail without executing
+  // anything first.
+  const git = boundary ? resolveCommand("git", { excludeRoots: [boundary] }) : null;
   if (git) {
     try {
       const out = execFileSync(git, ["rev-parse", "--show-toplevel"], {

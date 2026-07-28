@@ -73,7 +73,13 @@ export function resolveCommand(
 ) {
   if (typeof cmd !== "string" || !BARE_COMMAND.test(cmd)) return null;
 
-  const pathDirs = (env.PATH || "")
+  // Case-insensitive, matching sanitizePathEnv above. Windows environments carry
+  // "Path", and process.env papers over that only for the live object — a plain
+  // copy like the one sanitizePathEnv returns does not. Reading env.PATH from
+  // such a copy yields undefined, so resolution silently finds NOTHING and every
+  // command reports as missing on Windows.
+  const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  const pathDirs = (env[pathKey] || "")
     .split(path.delimiter)
     .filter(Boolean)
     .filter((dir) => !excludeRoots.some((root) => root && isInside(dir, root)));
