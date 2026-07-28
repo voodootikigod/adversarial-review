@@ -624,7 +624,7 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
         const stat = fs.statSync(secretPath);
         if (stat.isDirectory()) {
           bwrapArgs.push("--tmpfs", secretPath);
-        } else if (stat.isFile()) {
+        } else if (stat.isFile() || stat.isSocket()) {
           bwrapArgs.push("--ro-bind", "/dev/null", secretPath);
         }
       } catch {}

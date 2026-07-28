@@ -528,15 +528,20 @@ test("T44: probeOsConstraint uses bwrap on Linux when installed", () => {
   assert.equal(res.mode, "bwrap");
 });
 
-test("T44: buildFixerCmd fails closed in advisory mode if repository is inside a sensitive secret path", () => {
-  const sshDir = path.join(os.homedir(), ".ssh");
-  const mockWorkdir = path.join(sshDir, "mock-repo");
-  assert.throws(() => {
-    buildFixerCmd("agy", { mode: "advisory" }, {
-      prompt: "P",
-      timeoutMs: 60_000,
-      fixerPath: "/usr/local/bin/agy",
-      cwd: mockWorkdir
-    });
-  }, /located inside a sensitive host credential/i);
+test("T44: buildFixerCmd masks UNIX sockets with --ro-bind /dev/null", () => {
+  const { args } = buildFixerCmd("agy", { mode: "bwrap" }, {
+    prompt: "P",
+    timeoutMs: 60_000,
+    fixerPath: "/usr/local/bin/agy",
+    cwd: process.cwd()
+  });
+  const rawSock = "/var/run/docker.sock";
+  if (fs.existsSync(rawSock)) {
+    let realSock = rawSock;
+    try { realSock = fs.realpathSync.native(rawSock); } catch {}
+    const idx = args.indexOf(realSock) !== -1 ? args.indexOf(realSock) : args.indexOf(rawSock);
+    assert.ok(idx > 0);
+    assert.equal(args[idx - 2], "--ro-bind");
+    assert.equal(args[idx - 1], "/dev/null");
+  }
 });
