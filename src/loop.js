@@ -299,12 +299,8 @@ export function probeOsConstraint(args) {
   // permission of the invoking user.
   // Real kernel write confinement requires bubblewrap (`bwrap`).
   const linuxMode = probeLinuxConstraint();
-  if (args.loopUnsafe) {
-    log.warn("Linux: running without write sandboxing (--loop-unsafe). Fixer has unrestricted write access.");
-    return { mode: "advisory" };
-  }
   const isConfined = linuxMode === "bwrap";
-  if (!isConfined) {
+  if (!isConfined && !args.loopUnsafe) {
     throw new Error(
       "--loop has no enforced write confinement on Linux.\n" +
       "`unshare --mount` creates a mount namespace but remounts nothing read-only, so the fixer " +
@@ -314,8 +310,12 @@ export function probeOsConstraint(args) {
       "acknowledging the fixer has unrestricted write access."
     );
   }
-  log.info(`Linux: ${linuxMode} write confinement active (workspace writable, filesystem read-only).`);
-  return { mode: linuxMode };
+  if (isConfined) {
+    log.info(`Linux: ${linuxMode} write confinement active (workspace writable, filesystem read-only).`);
+    return { mode: linuxMode };
+  }
+  log.warn("Linux: running without write sandboxing (--loop-unsafe). Fixer has unrestricted write access.");
+  return { mode: "advisory" };
 }
 
 // ─── Gating finding helpers ───────────────────────────────────────────────────
@@ -601,17 +601,14 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
         secretPath = fs.realpathSync.native(rawSecretPath);
       } catch {}
 
-      if (
-        realCwd === secretPath ||
-        realCwd.startsWith(secretPath + path.sep) ||
-        realCwd === rawSecretPath ||
-        realCwd.startsWith(rawSecretPath + path.sep)
-      ) {
+      if (realCwd === secretPath || realCwd === rawSecretPath) {
         throw new Error(
-          `Refusing to run --loop with bwrap write confinement because the repository "${realCwd}" ` +
-          `is located inside a sensitive host credential directory "${secretPath}". ` +
+          `Refusing to run --loop with bwrap write confinement directly inside sensitive host credential directory "${secretPath}". ` +
           `Move the repository outside "${secretPath}" or pass --loop-unsafe.`
         );
+      }
+      if (realCwd.startsWith(secretPath + path.sep) || realCwd.startsWith(rawSecretPath + path.sep)) {
+        continue;
       }
       try {
         const stat = fs.statSync(secretPath);
