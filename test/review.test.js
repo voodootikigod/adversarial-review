@@ -138,6 +138,59 @@ test("assessFindings flags evidence not present in the inlined context", () => {
   assert.equal(assessments[0].effectiveConfidence, 0.5);
 });
 
+test("T47: assessFindings preserves full confidence for valid out-of-diff repository files", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.8, evidence: "" })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
+
+  const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 0.8);
+  assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+});
+
+test("T47: assessFindings preserves full confidence for evidence present in existing repo code outside diff patch", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 1.0, evidence: "SEVERITY_RANK" })]
+  });
+  const context = {
+    changedFiles: ["src/other.js"],
+    includeDiff: true,
+    content: "## Diff\n```\nconst x = 1;\n```"
+  };
+
+  const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 1.0);
+  assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+});
+
+test("T47: assessFindings halves confidence for fabricated files non-existent in repo or diff", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/nonexistent_fake_file.js", confidence: 0.8, evidence: "" })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
+
+  const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 0.4);
+  assert.ok(assessments[0].notes.some(n => n.includes("cited file is not in the reviewed change set or repository")));
+});
+
+test("T30: assessFindings uses route-aware haystack matching for API vs CLI reviewers", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", evidence: "SEVERITY_RANK", confidence: 1.0 })]
+  });
+  const context = {
+    changedFiles: ["src/review.js"],
+    includeDiff: true,
+    content: "## Diff\n```\nSEVERITY_RANK\n```"
+  };
+
+  const apiAssessments = assessFindings(result, context, { apiMode: true });
+  const cliAssessments = assessFindings(result, context, { apiMode: false });
+  assert.equal(apiAssessments[0].effectiveConfidence, 1.0);
+  assert.equal(cliAssessments[0].effectiveConfidence, 1.0);
+});
+
 test("assessFindings matches evidence with collapsed whitespace", () => {
   const result = validResult({
     findings: [validFinding({ evidence: "db.insert(  row )".replace(/\s+/g, " ") })]

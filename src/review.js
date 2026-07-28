@@ -201,38 +201,82 @@ function collapseWhitespace(s) {
 // for gating and the report marks it. In local-CLI mode the reviewer can
 // legitimately inspect untouched files, so the file check only applies to API
 // providers (which saw nothing beyond the prompt).
-export function assessFindings(result, context, { apiMode = true } = {}) {
+export function assessFindings(result, context, { apiMode = true, cwd = process.cwd() } = {}) {
   const changed = new Set((context.changedFiles || []).map(normalizePath));
-  // Ground against the text the model was actually SHOWN, not the raw content.
-  // Fencing neutralizes sentinel tokens before the diff reaches the model, so a
-  // finding that correctly quotes a neutralized line would otherwise score as
-  // ungrounded — halving its confidence and potentially dropping a real finding
-  // below the gate. Any reviewed file that mentions the sentinel format (this
-  // repository's own source does) triggers it.
-  const haystack = context.includeDiff
-    ? collapseWhitespace(stripFenceSentinels(context.content))
+  const rawContent = context.content || "";
+
+  // Ground against the text the model was actually SHOWN based on route:
+  // API providers read the fenced/neutralized prompt (haystackShown).
+  // Local CLI agents read raw files on disk (haystackRaw).
+  const haystackShown = context.includeDiff
+    ? collapseWhitespace(stripFenceSentinels(rawContent))
     : null;
+  const haystackRaw = context.includeDiff
+    ? collapseWhitespace(rawContent)
+    : null;
+  const haystack = apiMode ? haystackShown : haystackRaw;
 
   return result.findings.map((f) => {
     const notes = [];
     let effectiveConfidence = f.confidence;
 
-    if (apiMode && changed.size && !changed.has(normalizePath(f.file))) {
-      notes.push(`cited file is not in the reviewed change set (${f.file})`);
-      effectiveConfidence /= 2;
+    const normFile = normalizePath(f.file || "");
+    const inChangeSet = !changed.size || changed.has(normFile);
+
+    // Check if cited file exists in the repository on disk
+    let fileExistsInRepo = false;
+    let fileContentOnDisk = null;
+    if (f.file) {
+      try {
+        const targetFilePath = path.resolve(cwd, f.file);
+        if (fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).isFile()) {
+          fileExistsInRepo = true;
+        }
+      } catch {}
     }
-    if (haystack && f.evidence && f.evidence.trim()) {
-      // Normalize BOTH sides through the same neutralization. Reviewers reach
-      // the source by two different routes: API providers read the fenced
-      // prompt (already neutralized), while local CLI agents read the files on
-      // disk (raw). Neutralizing only one side grounds one route and penalizes
-      // the other. Running both through stripFenceSentinels makes the check
-      // agnostic to which text the reviewer actually quoted.
-      if (!haystack.includes(collapseWhitespace(stripFenceSentinels(f.evidence)))) {
-        notes.push("quoted evidence was not found in the provided context");
+
+    if (!inChangeSet) {
+      if (fileExistsInRepo) {
+        notes.push(`out-of-diff evidence: pre-existing repository file (${f.file})`);
+      } else if (apiMode) {
+        notes.push(`cited file is not in the reviewed change set or repository (${f.file})`);
         effectiveConfidence /= 2;
       }
     }
+
+    if (haystack && f.evidence && f.evidence.trim()) {
+      const normalizedEvidence = collapseWhitespace(stripFenceSentinels(f.evidence));
+      const rawEvidence = collapseWhitespace(f.evidence);
+      const targetEvidence = apiMode ? normalizedEvidence : rawEvidence;
+
+      const inDiff =
+        haystack.includes(targetEvidence) ||
+        (haystackShown && haystackShown.includes(normalizedEvidence)) ||
+        (haystackRaw && haystackRaw.includes(rawEvidence));
+
+      if (!inDiff) {
+        let inRepoFile = false;
+        if (fileExistsInRepo && f.file) {
+          try {
+            const targetFilePath = path.resolve(cwd, f.file);
+            fileContentOnDisk = fs.readFileSync(targetFilePath, "utf8");
+            const normDisk = collapseWhitespace(stripFenceSentinels(fileContentOnDisk));
+            const rawDisk = collapseWhitespace(fileContentOnDisk);
+            if (normDisk.includes(normalizedEvidence) || rawDisk.includes(rawEvidence)) {
+              inRepoFile = true;
+            }
+          } catch {}
+        }
+
+        if (inRepoFile) {
+          notes.push("out-of-diff evidence: quoted evidence is in existing repository code outside the diff patch");
+        } else {
+          notes.push("quoted evidence was not found in the provided context or repository");
+          effectiveConfidence /= 2;
+        }
+      }
+    }
+
     return { notes, effectiveConfidence };
   });
 }
