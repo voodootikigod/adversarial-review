@@ -3,8 +3,9 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { cleanJsonResponse, configureLLM, cliFallbackArgs, cliReviewArgs, describeUnknownFlagRejection, maxArgvPromptBytes, parseRetryAfterMs, isCmdInstalled, llmCall } from "../src/llm.js";
+import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
+import { buildSpawnTarget } from "../src/spawn-safe.js";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
   const input = '{"verdict": "approve", "summary": "good"}';
@@ -245,6 +246,19 @@ test("cliReviewArgs / cliFallbackArgs use per-CLI plan flags for claude and agy"
     ["-p", "PROMPT-BODY"]
   );
   assert.deepEqual(cliFallbackArgs("somecli", "PROMPT-BODY"), ["PROMPT-BODY"]);
+
+  // Cursor Agent CLI is handled by the isCursorAgentCli branch, which returns
+  // BEFORE the `cliCmd !== "claude"` guard. Pinned explicitly because reviewers
+  // have repeatedly read that guard as stripping Cursor's flags — a bare `agent`
+  // would open an interactive session and hang until the watchdog fires.
+  for (const cursor of ["agent", "cursor-agent"]) {
+    assert.deepEqual(
+      cliReviewArgs(cursor, {}),
+      ["-p", "--trust", "--output-format", "text", "--mode", "plan", "-"],
+      `${cursor} must get its non-interactive flags`
+    );
+    assert.notDeepEqual(cliReviewArgs(cursor, {}), [], `${cursor} must never be launched bare`);
+  }
 });
 
 test("cliReviewArgs / cliFallbackArgs forward a resolved model to claude and agy", () => {
@@ -259,6 +273,192 @@ test("cliReviewArgs / cliFallbackArgs forward a resolved model to claude and agy
     cliFallbackArgs("agy", "PROMPT-BODY", { model: "gemini-3.1-pro-high" }),
     ["--mode", "plan", "--model", "gemini-3.1-pro-high", "-p", "PROMPT-BODY"]
   );
+});
+
+test("cliFallbackArgs forwards the review budget to agy's own --print-timeout", () => {
+  // agy's print mode defaults to a 5m0s wait of its own. Without --print-timeout it
+  // aborts a long review at 5 minutes regardless of --timeout (2400s for a local
+  // CLI), so the user's budget silently does not apply.
+  assert.deepEqual(cliPrintTimeoutArgs("agy", 2400 * 1000), ["--print-timeout", "2400s"]);
+  assert.deepEqual(cliPrintTimeoutArgs("agy", 900 * 1000), ["--print-timeout", "900s"]);
+  // Sub-second budgets still have to name a positive duration Go can parse.
+  assert.deepEqual(cliPrintTimeoutArgs("agy", 250), ["--print-timeout", "1s"]);
+  // Unknown/absent budget, and CLIs without the flag, add nothing.
+  assert.deepEqual(cliPrintTimeoutArgs("agy", null), []);
+  assert.deepEqual(cliPrintTimeoutArgs("agy", 0), []);
+  assert.deepEqual(cliPrintTimeoutArgs("claude", 2400 * 1000), []);
+
+  assert.deepEqual(
+    cliFallbackArgs("agy", "PROMPT-BODY", { timeoutMs: 900 * 1000 }),
+    ["--mode", "plan", "--print-timeout", "900s", "-p", "PROMPT-BODY"]
+  );
+  // claude has no such flag — its argv form must not grow one.
+  assert.deepEqual(
+    cliFallbackArgs("claude", "PROMPT-BODY", { timeoutMs: 900 * 1000 }),
+    ["--permission-mode", "plan", "-p", "PROMPT-BODY"]
+  );
+});
+
+test("cliFallbackArgs keeps the prompt LAST, as the value of -p", () => {
+  // agy parses with Go's flag package: parsing stops at the first non-flag
+  // argument, so any flag appended after the prompt is silently dropped, and any
+  // flag inserted between -p and the prompt is consumed AS the prompt (agy then
+  // answers that flag name and the real review is never seen). Every argv form
+  // must therefore end with exactly [-p, prompt].
+  const forms = [
+    cliFallbackArgs("agy", "PROMPT-BODY", { timeoutMs: 900 * 1000, model: "gemini-3.1-pro-high" }),
+    cliFallbackArgs("agy", "PROMPT-BODY", { allowUnsandboxedCli: true, timeoutMs: 900 * 1000 }),
+    cliFallbackArgs("agy", "PROMPT-BODY"),
+    cliFallbackArgs("claude", "PROMPT-BODY", { model: "claude-sonnet-4-6" })
+  ];
+  for (const args of forms) {
+    assert.equal(args.at(-1), "PROMPT-BODY", `prompt must be the final argv element: ${JSON.stringify(args)}`);
+    assert.equal(args.at(-2), "-p", `prompt must be the value of -p: ${JSON.stringify(args)}`);
+    assert.equal(args.indexOf("PROMPT-BODY"), args.length - 1, "prompt must appear exactly once, at the end");
+  }
+});
+
+test("timeoutExceededMessage never renders a NaN or zero budget", () => {
+  assert.equal(
+    timeoutExceededMessage('local CLI agent "agy"', 900 * 1000),
+    'Failed to execute local CLI agent "agy": exceeded --timeout 900s; retry with --timeout <larger>'
+  );
+  assert.equal(
+    timeoutExceededMessage("codex", 2400 * 1000),
+    "Failed to execute codex: exceeded --timeout 2400s; retry with --timeout <larger>"
+  );
+  // No budget known: cliPrintTimeoutArgs forwarded nothing, so the agent's OWN
+  // default is what fired — say so rather than printing "NaNs" or "0s".
+  for (const bad of [undefined, null, NaN, 0, -1, "", "abc", {}]) {
+    const msg = timeoutExceededMessage("codex", bad);
+    assert.doesNotMatch(msg, /NaN|--timeout 0s|--timeout -/, `degenerate budget ${String(bad)} leaked into: ${msg}`);
+    assert.match(msg, /timed out with no --timeout budget set/);
+  }
+  // A numeric STRING is a budget too. Rejecting it would silently drop the
+  // user's timeout: agy would revert to its 5m default while this message
+  // insisted no budget was set.
+  assert.equal(budgetSeconds("600000"), 600);
+  assert.deepEqual(cliPrintTimeoutArgs("agy", "600000"), ["--print-timeout", "600s"]);
+  assert.equal(
+    timeoutExceededMessage("codex", " 900000 "),
+    "Failed to execute codex: exceeded --timeout 900s; retry with --timeout <larger>"
+  );
+  // A sub-second budget IS a budget: it must report the same duration that was
+  // forwarded to the agent (1s), not claim none was set.
+  assert.equal(budgetSeconds(500), 1);
+  assert.deepEqual(cliPrintTimeoutArgs("agy", 500), ["--print-timeout", "1s"]);
+  assert.equal(
+    timeoutExceededMessage("codex", 500),
+    "Failed to execute codex: exceeded --timeout 1s; retry with --timeout <larger>"
+  );
+});
+
+test("the forwarded --print-timeout and the overrun message always name the same budget", () => {
+  // Drift here is the whole failure mode: agy would be told one budget while the
+  // error blames another. Both must read the duration from budgetSeconds.
+  for (const ms of [500, 1000, 1500, 900 * 1000, 2400 * 1000, 900_499]) {
+    const [, forwarded] = cliPrintTimeoutArgs("agy", ms);
+    assert.equal(forwarded, `${budgetSeconds(ms)}s`);
+    assert.match(timeoutExceededMessage('local CLI agent "agy"', ms), new RegExp(`exceeded --timeout ${budgetSeconds(ms)}s`));
+  }
+});
+
+test("a numeric-string budget reaches the watchdog and the agent as the SAME number", () => {
+  // The divergence this prevents: budgetSeconds coerces "2400000" and tells agy
+  // 2400s, while the raw string reaches the watchdog, which cannot read it and
+  // substitutes its own default — killing the review early and then blaming a
+  // budget that was never enforced.
+  for (const raw of ["2400000", " 900000 ", 900 * 1000]) {
+    const ms = normalizeTimeoutMs(raw);
+    assert.equal(typeof ms, "number");
+    assert.equal(budgetSeconds(raw), Math.ceil(ms / 1000), "the agent flag must match the watchdog window");
+    assert.match(timeoutExceededMessage("codex", raw), new RegExp(`exceeded --timeout ${Math.ceil(ms / 1000)}s`));
+  }
+  for (const bad of [undefined, null, NaN, 0, -1, "", "abc", {}]) {
+    assert.equal(normalizeTimeoutMs(bad), null, `${String(bad)} is not a budget`);
+  }
+});
+
+test("an argv-prompt CLI installed as a Windows .cmd shim is not offered for review", () => {
+  // agy takes the prompt as an argument, and a .cmd shim can only be reached
+  // through cmd.exe, which re-parses it — so buildSpawnTarget refuses. Detection
+  // must skip such an install rather than pick it and fail at spawn time.
+  const shim = () => "C:\\npm\\agy.cmd";
+  const exe = () => "C:\\tools\\agy.exe";
+  assert.equal(cliUsableForReview("agy", { platform: "win32", resolve: shim }), false);
+  assert.equal(cliUsableForReview("agy", { platform: "win32", resolve: exe }), true);
+  assert.equal(cliUsableForReview("agy", { platform: "win32", resolve: () => null }), false);
+  // POSIX has no shim problem, and stdin-prompt CLIs are unaffected anywhere.
+  assert.equal(cliUsableForReview("agy", { platform: "linux", resolve: shim }), true);
+  assert.equal(cliUsableForReview("claude", { platform: "win32", resolve: () => "C:\\npm\\claude.cmd" }), true);
+  assert.equal(cliUsableForReview("codex", { platform: "win32", resolve: () => "C:\\npm\\codex.cmd" }), true);
+
+  // The explicit-selection error must distinguish "cannot work" from "not
+  // installed" and name what to do instead.
+  const msg = cliUnusableMessage("agy");
+  assert.match(msg, /\.cmd shim/);
+  assert.match(msg, /--provider claude|--provider codex/);
+  assert.doesNotMatch(msg, /not installed/);
+});
+
+test("a CLI named by PATH gets its own calling convention, not the generic one", () => {
+  // Accepting a path for --provider meant every dispatch that compared the raw
+  // string to "agy"/"claude"/"codex" mismatched, so "/opt/tools/agy" configured
+  // cleanly and then reached the wrong branch — losing --mode plan, the argv
+  // prompt, and --print-timeout. Same defect as the loop fixer, second surface.
+  for (const named of ["/opt/tools/agy", "C:\\tools\\agy.cmd", "/usr/local/bin/agy"]) {
+    assert.equal(cliRequiresArgvPrompt(named), true, `${named} must still be argv-prompt`);
+    assert.deepEqual(
+      cliFallbackArgs(named, "PROMPT-BODY", { timeoutMs: 900 * 1000 }),
+      ["--mode", "plan", "--print-timeout", "900s", "-p", "PROMPT-BODY"],
+      `${named} lost its agy convention`
+    );
+    assert.deepEqual(cliReviewArgs(named), [], `${named} must have no stdin review form`);
+  }
+  for (const named of ["/opt/tools/claude", "C:\\npm\\claude.CMD"]) {
+    assert.equal(cliRequiresArgvPrompt(named), false);
+    assert.deepEqual(
+      cliReviewArgs(named),
+      ["--permission-mode", "plan", "-p", "-"],
+      `${named} lost its claude convention`
+    );
+  }
+  // Cursor's alias forms travel by path too.
+  assert.deepEqual(
+    cliReviewArgs("/opt/tools/cursor-agent"),
+    ["-p", "--trust", "--output-format", "text", "--mode", "plan", "-"]
+  );
+  // A genuinely unknown CLI still gets the generic form.
+  assert.deepEqual(cliFallbackArgs("/opt/tools/somecli", "PROMPT-BODY"), ["PROMPT-BODY"]);
+});
+
+test("isCliPrintTimeoutStderr recognizes agy giving up on its own wait", () => {
+  assert.equal(isCliPrintTimeoutStderr("Error: timeout waiting for response\n"), true);
+  assert.equal(isCliPrintTimeoutStderr("some unrelated failure"), false);
+  assert.equal(isCliPrintTimeoutStderr(""), false);
+  assert.equal(isCliPrintTimeoutStderr(null), false);
+});
+
+test("agy's own print-timeout surfaces as a --timeout overrun, not an opaque exit 1", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-print-timeout-"));
+  const binPath = path.join(tmpDir, "agy");
+  fs.writeFileSync(binPath, '#!/bin/sh\necho "Error: timeout waiting for response" >&2\nexit 1\n');
+  fs.chmodSync(binPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}:${oldPath}`;
+  try {
+    await assert.rejects(
+      () => llmCall({ provider: "cli", cliCmd: "agy", timeoutMs: 900 * 1000 }, "review this", "sys"),
+      (err) => {
+        assert.match(err.message, /exceeded --timeout 900s; retry with --timeout <larger>/);
+        return true;
+      }
+    );
+  } finally {
+    process.env.PATH = oldPath;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test("describeUnknownFlagRejection parses Go flag and common unknown-flag stderr", () => {
@@ -852,7 +1052,7 @@ test("T12 AC1: no spawn site derives `shell` from the platform or the environmen
   // would have silently stopped covering the thing it guards.
   const modules = ["../src/llm.js", "../src/exec-watchdog.js", "../src/spawn-safe.js"];
   let explicitFalse = 0;
-  let legacyWindowsShell = 0;
+  let shellTrue = 0;
 
   for (const mod of modules) {
     const raw = fs.readFileSync(new URL(mod, import.meta.url), "utf8");
@@ -866,24 +1066,58 @@ test("T12 AC1: no spawn site derives `shell` from the platform or the environmen
 
     for (const line of code.split("\n").filter((l) => /^\s*shell:/.test(l))) {
       if (/shell:\s*false/.test(line)) { explicitFalse++; continue; }
-      // ONE deliberate exemption: the win32 legacy branch in llm.js keeps main's
-      // execFileSync(shell:true) behaviour verbatim. Four review rounds found
-      // four different defects in this branch's attempts to replace it, none
-      // verifiable because CI is Ubuntu-only. Shipping the known-unsafe status
-      // quo beat shipping a fifth guess. Owned by T19.
-      assert.match(line, /shell:\s*true/, `${mod}: unexpected shell option ${line.trim()}`);
-      assert.equal(mod, "../src/llm.js", "the only shell:true exemption lives in llm.js");
-      legacyWindowsShell++;
+      shellTrue++;
     }
-    // The ORIGINAL defect was a shell selected by an EXPRESSION over platform or
-    // env. That must still never appear: the exemption above is a literal inside
-    // an explicit, commented win32 branch, not a computed value.
+    // The original defect was a shell selected by an EXPRESSION over platform or
+    // env. Neither that nor a literal `shell: true` may reappear: a Windows .cmd
+    // shim reaches its interpreter through buildSpawnTarget, by resolved absolute
+    // path, with untrusted argv refused — no spawn site needs a shell.
     assert.ok(!/shell:\s*process\.(platform|env)/.test(code), `${mod}: shell must never be derived from platform/env`);
     assert.ok(!/process\.env\.SHELL/.test(code), `${mod}: SHELL must not select a shell`);
   }
 
   assert.ok(explicitFalse > 0, "at least one spawn site must set shell:false explicitly");
-  assert.equal(legacyWindowsShell, 1, "exactly one documented win32 exemption — no more may accumulate");
+  assert.equal(shellTrue, 0, "no spawn site may enable a shell — cmd.exe would re-parse argv");
+});
+
+test("a Windows .cmd shim never receives the reviewed prompt as an argument", () => {
+  // The agy provider delivers the prompt via argv (it has no stdin sentinel). On
+  // Windows that argv would reach cmd.exe through the shim interpreter, which
+  // re-parses it — so a diff containing cmd.exe metacharacters could execute as
+  // commands. This must fail closed rather than spawn.
+  const prompt = 'review this & calc.exe';
+  assert.throws(
+    () => buildSpawnTarget("C:\\npm\\agy.cmd", ["--mode", "plan", "-p", prompt], {
+      platform: "win32", env: {}, argsContainUntrusted: true
+    }),
+    (err) => {
+      assert.equal(err.code, "EWINARGV");
+      assert.doesNotMatch(err.message, /T19|tracked in/i, "error must name a remedy, not a ticket");
+      assert.match(err.message, /stdin|API provider|native executable/);
+      return true;
+    }
+  );
+
+  // A native executable has no interpreter in the path at all, so the same argv
+  // is spawned directly — no cmd.exe, nothing to re-parse.
+  const direct = buildSpawnTarget("C:\\tools\\agy.exe", ["-p", prompt], {
+    platform: "win32", env: {}, argsContainUntrusted: true
+  });
+  assert.equal(direct.viaInterpreter, false);
+  assert.equal(direct.command, "C:\\tools\\agy.exe");
+  assert.deepEqual(direct.args, ["-p", prompt]);
+});
+
+test("execCli has no platform-branched spawn: every OS takes the watchdog path", () => {
+  // Regression guard for the bypass this replaced — execCli used to short-circuit
+  // win32 into execFileSync(shell:true), skipping buildSpawnTarget entirely, so
+  // the untrusted-argv refusal and the resolved-path routing never ran there.
+  const raw = fs.readFileSync(new URL("../src/llm.js", import.meta.url), "utf8");
+  const code = raw.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  const execCliBody = code.slice(code.indexOf("async function execCli("));
+  const body = execCliBody.slice(0, execCliBody.indexOf("\n}"));
+  assert.ok(!/process\.platform/.test(body), "execCli must not branch on platform when spawning");
+  assert.ok(/spawnWithWatchdog\(/.test(body), "execCli must spawn through spawnWithWatchdog");
 });
 
 test("T12: isCmdInstalled still answers correctly via resolveCommand", () => {

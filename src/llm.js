@@ -1,12 +1,12 @@
 import { execFileSync } from "child_process";
-import { resolveCommand } from "./spawn-safe.js";
+import { resolveCommand, resolveTrustedCommand, sanitizedSpawnEnv, isWindowsBatchShim } from "./spawn-safe.js";
+import { commandKind } from "./resolve-command.js";
 import { spawnWithWatchdog } from "./exec-watchdog.js";
 import fs from "fs";
 import os from "os";
 import path from "path";
 import { log } from "./utils.js";
 import { sanitizeSchemaForProvider } from "./schema-validate.js";
-import { isInsideTrustRoot } from "./trust-root.js";
 
 const DEFAULT_TIMEOUT_MS = 120 * 1000;
 
@@ -34,11 +34,21 @@ function environmentBlockBytes(env = process.env) {
 
 function probeArgMax() {
   if (cachedProbedArgMax !== undefined) return cachedProbedArgMax;
+  // Even a helper that only reads a number is a spawn. This one runs early — the
+  // agy path calls it before execCli reaches the trusted-CLI check — so a bare
+  // name here would execute a repository-supplied getconf ahead of every guard on
+  // the branch. Without a trusted one, fall back to the platform default.
+  const getconf = resolveTrustedCommand("getconf");
+  if (!getconf) {
+    cachedProbedArgMax = null;
+    return cachedProbedArgMax;
+  }
   try {
-    const out = execFileSync("getconf", ["ARG_MAX"], {
+    const out = execFileSync(getconf, ["ARG_MAX"], {
       encoding: "utf8",
       timeout: 2000,
       stdio: ["ignore", "pipe", "ignore"],
+      env: sanitizedSpawnEnv(),
     }).trim();
     const n = Number.parseInt(out, 10);
     cachedProbedArgMax = Number.isFinite(n) && n > 0 ? n : null;
@@ -82,6 +92,42 @@ export function maxArgvPromptBytes({
   }
 
   return Math.max(0, totalBudget);
+}
+
+// The review budget in milliseconds as a finite positive NUMBER, or null.
+//
+// Normalizing here, once, is what keeps three consumers agreeing: the watchdog
+// that kills the process, the --print-timeout we hand the agent, and the message
+// we print on overrun. A numeric string is coerced rather than rejected because
+// every way this can diverge fails SILENTLY — the watchdog would substitute its
+// own default while the agent was told a different number and the error blamed a
+// third — so a config or env value arriving as "600000" must not be discarded.
+// Callers must pass the normalized value to ALL of them, never the raw input.
+export function normalizeTimeoutMs(timeoutMs) {
+  const ms = typeof timeoutMs === "string" ? Number(timeoutMs.trim()) : timeoutMs;
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  return ms;
+}
+
+// The review budget in whole seconds, or null when no usable budget is known.
+// Rounds UP so a sub-second budget still names a positive duration; both the flag
+// we forward to the agent and the message we report on overrun read it from here,
+// so the two can never disagree about what the budget was.
+export function budgetSeconds(timeoutMs) {
+  const ms = normalizeTimeoutMs(timeoutMs);
+  return ms === null ? null : Math.max(1, Math.ceil(ms / 1000));
+}
+
+// Single wording for "the review ran out of time", whether the watchdog killed the
+// process or the agent abandoned its own wait. `subject` names the thing that timed
+// out, e.g. `codex` or `local CLI agent "agy"`. A missing/degenerate budget must not
+// render as "NaNs" or "0s" — with no budget known, no --print-timeout was forwarded
+// either, so the agent's own default is what actually fired.
+export function timeoutExceededMessage(subject, timeoutMs) {
+  const seconds = budgetSeconds(timeoutMs);
+  return seconds === null
+    ? `Failed to execute ${subject}: timed out with no --timeout budget set; retry with --timeout <seconds>`
+    : `Failed to execute ${subject}: exceeded --timeout ${seconds}s; retry with --timeout <larger>`;
 }
 
 function argvTooLargeMessage(cliLabel, promptBytes, limitBytes) {
@@ -186,16 +232,14 @@ export function isCmdInstalled(cmd) {
 // tree whose target is inside is still refused. This is the SINGLE resolver used
 // by fresh detection, cache reuse, and the spawn site (T22).
 export function resolveTrustedCli(cmd) {
-  const resolved = resolveCommand(cmd);
-  if (!resolved) return null;
-  let real;
-  try {
-    real = fs.realpathSync(resolved);
-  } catch {
-    real = path.resolve(resolved);
-  }
-  if (isInsideTrustRoot(real)) return null;
-  return real;
+  // SKIP repo-local PATH entries and keep looking, rather than resolving to the
+  // first match and then rejecting it. Rejecting made one repo-local binary hide
+  // the real system CLI behind it: a dependency that installs its own `codex`
+  // into node_modules/.bin — which npx puts first — made an installed
+  // /usr/local/bin/codex report as unavailable, so the tool refused a provider
+  // the user actually had. Excluding the trust root during the walk is both safer
+  // and correct, since resolveCommand also canonicalizes and re-checks the target.
+  return resolveTrustedCommand(cmd);
 }
 
 // Boolean form for the detection ladder: a repo-local CLI is NOT available.
@@ -204,61 +248,39 @@ export function isTrustedCliInstalled(cmd) {
 }
 
 async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true } = {}) {
-  // SECURITY: shell:false on every platform. This previously passed
-  // `shell: process.platform === "win32"`, which handed every argument to
-  // cmd.exe for re-parsing on Windows and lost argv metacharacter safety.
+  // SECURITY: no spawn site here selects a shell. A shell was once needed on
+  // Windows so the interpreter would locate npm-installed `.cmd` shims, which are
+  // not executable images. resolveCommand performs that lookup explicitly (PATH +
+  // PATHEXT), and buildSpawnTarget routes a shim through the interpreter by its
+  // resolved absolute path, so no argument is ever handed to cmd.exe for
+  // re-parsing and no bare name is re-resolved against the current directory.
   //
-  // That flag was not gratuitous — it was how npm-installed `.cmd` shims got
-  // resolved. So it cannot simply be removed: resolveCommand performs that
-  // lookup explicitly (PATH + PATHEXT) and we spawn the resolved absolute path,
-  // which removes the only reason the shell was needed.
-  // WINDOWS IS DELIBERATELY UNCHANGED FROM main. Four successive review rounds
-  // found this branch's Windows handling wrong in a different way each time —
-  // .cmd shims are not executable images, cmd.exe re-parses argv after /c, a
-  // blanket argument refusal broke every npm-installed CLI, and a bare cmd.exe
-  // fallback is resolvable from the reviewed repository. None of it has ever
-  // executed on Windows, because CI is Ubuntu-only.
-  //
-  // Windows here keeps the exact behaviour it has in main: execFileSync with
-  // shell:true. This path is KNOWN-UNSAFE — arguments are re-parsed by cmd.exe —
-  // and remains the original defect; it is unchanged, not fixed. T19 tracks the
-  // correct Windows implementation, gated on windows-latest CI.
-  // TRUST GUARD (T22) — runs on EVERY platform, BEFORE the Windows branch. Spawn
+  // Every platform takes the same spawnWithWatchdog path below, which applies the
+  // `argsContainUntrusted` decision recorded by the caller: argv carrying the
+  // reviewed prompt is refused on a Windows shim rather than executed.
+  // TRUST GUARD — spawn
   // only a TRUSTED, canonical path: refuse to execute a CLI that resolves inside
   // the git worktree under review — npm/npx put ./node_modules/.bin on PATH, so a
   // reviewed repo could otherwise ship a shim that runs as the reviewer. Detection
   // already avoids selecting such a binary; this makes execution impossible even
   // if one slipped through.
-  const resolved = resolveCommand(cliCmd);
-  if (!resolved) {
+  // Path-aware: configureLLM accepts a CLI named by path (--provider
+  // /opt/tools/agy), and re-checking with the bare-name-only resolver rejected
+  // every one of them, so a provider that configured cleanly failed at the first
+  // review call with "not found on PATH". Ask the same resolver configuration
+  // asked, then distinguish the two failures for the message.
+  const trusted = resolveTrustedCli(cliCmd);
+  if (!trusted && !resolvesAtAll(cliCmd)) {
     throw new Error(
       `Local CLI agent "${cliCmd}" was not found on PATH. Install it, or pass --provider <other>.`
     );
   }
-  const trusted = resolveTrustedCli(cliCmd);
   if (!trusted) {
     throw new Error(
       `Refusing to run local CLI agent "${cliCmd}": it resolves to an executable inside the ` +
-        `working tree (${resolved}). A review provider must not be a repository-local binary — ` +
+        `working tree. A review provider must not be a repository-local binary — ` +
         `install it outside the repo, or pass --provider with a trusted provider.`
     );
-  }
-
-  if (process.platform === "win32") {
-    // Windows keeps shell:true so npm-installed `.cmd` shims still run. NOTE: it
-    // still passes the BARE command (not `trusted`) to cmd.exe, which re-resolves
-    // it against the live directory — the known-unsafe re-resolution that T19
-    // tracks. The repo-local REFUSAL above now runs on Windows too, so a codex
-    // that resolveCommand itself finds inside the tree is rejected pre-spawn; the
-    // residual cmd.exe re-resolution is unchanged and remains T19's scope.
-    return execFileSync(cliCmd, args, {
-      input,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-      maxBuffer: 10 * 1024 * 1024,
-      timeout: timeoutMs,
-      shell: true
-    }).trim();
   }
 
   return spawnWithWatchdog(trusted, args, {
@@ -274,8 +296,23 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
 // diff cannot prompt-inject writes (mirrors Codex --sandbox read-only). Flag name
 // is per-CLI: claude uses --permission-mode; agy uses --mode. Opt out with
 // --allow-unsandboxed-cli when an older CLI rejects plan mode.
+// Does this name identify an executable at all, trusted or not? Used only to
+// tell "you have not installed it" apart from "it is inside the repository" —
+// two very different problems that must not share one message.
+function resolvesAtAll(cliCmd) {
+  if (typeof cliCmd === "string" && (path.isAbsolute(cliCmd) || cliCmd.includes("/") || cliCmd.includes("\\"))) {
+    try {
+      return fs.statSync(path.resolve(cliCmd)).isFile();
+    } catch {
+      return false;
+    }
+  }
+  return resolveCommand(cliCmd) !== null;
+}
+
 export function isCursorAgentCli(cliCmd) {
-  return cliCmd === "agent" || cliCmd === "cursor-agent";
+  const kind = commandKind(cliCmd);
+  return kind === "agent" || kind === "cursor-agent";
 }
 
 // agy's `-p`/`--print`/`--prompt` takes the prompt as its VALUE — it has NO stdin
@@ -284,14 +321,66 @@ export function isCursorAgentCli(cliCmd) {
 // conversational prose ("Hello! How can I help you today?") instead of the review
 // JSON. So agy must always receive the prompt as the `-p` argument value.
 export function cliRequiresArgvPrompt(cliCmd) {
-  return cliCmd === "agy";
+  return commandKind(cliCmd) === "agy";
+}
+
+// agy's print mode has its OWN wait budget (`--print-timeout`, default 5m0s) that
+// is independent of our watchdog. Left unset, agy aborts a long review at 5 minutes
+// with "Error: timeout waiting for response" no matter how large a --timeout the
+// user asked for (the CLI default for a local agent is 2400s) — the user's timeout
+// silently does not apply. Pass the resolved budget through so agy honours it.
+// Returns [] for CLIs without the flag, and when no budget is known.
+export function cliPrintTimeoutArgs(cliCmd, timeoutMs) {
+  if (commandKind(cliCmd) !== "agy") return [];
+  const seconds = budgetSeconds(timeoutMs);
+  if (seconds === null) return [];
+  // Go duration literal; seconds granularity is enough for a review budget.
+  return ["--print-timeout", `${seconds}s`];
+}
+
+/** True when CLI stderr shows the agent gave up waiting on its own response. */
+export function isCliPrintTimeoutStderr(stderr) {
+  return /timeout waiting for response/i.test((stderr || "").toString());
+}
+
+// A CLI that must carry the prompt in argv cannot be launched from a Windows npm
+// `.cmd` shim: cmd.exe re-parses the command line, so buildSpawnTarget refuses
+// the untrusted argv rather than let a reviewed diff execute. Such an install can
+// never complete a review, so detection must skip it instead of selecting it and
+// failing at spawn time — and an explicit request for it must say why.
+export function cliUsableForReview(cliCmd, { platform = process.platform, resolve = resolveTrustedCli } = {}) {
+  if (platform !== "win32" || !cliRequiresArgvPrompt(cliCmd)) return true;
+  const resolved = resolve(cliCmd);
+  if (!resolved) return false;
+  return !isWindowsBatchShim(resolved, { platform });
+}
+
+// THE reachability predicate for a local CLI. Installed-and-trusted is not the
+// same as able-to-review, and every selection path must ask the same question:
+// auto-detection, --providers token resolution, the large-diff family downgrade,
+// and cache reuse. Where one of them asks a weaker question, that path selects a
+// provider the spawn site will refuse — and a --providers run aborts instead of
+// continuing with the reviewers that do work.
+export function cliReachableForReview(cliCmd) {
+  return isTrustedCliInstalled(cliCmd) && cliUsableForReview(cliCmd);
+}
+
+export function cliUnusableMessage(cliCmd) {
+  return (
+    `Local CLI agent "${cliCmd}" is installed as a Windows .cmd shim, which cannot be used for ` +
+    `review: it can only be launched through cmd.exe, and ${cliCmd} takes the prompt as a ` +
+    `command-line argument, so the reviewed diff would be re-parsed as commands.\n` +
+    `Use a provider whose prompt travels over stdin (--provider claude or --provider codex), ` +
+    `an API provider, or install ${cliCmd} as a native executable.`
+  );
 }
 
 /** Plan/read-only sandbox flags for a local CLI (empty when unsandboxed or unknown). */
 export function cliSandboxArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
   if (allowUnsandboxedCli) return [];
-  if (cliCmd === "claude") return ["--permission-mode", "plan"];
-  if (cliCmd === "agy" || isCursorAgentCli(cliCmd)) return ["--mode", "plan"];
+  const kind = commandKind(cliCmd);
+  if (kind === "claude") return ["--permission-mode", "plan"];
+  if (kind === "agy" || isCursorAgentCli(cliCmd)) return ["--mode", "plan"];
   return [];
 }
 
@@ -344,14 +433,19 @@ export function cliReviewArgs(cliCmd, { allowUnsandboxedCli = false, model = nul
   // Only claude uses the stdin `-` review form here. agy has no stdin sentinel
   // (see cliRequiresArgvPrompt) and is invoked with the prompt as the -p value via
   // cliFallbackArgs; it must NOT get a `-p -` form, which agy reads as the prompt "-".
-  if (cliCmd !== "claude") return [];
+  if (commandKind(cliCmd) !== "claude") return [];
   const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
   if (model) args.push("--model", model);
   args.push("-p", "-");
   return args;
 }
 
-export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = false, model = null } = {}) {
+// INVARIANT: the prompt is always the LAST element, immediately preceded by the
+// flag that consumes it (`-p`). agy parses with Go's flag package, which stops at
+// the first non-flag argument — anything appended after the prompt is silently
+// dropped, and anything inserted between `-p` and the prompt is consumed AS the
+// prompt. New flags must be added before that trailing pair, never after it.
+export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = false, model = null, timeoutMs = null } = {}) {
   if (isCursorAgentCli(cliCmd)) {
     const args = ["-p", "--trust", "--output-format", "text"];
     args.push(...cliSandboxArgs(cliCmd, { allowUnsandboxedCli }));
@@ -361,9 +455,11 @@ export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = fals
   }
   // claude and agy are Claude-Code-compatible: they need -p (print mode) when
   // the prompt is passed as a command-line argument.
-  if (cliCmd === "claude" || cliCmd === "agy") {
+  const kind = commandKind(cliCmd);
+  if (kind === "claude" || kind === "agy") {
     const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
     if (model) args.push("--model", model);
+    args.push(...cliPrintTimeoutArgs(cliCmd, timeoutMs));
     args.push("-p", fullPrompt);
     return args;
   }
@@ -411,7 +507,7 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
       await execCli("codex", [...baseArgs, "-"], fullPrompt, timeoutMs, { stream, argsContainUntrusted: false });
     } catch (stdinErr) {
       if (stdinErr.code === "ETIMEDOUT") {
-        throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: stdinErr.stdout, stderr: stdinErr.stderr, cause: stdinErr });
+        throw Object.assign(new Error(timeoutExceededMessage("codex", timeoutMs)), { stdout: stdinErr.stdout, stderr: stdinErr.stderr, cause: stdinErr });
       }
       const promptBytes = Buffer.byteLength(fullPrompt);
       const argvLimit = maxArgvPromptBytes();
@@ -427,7 +523,7 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
         await execCli("codex", [...baseArgs, fullPrompt], null, timeoutMs, { stream });
       } catch (argvErr) {
         if (argvErr.code === "ETIMEDOUT") {
-          throw Object.assign(new Error(`Failed to execute codex: exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
+          throw Object.assign(new Error(timeoutExceededMessage("codex", timeoutMs)), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
         }
         if (isE2BigError(argvErr)) {
           throw Object.assign(new Error(argvTooLargeMessage("Codex", promptBytes, argvLimit)), { stdout: argvErr.stdout, stderr: argvErr.stderr, cause: argvErr });
@@ -448,7 +544,16 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
 }
 
 // Invoke a local CLI agent (claude, agy, ...) by piping the prompt to stdin.
-async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs = 10 * 60 * 1000, allowUnsandboxedCli = false, model = null, stream = false } = {}) {
+const DEFAULT_CLI_TIMEOUT_MS = 10 * 60 * 1000;
+
+async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs: rawTimeoutMs = DEFAULT_CLI_TIMEOUT_MS, allowUnsandboxedCli = false, model = null, stream = false } = {}) {
+  // Normalize ONCE, at the boundary. Everything downstream — the watchdog window,
+  // the agent's own --print-timeout, and the overrun message — must read the same
+  // number, or the process is killed at one budget while the agent was told
+  // another and the error reports a third.
+  // An unusable value resolves to the documented default rather than null, so no
+  // consumer downstream has to invent one of its own.
+  const timeoutMs = normalizeTimeoutMs(rawTimeoutMs) ?? DEFAULT_CLI_TIMEOUT_MS;
   let fullPrompt = "";
   if (systemInstruction) {
     fullPrompt += `System Instructions:\n${systemInstruction}\n\n`;
@@ -457,11 +562,11 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
 
   log.step(`Invoking local subscription agent via command: "${cliCmd}"...`);
 
-  if (cliCmd === "codex") {
+  if (commandKind(cliCmd) === "codex") {
     return callCodexCli(fullPrompt, schema, timeoutMs, { stream, model });
   }
 
-  const fallbackOpts = { allowUnsandboxedCli, model };
+  const fallbackOpts = { allowUnsandboxedCli, model, timeoutMs };
 
   // agy: the prompt MUST be the `-p` value (no stdin sentinel). Deliver it via
   // argv directly — there is no stdin path to try first. Guard the argv size.
@@ -475,12 +580,17 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
       return await execCli(cliCmd, cliFallbackArgs(cliCmd, fullPrompt, fallbackOpts), null, timeoutMs, { stream, argsContainUntrusted: true });
     } catch (err) {
       if (err.code === "ETIMEDOUT") {
-        throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: err.stdout, stderr: err.stderr, cause: err });
+        throw Object.assign(new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)), { stdout: err.stdout, stderr: err.stderr, cause: err });
       }
       if (isE2BigError(err)) {
         throw Object.assign(new Error(argvTooLargeMessage(`Local CLI agent "${cliCmd}"`, promptBytes, argvLimit)), { stdout: err.stdout, stderr: err.stderr, cause: err });
       }
       const stderr = err.stderr?.toString("utf8") || "";
+      // The agent aborted its own wait (agy --print-timeout). Report it as the
+      // budget overrun it is, not as an opaque exit-1, so the fix is obvious.
+      if (isCliPrintTimeoutStderr(stderr)) {
+        throw Object.assign(new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      }
       const flagRejection = describeUnknownFlagRejection(cliCmd, stderr);
       if (flagRejection) {
         throw Object.assign(new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : "")), { stdout: err.stdout, stderr: err.stderr, cause: err });
@@ -499,7 +609,7 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
     return await execCli(cliCmd, primaryArgs, fullPrompt, timeoutMs, { stream, argsContainUntrusted: false });
   } catch (err) {
     if (err.code === "ETIMEDOUT") {
-      throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      throw Object.assign(new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)), { stdout: err.stdout, stderr: err.stderr, cause: err });
     }
     const stderr = err.stderr?.toString("utf8") || "";
     // Unknown-flag rejections must surface clearly — not as a prompt-size / argv error.
@@ -522,7 +632,7 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
     } catch (err2) {
       if (err2.code === "ETIMEDOUT") {
         throw Object.assign(
-          new Error(`Failed to execute local CLI agent "${cliCmd}": exceeded --timeout ${Math.floor(timeoutMs / 1000)}s; retry with --timeout <larger>`),
+          new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)),
           { stdout: err2.stdout, stderr: err2.stderr, cause: err2 }
         );
       }
@@ -607,6 +717,9 @@ export function cachedResolutionUsable(entry) {
     const trusted = resolveTrustedCli(cliCmd);
     if (!trusted) return false;
     if (trusted !== entry.cliPath) return false;
+    // A resolution cached before this CLI became unusable for review (or cached on
+    // another platform) must not be replayed into a guaranteed spawn refusal.
+    if (!cliUsableForReview(cliCmd)) return false;
     return true;
   }
   if (provider === "anthropic") return !!envNonEmpty("ANTHROPIC_API_KEY");
@@ -679,7 +792,7 @@ export function configureLLM(args) {
     const canOpenai = () => !exP.has("openai") && envNonEmpty("OPENAI_API_KEY");
     const canAnthropic = () => !exP.has("anthropic") && envNonEmpty("ANTHROPIC_API_KEY");
     const canGw = () => !exP.has("vercel") && !!gw;
-    const canCli = (c) => !exC.has(c) && isTrustedCliInstalled(c);
+    const canCli = (c) => !exC.has(c) && isTrustedCliInstalled(c) && cliUsableForReview(c);
     const cursorAgent = resolveCursorAgentCmd();
     const canCursorAgent = () => (cursorAgent && !exC.has(cursorAgent)) ? cursorAgent : null;
 
@@ -805,6 +918,10 @@ export function configureLLM(args) {
       const knownApis = ["gemini", "openai", "anthropic", "vercel"];
       if (!knownApis.includes(provider)) {
         if (isTrustedCliInstalled(provider)) {
+          // Installed but unable to complete a review is a DIFFERENT failure from
+          // not installed, and it has a different remedy — say which one it is
+          // here rather than letting it surface as a spawn refusal mid-review.
+          if (!cliUsableForReview(provider)) throw new Error(cliUnusableMessage(provider));
           cliCmd = provider;
           provider = "cli";
         } else {
@@ -1005,7 +1122,7 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
 
   // Explicit local-CLI token: resolve to that CLI only, never the family API.
   if (CLI_ONLY_TOKENS.has(id)) {
-    return isTrustedCliInstalled(id) ? build(id) : { id, family, config: null };
+    return cliReachableForReview(id) ? build(id) : { id, family, config: null };
   }
 
   if (family) {
@@ -1035,7 +1152,7 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
           };
         }
       }
-      if (cand.kind === "cli" && isTrustedCliInstalled(cand.cliCmd)) {
+      if (cand.kind === "cli" && cliReachableForReview(cand.cliCmd)) {
         return build(cand.cliCmd);
       }
     }
@@ -1053,7 +1170,7 @@ export function resolveProviderToken(token, args = {}, { allowApiKeyFallback = f
     };
   }
   // Unknown token: treat as a raw local CLI command if installed.
-  if (isTrustedCliInstalled(id)) return build(id);
+  if (cliReachableForReview(id)) return build(id);
   return { id, family: null, config: null };
 }
 
@@ -1064,7 +1181,7 @@ const FAMILY_CLI = { openai: "codex", anthropic: "claude", gemini: "agy" };
 // Return a CLI provider entry for `family` if its local CLI is installed, else null.
 export function cliFallbackForFamily(family, args = {}) {
   const cliCmd = FAMILY_CLI[family];
-  if (cliCmd && isTrustedCliInstalled(cliCmd)) {
+  if (cliCmd && cliReachableForReview(cliCmd)) {
     return { id: cliCmd, family, config: { ...configureLLM({ ...args, provider: cliCmd, providers: undefined, apiKey: null }), id: cliCmd } };
   }
   return null;

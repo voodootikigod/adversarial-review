@@ -199,7 +199,8 @@ Next steps
 --loop-fixer <cmd>     Override the fixer CLI (default: auto-detect codex→claude→agy).
 --loop-fixer-scope     sc2 (default): only finding-cited files. unrestricted: all files.
 --loop-fixer-file-cap  Max files listed in unrestricted mode (default 100).
---loop-unsafe          Required on macOS (no write sandbox); on Linux skips the probe.
+--loop-unsafe          Required on every platform: no enforced write confinement exists.
+                       The fixer has unrestricted write access to your filesystem.
 --loop-unsafe-allow-fix-secrets
                        Bypass the secret scan on the fix prompt (same-provider checked).
 ```
@@ -378,9 +379,12 @@ npx adversarial-review --loop --loop-unsafe --loop-max 3
   incompatible with `--scope branch` / `--base`. (Branch-scoped convergence is not yet
   supported.)
 - **Fixer.** Auto-detected in order `codex → claude → agy`; override with `--loop-fixer`.
-- **Write sandbox.** macOS has no enforced sandbox, so `--loop-unsafe` is required to
-  acknowledge the fixer has unrestricted write access; on Linux the loop uses a
-  mount-namespace sandbox (`unshare`) when available, and otherwise requires `--loop-unsafe`.
+- **No write confinement.** `--loop-unsafe` is required on EVERY platform. macOS has no
+  enforced sandbox (`sandbox-exec` was removed in macOS 14+). On Linux, `unshare --mount`
+  gives a mount namespace but remounts nothing read-only, so it isolates mount operations
+  and confines no writes — the fixer keeps full access to your filesystem (home directory,
+  credentials, `.git` internals, other repositories), and the loop’s git checkpoint can only
+  roll back the worktree. Real confinement (Landlock/bubblewrap) is not implemented.
 - **Checkpoints.** The working tree is stashed before each fix; on a fixer error or
   timeout the checkpoint is restored, and the recovery command is always printed.
 - **Stop conditions** (exit `2`): `no-progress` (the gating set repeats), `ceiling`

@@ -29,7 +29,7 @@
 import { spawn } from "child_process";
 import { StringDecoder } from "string_decoder";
 import path from "path";
-import { resolveCommand, terminateProcessTree, buildSpawnTarget } from "./spawn-safe.js";
+import { resolveCommand, terminateProcessTree, buildSpawnTarget, sanitizedSpawnEnv } from "./spawn-safe.js";
 
 export const DEFAULT_IDLE_TIMEOUT_MS = 180 * 1000;
 export const DEFAULT_MAX_MS = 900 * 1000;
@@ -152,6 +152,13 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
       windowsHide: true,
+      // Set only for the cmd.exe shim route, which quotes its own command string
+      // for /s. Node would otherwise backslash-escape those quotes and cmd.exe
+      // would split a spaced shim path at the first space.
+      windowsVerbatimArguments: target.windowsVerbatimArguments === true,
+      // The child does its OWN lookups (env-shebang interpreters, .cmd wrappers
+      // falling back to a bare node) from what it inherits — see sanitizedSpawnEnv.
+      env: sanitizedSpawnEnv(),
       // Own process group so terminateProcessTree can signal the whole tree.
       detached: process.platform !== "win32"
     });

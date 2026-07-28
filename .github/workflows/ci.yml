@@ -31,3 +31,30 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+  # The spawn path is the one place where a Windows-only defect is a security
+  # defect: .cmd shims are not executable images, so they reach cmd.exe, which
+  # re-parses argv and resolves unqualified names against the reviewed
+  # repository. Simulating win32 through the platform/env seams on Ubuntu checks
+  # our decisions but never CreateProcess, PATHEXT, or cmd.exe itself — so that
+  # path is executed for real here.
+  #
+  # Only test/windows-spawn.test.mjs runs: the rest of the suite is not
+  # Windows-portable (POSIX mode bits, `#!/bin/sh` mock CLIs) and making it so is
+  # separate work.
+  windows-spawn:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Windows spawn-safety tests
+        run: node --test test/windows-spawn.test.mjs

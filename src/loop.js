@@ -11,6 +11,8 @@ export function tailOf(text, limit) {
   return text.length > limit ? text.slice(-limit) : text;
 }
 import { collectReviewContext } from "./git-context.js";
+import { resolveTrustedGit } from "./trust-root.js";
+import { resolveTrustedCommand, buildSpawnTarget, terminateProcessTree, sanitizedSpawnEnv } from "./spawn-safe.js";
 import {
   buildPrompt,
   fenceUntrusted,
@@ -25,7 +27,7 @@ import {
   renderReport,
   SEVERITY_RANK
 } from "./review.js";
-import { configureLLM, isCmdInstalled, selectProviders, underSatisfiedNotice } from "./llm.js";
+import { configureLLM, selectProviders, underSatisfiedNotice, cliPrintTimeoutArgs, cliRequiresArgvPrompt, cliUsableForReview, cliUnusableMessage, maxArgvPromptBytes } from "./llm.js";
 import { persistAutoResolution, withProviderFallback, isStaleResolutionFailure } from "./resolution-lifecycle.js";
 
 // Build the per-round review operation (review + optional --verify) as a single
@@ -53,12 +55,16 @@ function buildReviewRound(args, context, prompt) {
 // ─── Git helpers ──────────────────────────────────────────────────────────────
 
 function gitRun(cwd, args, { allowFail = false } = {}) {
+  // Absolute, trusted git only — see resolveTrustedGit. Resolved outside the try
+  // so an allowFail probe cannot turn a security refusal into an empty string.
+  const gitBin = resolveTrustedGit();
   try {
-    return execFileSync("git", args, {
+    return execFileSync(gitBin, args, {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      maxBuffer: 4 * 1024 * 1024
+      maxBuffer: 4 * 1024 * 1024,
+      env: sanitizedSpawnEnv()
     }).trim();
   } catch (err) {
     if (allowFail) return "";
@@ -184,29 +190,40 @@ function buildRecoveryCmd(stashName) {
 
 // ─── Fixer detection ─────────────────────────────────────────────────────────
 
+// Probing EXECUTES the candidate. Detection therefore has to resolve it to a
+// trusted absolute path first: under npx a reviewed repository can put its own
+// `codex`/`claude`/`agy` at the front of PATH, and the --version probe would run
+// it — before probeOsConstraint has established or rejected the write sandbox, so
+// even a loop that is about to be refused would already have run repository code.
 function probeFixer(cmd) {
+  const resolved = resolveTrustedCommand(cmd);
+  if (!resolved) return false;
   try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore", timeout: 5000 });
+    execFileSync(resolved, ["--version"], { stdio: "ignore", timeout: 5000, env: sanitizedSpawnEnv() });
     return true;
   } catch {
     try {
-      execFileSync(cmd, ["-h"], { stdio: "ignore", timeout: 5000 });
+      execFileSync(resolved, ["-h"], { stdio: "ignore", timeout: 5000, env: sanitizedSpawnEnv() });
       return true;
     } catch {
-      return isCmdInstalled(cmd);
+      // It exists and is trusted; it just has no probe-friendly flag.
+      return true;
     }
   }
 }
 
 export function detectFixer(args) {
   if (args.loopFixer) {
-    if (!isCmdInstalled(args.loopFixer)) {
-      throw new Error(`--loop-fixer "${args.loopFixer}" not found in PATH.`);
+    if (!resolveTrustedCommand(args.loopFixer)) {
+      throw new Error(
+        `--loop-fixer "${args.loopFixer}" was not found on PATH outside the repository under ` +
+        `review. A repository must not supply the tool that edits it.`
+      );
     }
     return args.loopFixer;
   }
   for (const cmd of ["codex", "claude", "agy"]) {
-    if (isCmdInstalled(cmd) && probeFixer(cmd)) return cmd;
+    if (probeFixer(cmd)) return cmd;
   }
   throw new Error(
     "No fixer CLI found (tried codex, claude, agy).\n" +
@@ -230,14 +247,18 @@ export const FIXER_PROVIDER_MAP = {
 // ─── OS write constraint ──────────────────────────────────────────────────────
 
 function probeLinuxConstraint() {
+  // The sandbox helper is itself a spawn, and a repo-supplied `unshare` that
+  // exits 0 would report a sandbox that does not exist — then wrap the fixer.
+  const unshare = resolveTrustedCommand("unshare");
+  if (!unshare) return null;
   try {
-    execFileSync("unshare", ["--mount", "--user", "--map-root-user", "true"], {
-      stdio: "ignore", timeout: 3000
+    execFileSync(unshare, ["--mount", "--user", "--map-root-user", "true"], {
+      stdio: "ignore", timeout: 3000, env: sanitizedSpawnEnv()
     });
     return "unshare-user";
   } catch {}
   try {
-    execFileSync("unshare", ["--mount", "true"], { stdio: "ignore", timeout: 3000 });
+    execFileSync(unshare, ["--mount", "true"], { stdio: "ignore", timeout: 3000, env: sanitizedSpawnEnv() });
     return "unshare";
   } catch {}
   return null;
@@ -258,19 +279,36 @@ function probeOsConstraint(args) {
     return { mode: "advisory" };
   }
 
-  // Linux
+  // Linux.
+  //
+  // `unshare --mount` creates a new MOUNT NAMESPACE. It does not remount anything
+  // read-only and does not restrict writes — the fixer keeps every filesystem
+  // permission of the invoking user. Treating it as a write sandbox told Linux
+  // users they were confined when they were not, and skipped the --loop-unsafe
+  // acknowledgement macOS correctly requires. That matters here because the fixer
+  // runs with --dangerously-skip-permissions on a prompt derived from an
+  // untrusted diff, and the loop's git rollback cannot undo a write to
+  // ~/.ssh/authorized_keys, a shell profile, .git/hooks, or another repository.
+  //
+  // Real write confinement needs Landlock or bubblewrap. Until that exists, Linux
+  // is acknowledged as unconfined too. The namespace is still used when available
+  // — it does contain mount operations — but it is not claimed to be more.
   const linuxMode = probeLinuxConstraint();
-  if (!linuxMode) {
-    if (!args.loopUnsafe) {
-      throw new Error(
-        "--loop on Linux requires write sandboxing (landlock or unshare --mount), but neither is available.\n" +
-        "Pass --loop-unsafe to proceed without sandboxing."
-      );
-    }
-    log.warn("Linux: running without write sandboxing (--loop-unsafe). Fixer has unrestricted write access.");
-    return { mode: "none" };
+  if (!args.loopUnsafe) {
+    throw new Error(
+      "--loop has no enforced write confinement on Linux.\n" +
+      "`unshare --mount` creates a mount namespace but remounts nothing read-only, so the fixer " +
+      "keeps full write access to your filesystem — home directory, credentials, .git internals, " +
+      "other repositories — and the loop's git rollback cannot undo changes outside the worktree.\n" +
+      "Pass --loop-unsafe to proceed, acknowledging the fixer has unrestricted write access."
+    );
   }
-  return { mode: linuxMode };
+  log.warn(
+    linuxMode
+      ? `Linux: mount namespace (${linuxMode}) active, but writes are NOT confined (--loop-unsafe). Fixer has unrestricted write access.`
+      : "Linux: running without write confinement (--loop-unsafe). Fixer has unrestricted write access."
+  );
+  return { mode: linuxMode ?? "none" };
 }
 
 // ─── Gating finding helpers ───────────────────────────────────────────────────
@@ -450,49 +488,139 @@ export function buildFixPrompt(findings, files) {
 // ─── Fixer spawning ───────────────────────────────────────────────────────────
 
 // Build the command + args for the write-capable fixer invocation.
-export function buildFixerCmd(fixerCmd, constraint) {
-  let cmd, args;
+// `fixerPath` is the trusted absolute executable; `fixerCmd` only selects the
+// calling convention. They are separate because the unshare wrapper puts the
+// fixer in unshare's ARGUMENTS, where unshare performs its own PATH lookup —
+// resolving the command handed to spawn() is not enough when the real target is
+// one level in. A bare name there would be re-resolved against the inherited
+// npx-style PATH, handing the repository the exact execution the wrapper exists
+// to contain.
+// The fixer's KIND — which calling convention it needs — is separate from WHERE
+// it lives. Once --loop-fixer accepted a path, comparing the raw string to bare
+// names sent "/opt/tools/agy" down the generic stdin branch, silently dropping
+// --dangerously-skip-permissions, --print-timeout and the -p prompt, so the fix
+// was never applied and the loop exited no-diff. Match on the basename, minus a
+// Windows executable/shim extension.
+export function fixerKind(fixerCmd) {
+  // Split on BOTH separators explicitly. path.basename follows the host's rules,
+  // so on POSIX it treats "C:\tools\agy.cmd" as one long filename and the kind
+  // comes back as the whole string — the Windows case would silently fall through
+  // to the generic branch on any non-Windows machine, including CI.
+  const base = String(fixerCmd || "").split(/[/\\]/).pop().toLowerCase();
+  return base.replace(/\.(cmd|bat|exe|com)$/, "");
+}
 
-  if (fixerCmd === "codex") {
-    cmd = "codex";
+export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs = null, fixerPath = null } = {}) {
+  const exe = fixerPath || fixerCmd;
+  const kind = fixerKind(fixerCmd);
+  let cmd, args;
+  // Whether the prompt travels over stdin. agy is the exception on BOTH paths:
+  // its -p takes the prompt as a VALUE and it has no `-` sentinel, so `-p -`
+  // makes it answer the literal "-" and ignore the piped fix entirely. The review
+  // path already accounts for that; this one has to as well.
+  let useStdin = true;
+
+  if (kind === "codex") {
+    cmd = exe;
     args = ["exec", "--ephemeral", "--ignore-rules", "-"];
-  } else if (fixerCmd === "claude" || fixerCmd === "agy") {
-    // agy is Claude-Code-compatible: same write-capable print-mode invocation.
-    cmd = fixerCmd;
+  } else if (kind === "agy") {
+    cmd = exe;
+    args = ["--dangerously-skip-permissions"];
+    // Before the -p pair: agy parses with Go's flag package, which stops at the
+    // first non-flag argument, so anything after the prompt is dropped.
+    args.push(...cliPrintTimeoutArgs("agy", timeoutMs));
+    args.push("-p", prompt ?? "");
+    useStdin = false;
+  } else if (kind === "claude") {
+    cmd = exe;
     args = ["--dangerously-skip-permissions", "-p", "-"];
   } else {
     // unknown custom CLI: try piping via stdin
-    cmd = fixerCmd;
+    cmd = exe;
     args = ["-"];
   }
 
-  // Wrap with unshare if available
+  // Wrap with unshare if available. The prompt stays the LAST argument either way.
   if (constraint.mode === "unshare-user") {
-    return { cmd: "unshare", args: ["--mount", "--user", "--map-root-user", cmd, ...args] };
+    return { cmd: "unshare", args: ["--mount", "--user", "--map-root-user", cmd, ...args], useStdin };
   }
   if (constraint.mode === "unshare") {
-    return { cmd: "unshare", args: ["--mount", cmd, ...args] };
+    return { cmd: "unshare", args: ["--mount", cmd, ...args], useStdin };
   }
 
-  return { cmd, args };
+  return { cmd, args, useStdin };
 }
 
 // Spawn the fixer and return { promise, child }.
 // Promise resolves to { success, timedOut, error, code, stderr }.
 function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
-  const { cmd, args } = buildFixerCmd(fixerCmd, constraint);
+  // An argv-delivered prompt has a hard platform ceiling, and exceeding it fails
+  // as an opaque spawn error. Check before spawning so the message is actionable.
+  const kind = fixerKind(fixerCmd);
+  if (cliRequiresArgvPrompt(kind)) {
+    const promptBytes = Buffer.byteLength(prompt);
+    const argvLimit = maxArgvPromptBytes();
+    if (promptBytes > argvLimit) {
+      throw new Error(
+        `Fixer "${fixerCmd}" takes the fix prompt as a command-line argument, and this prompt ` +
+        `(${promptBytes} bytes) exceeds this platform's argv limit (~${argvLimit} bytes). ` +
+        `Narrow --loop-fixer-scope, lower --max-bytes, or use --loop-fixer codex.`
+      );
+    }
+    if (!cliUsableForReview(kind)) {
+      throw new Error(cliUnusableMessage(kind));
+    }
+  }
 
-  const child = spawn(cmd, args, {
+  // The fixer runs WITH WRITE ACCESS in the reviewed repository's directory, so
+  // this is the last place a bare name should survive: on Windows the current
+  // directory is searched first, and npx puts ./node_modules/.bin at the head of
+  // PATH everywhere. Resolve the fixer BEFORE building the command line — under
+  // unshare it ends up in unshare's arguments, where unshare does its own PATH
+  // lookup, so resolving only what spawn() receives would leave the real target
+  // bare one level in.
+  const fixerPath = resolveTrustedCommand(fixerCmd);
+  if (!fixerPath) {
+    throw new Error(
+      `Fixer command "${fixerCmd}" was not found on PATH outside the repository under review. ` +
+      `A repository must not supply the tool that edits it.`
+    );
+  }
+
+  const { cmd, args, useStdin } = buildFixerCmd(fixerCmd, constraint, { prompt, timeoutMs, fixerPath });
+
+  // `cmd` is the resolved fixer, or the sandbox wrapper when one is in use. The
+  // wrapper is a separate binary and gets its own resolution.
+  let spawnCmd = cmd;
+  if (cmd === "unshare") {
+    spawnCmd = resolveTrustedCommand("unshare");
+    if (!spawnCmd) {
+      throw new Error(
+        "The write sandbox helper \"unshare\" was not found on PATH outside the repository " +
+        "under review. Re-run with --loop-unsafe to proceed without it, or install " +
+        "util-linux system-wide."
+      );
+    }
+  }
+  // Route through buildSpawnTarget so a Windows .cmd shim reaches its interpreter.
+  const target = buildSpawnTarget(spawnCmd, args, { argsContainUntrusted: !useStdin });
+
+  const child = spawn(target.command, target.args, {
     cwd,
     stdio: ["pipe", "ignore", "pipe"],
-    detached: true // own process group for SIGKILL
+    shell: false,
+    windowsVerbatimArguments: target.windowsVerbatimArguments === true,
+    env: sanitizedSpawnEnv(),
+    detached: process.platform !== "win32" // own process group for the timeout kill
   });
 
   const stderrChunks = [];
   child.stderr?.on("data", chunk => stderrChunks.push(chunk));
 
   try {
-    child.stdin.write(prompt, "utf8");
+    // The argv-prompt fixer already HAS the prompt; writing it again would feed
+    // the whole fix instruction to a process that is not reading stdin.
+    if (useStdin) child.stdin.write(prompt, "utf8");
     child.stdin.end();
   } catch { /* fixer may not read stdin; that's OK */ }
 
@@ -502,7 +630,15 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
-      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+      // The fixer's own children (a CLI's model subprocess) outlive a bare
+      // process-group kill on Windows, which has no process groups at all —
+      // terminateProcessTree is the cross-platform tree kill.
+      // requireAlive:false is load-bearing. The default gates the kill on the
+      // LEADER being alive, and a fixer whose leader exits just before the
+      // timeout — while a worker still holds the pipes and keeps editing —
+      // probes as ESRCH, so no kill is attempted at all. Rollback would then
+      // race a live writer and recreate changes after the checkpoint restore.
+      try { terminateProcessTree(child.pid, { signal: "SIGKILL", requireAlive: false }); } catch {}
       const stderr = tailOf(Buffer.concat(stderrChunks).toString("utf8"), 2048);
       resolve({ timedOut: true, stderr });
     }, timeoutMs);
@@ -696,7 +832,7 @@ export async function runLoop(cwd, args) {
       );
       process.exit(1);
     }
-    const fixerProvider = FIXER_PROVIDER_MAP[fixerCmd];
+    const fixerProvider = FIXER_PROVIDER_MAP[fixerKind(fixerCmd)];
     if (!fixerProvider) {
       log.warn(
         "--loop-unsafe-allow-fix-secrets: cannot verify provider match for custom fixer — " +
@@ -721,7 +857,7 @@ export async function runLoop(cwd, args) {
 
   // Print loop header
   log.info(
-    `Loop: scope=working-tree, fixer=${fixerCmd}, sandbox=${constraint.mode}, ` +
+    `Loop: scope=working-tree, fixer=${fixerCmd}, write-confinement=none (mount-ns: ${constraint.mode}), ` +
     `max-iterations=${loopMax}`
   );
   log.step(
@@ -1225,7 +1361,7 @@ export async function runBranchLoop(cwd, args) {
       );
       process.exit(1);
     }
-    const fixerProvider = FIXER_PROVIDER_MAP[fixerCmd];
+    const fixerProvider = FIXER_PROVIDER_MAP[fixerKind(fixerCmd)];
     if (!fixerProvider) {
       log.warn("--loop-unsafe-allow-fix-secrets: cannot verify provider match for custom fixer — bypassing at your own risk.");
     } else {

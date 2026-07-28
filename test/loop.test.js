@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { log } from "../src/utils.js";
-import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
+import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, fixerKind, FIXER_PROVIDER_MAP, detectFixer } from "../src/loop.js";
 
 test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemini key", () => {
   assert.equal(FIXER_PROVIDER_MAP.agy, "gemini");
@@ -15,10 +15,99 @@ test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemi
   assert.equal(FIXER_PROVIDER_MAP.claude, "anthropic");
 });
 
-test("buildFixerCmd invokes agy with claude-style write args, not the generic stdin passthrough", () => {
-  const { cmd, args } = buildFixerCmd("agy", { mode: "none" });
+test("buildFixerCmd gives agy the fix prompt as the -p VALUE, never the stdin sentinel", () => {
+  // agy has no `-` stdin sentinel: `-p -` makes it answer the literal "-" and
+  // ignore the piped fix entirely, so the loop would report no-diff while the
+  // requested edit was never attempted. Same defect the review path had.
+  const { cmd, args, useStdin } = buildFixerCmd("agy", { mode: "none" }, {
+    prompt: "FIX-PROMPT-BODY",
+    timeoutMs: 600 * 1000
+  });
   assert.equal(cmd, "agy");
-  assert.deepEqual(args, ["--dangerously-skip-permissions", "-p", "-"]);
+  assert.deepEqual(args, [
+    "--dangerously-skip-permissions",
+    "--print-timeout", "600s",
+    "-p", "FIX-PROMPT-BODY"
+  ]);
+  assert.equal(useStdin, false, "the prompt is already in argv; stdin must not repeat it");
+  // Go's flag package stops at the first non-flag argument, so the prompt must
+  // stay last or --print-timeout would be silently dropped.
+  assert.equal(args.at(-1), "FIX-PROMPT-BODY");
+  assert.equal(args.at(-2), "-p");
+  assert.notEqual(args.at(-1), "-");
+});
+
+test("the unshare wrapper receives the fixer's ABSOLUTE path, never a bare name", () => {
+  // unshare performs its OWN PATH lookup on the command in its arguments. A bare
+  // name there is re-resolved against the inherited npx-style PATH, so a repo's
+  // ./node_modules/.bin/claude wins — the wrapper meant to contain the fixer
+  // becomes the thing that launches the repository's payload. Resolving only the
+  // command handed to spawn() does not cover this: the real target is one level in.
+  const abs = "/usr/local/bin/agy";
+  for (const mode of ["unshare", "unshare-user"]) {
+    const { cmd, args } = buildFixerCmd("agy", { mode }, {
+      prompt: "P", timeoutMs: 60_000, fixerPath: abs
+    });
+    assert.equal(cmd, "unshare");
+    assert.ok(args.includes(abs), `${mode}: the absolute fixer path must be in unshare's args`);
+    assert.ok(!args.includes("agy"), `${mode}: a bare fixer name must not survive`);
+    // unshare's own flags come first, then the fixer, then its args.
+    assert.ok(args.indexOf("--mount") < args.indexOf(abs));
+    assert.equal(args.at(-1), "P", "the prompt still has to be last");
+    assert.equal(args.at(-2), "-p");
+  }
+});
+
+test("a path-named fixer still gets its own calling convention", () => {
+  // Once --loop-fixer accepted a path, comparing the raw string to bare names
+  // sent "/opt/tools/agy" down the generic stdin branch — dropping
+  // --dangerously-skip-permissions, --print-timeout and the -p prompt, so the fix
+  // was never applied and the loop exited no-diff. Match on the basename.
+  const cases = [
+    ["/opt/tools/agy", "agy"],
+    ["C:\\tools\\agy.cmd", "agy"],
+    ["/opt/tools/claude", "claude"],
+    ["C:\\npm\\claude.CMD", "claude"],
+    ["/opt/tools/codex", "codex"],
+    ["/opt/tools/codex.exe", "codex"]
+  ];
+  for (const [named, expectedKind] of cases) {
+    assert.equal(fixerKind(named), expectedKind, `${named} must be recognised as ${expectedKind}`);
+    const { cmd, args, useStdin } = buildFixerCmd(named, { mode: "none" }, {
+      prompt: "FIXP", timeoutMs: 600 * 1000, fixerPath: named
+    });
+    assert.equal(cmd, named, "the resolved path is what gets spawned");
+    if (expectedKind === "agy") {
+      assert.equal(useStdin, false);
+      assert.ok(args.includes("--dangerously-skip-permissions"), `${named}: lost its write flag`);
+      assert.deepEqual(args.slice(-2), ["-p", "FIXP"], `${named}: lost its argv prompt`);
+      assert.ok(args.includes("--print-timeout"), `${named}: lost its print timeout`);
+    } else {
+      assert.equal(useStdin, true);
+      assert.equal(args.at(-1), "-", `${named}: lost its stdin sentinel`);
+      assert.notDeepEqual(args, ["-"], `${named}: fell through to the generic branch`);
+    }
+  }
+});
+
+test("the unresolved fixer name is only a fallback for direct invocation", () => {
+  // Without fixerPath the name passes through, which is what unit callers use;
+  // spawnFixer always supplies the resolved path.
+  const { cmd } = buildFixerCmd("agy", { mode: "none" }, { prompt: "P", timeoutMs: 60_000 });
+  assert.equal(cmd, "agy");
+  const { cmd: resolved } = buildFixerCmd("agy", { mode: "none" }, {
+    prompt: "P", timeoutMs: 60_000, fixerPath: "/usr/local/bin/agy"
+  });
+  assert.equal(resolved, "/usr/local/bin/agy");
+});
+
+test("buildFixerCmd still pipes claude and codex over stdin", () => {
+  for (const cli of ["claude", "codex"]) {
+    const { useStdin, args } = buildFixerCmd(cli, { mode: "none" }, { prompt: "P", timeoutMs: 60_000 });
+    assert.equal(useStdin, true, `${cli} reads the prompt from stdin`);
+    assert.equal(args.at(-1), "-", `${cli} keeps its stdin sentinel`);
+    assert.ok(!args.includes("P"), `${cli} must not get the prompt in argv`);
+  }
 });
 
 test("buildFixerCmd still routes truly-unknown custom CLIs through bare stdin", () => {

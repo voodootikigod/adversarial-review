@@ -1,6 +1,9 @@
 import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
+import { resolveTrustedGit } from "./trust-root.js";
+import { isPathInside } from "./path-containment.js";
+import { sanitizedSpawnEnv } from "./spawn-safe.js";
 
 const MAX_INLINE_FILE_BYTES = 256 * 1024;
 
@@ -10,12 +13,20 @@ const MAX_INLINE_FILE_BYTES = 256 * 1024;
 // genuine probes where a non-zero exit is an expected answer (e.g. "is there
 // an upstream?"), never for content collection.
 function git(cwd, gitArgs, { allowFail = false } = {}) {
+  // Absolute, trusted git only. A bare name is resolved from the CURRENT
+  // DIRECTORY on Windows, and our cwd is the repository under review.
+  //
+  // Resolved OUTSIDE the try on purpose: inside it, a refusal to run an
+  // untrusted git would be caught below and — on an allowFail probe — silently
+  // become an empty string, turning a security stop into missing review input.
+  const gitBin = resolveTrustedGit();
   try {
-    return execFileSync("git", gitArgs, {
+    return execFileSync(gitBin, gitArgs, {
       cwd,
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      env: sanitizedSpawnEnv()
     });
   } catch (err) {
     if (allowFail) return "";
@@ -39,8 +50,7 @@ function resolveCommit(cwd, ref, label = "ref") {
 }
 
 function isInsideDir(parent, child) {
-  const rel = path.relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return isPathInside(child, parent);
 }
 
 function section(title, body) {
@@ -225,7 +235,10 @@ export function collectReviewContext(
   let repoRoot;
   try {
     repoRoot = git(cwd, ["rev-parse", "--show-toplevel"]).trim();
-  } catch {
+  } catch (err) {
+    // A refusal to run an untrusted git is NOT "you are not in a repository" —
+    // reporting it that way hides a security decision behind a setup error.
+    if (err?.code === "EUNTRUSTEDGIT") throw err;
     throw new Error("Not inside a git repository.");
   }
 

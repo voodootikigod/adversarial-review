@@ -16,45 +16,84 @@
 import { spawnSync } from "child_process";
 import fs from "fs";
 import path from "path";
+import { isInsideTrustRoot, reviewTrustRoot } from "./trust-root.js";
+import { resolveCommand, sanitizePathEnv } from "./resolve-command.js";
+import { isPathInside } from "./path-containment.js";
 
-// Only bare command tokens are resolvable. A path separator or shell
-// metacharacter reaching a spawn site is a bug in the caller, not a lookup to
-// perform — rejecting it here keeps that from becoming an injection.
-const BARE_COMMAND = /^[A-Za-z0-9._-]+$/;
+// Re-exported: this was resolveCommand's original home, and callers import it here.
+export { resolveCommand };
 
 /**
- * Resolve a bare command name to an absolute executable path, or null.
+ * Resolve a command to a canonical absolute path OUTSIDE the repository under
+ * review, or null.
  *
- * The `platform`/`env` seam exists so the Windows PATHEXT behaviour is testable
- * on a POSIX machine; production callers pass neither.
+ * THE resolver for every child process this tool starts. A bare name is not a
+ * command, it is a lookup performed in an environment the reviewed repository can
+ * influence: Windows searches the current directory (the repo) before PATH, and
+ * npm/npx put ./node_modules/.bin at the front of PATH on every platform. Any
+ * spawn site that skips this — including probes, version checks, and helpers that
+ * "just" read a number — hands the repository a way to run code as the reviewer,
+ * usually before the sandbox meant to contain it exists.
  */
-export function resolveCommand(cmd, { platform = process.platform, env = process.env } = {}) {
-  if (typeof cmd !== "string" || !BARE_COMMAND.test(cmd)) return null;
+export function resolveTrustedCommand(cmd) {
+  const root = reviewTrustRoot();
 
-  const pathDirs = (env.PATH || "").split(path.delimiter).filter(Boolean);
-  // On Windows a bare name does not identify a file: `claude` is `claude.cmd`
-  // for anything installed by npm. Resolving the real filename ourselves is
-  // what lets us drop `shell: true`, which was only ever there to make the
-  // shell perform this lookup for us.
-  const extensions = platform === "win32"
-    ? (env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean).map((e) => e.toLowerCase())
-    : [""];
-
-  for (const dir of pathDirs) {
-    for (const ext of extensions) {
-      const file = ext && cmd.toLowerCase().endsWith(ext) ? cmd : `${cmd}${ext}`;
-      const candidate = path.join(dir, file);
-      try {
-        // On win32 the X_OK bit is not meaningful, so existence + regular file
-        // is the strongest check available there.
-        if (platform !== "win32") fs.accessSync(candidate, fs.constants.X_OK);
-        if (fs.statSync(candidate).isFile()) return path.resolve(candidate);
-      } catch {
-        // Not this candidate; keep looking.
-      }
+  // A user may name a CLI by PATH (`--loop-fixer /opt/tools/codex`). resolveCommand
+  // deliberately rejects anything non-bare — a path reaching the PATH walk is a
+  // caller bug — so such an input resolved to null and was reported as "not
+  // installed", which is both wrong and misleading. Handle it explicitly instead:
+  // it still has to exist, be a regular executable file, and canonicalize outside
+  // the repository, so naming a path buys no trust that a bare name would not get.
+  if (typeof cmd === "string" && (path.isAbsolute(cmd) || cmd.includes("/") || cmd.includes("\\"))) {
+    const real = realpathOrSelf(path.resolve(cmd));
+    try {
+      if (!fs.statSync(real).isFile()) return null;
+      if (process.platform !== "win32") fs.accessSync(real, fs.constants.X_OK);
+    } catch {
+      return null;
     }
+    return isPathInside(real, root) ? null : real;
   }
-  return null;
+
+  return resolveCommand(cmd, { excludeRoots: [root] });
+}
+
+/**
+ * The environment to hand every child process.
+ *
+ * Resolving the executable we spawn is not the end of the trust decision,
+ * because the thing we spawn does its OWN lookups from the environment it
+ * inherits. An npm `.cmd` wrapper falls back to a bare `node`; a POSIX script
+ * with `#!/usr/bin/env node` resolves its interpreter from PATH. Both would pick
+ * a repository-supplied runtime out of ./node_modules/.bin — a trusted wrapper
+ * executing untrusted code, before any plan/read-only flag applies.
+ *
+ * So the child gets a PATH with trust-root entries removed. On Windows it also
+ * gets NoDefaultCurrentDirectoryInExePath, which stops the command interpreter
+ * searching the current directory — the repository — ahead of PATH.
+ */
+export function sanitizedSpawnEnv(env = process.env) {
+  return sanitizePathEnv(env, reviewTrustRoot());
+}
+
+// Termination must never fail because the trust root is unavailable or poisoned
+// — a process would be left running. Fall back to the boundary-free environment
+// only for that path, where the command is an absolute System32 path with fixed
+// numeric arguments and performs no interpreter lookup.
+function safeSpawnEnvOrRaw() {
+  try {
+    return sanitizedSpawnEnv();
+  } catch {
+    return process.env;
+  }
+}
+
+function realpathOrSelf(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
 }
 
 // Windows batch shims (.cmd/.bat) are NOT executable images: CreateProcess
@@ -62,27 +101,26 @@ export function resolveCommand(cmd, { platform = process.platform, env = process
 // codex/claude/agy exactly that way, so the shim must be routed through
 // cmd.exe.
 //
-// IMPORTANT — THIS IS NOT ARGUMENT-SAFE, AND DOES NOT CLAIM TO BE.
-// An earlier revision asserted that passing an explicit argv array (rather than
-// shell:true) restored metacharacter safety. That is false: Node serializes
-// these args into a command line and cmd.exe re-parses everything after /c
-// under its own quoting rules. Using shell:false avoids Node's string-building,
-// not cmd.exe's parsing.
+// This interpreter route is NOT argument-safe. shell:false stops Node from
+// building a command string, but cmd.exe still re-parses everything after /c
+// under its own quoting rules, so an explicit argv array does not restore
+// metacharacter safety.
 //
-// So callers MUST NOT pass attacker-influenceable data as argv on this path.
-// The distinction is authorship, not quantity: our own invocation flags are
-// constants authored in this repository, while the reviewed prompt is untrusted
-// and travels over stdin on the primary path. Callers declare which they are
-// passing via `argsContainUntrusted`, and only the untrusted case is refused.
-//
-// An earlier revision refused ALL arguments, which rejected our own flags too
-// and broke every npm-installed CLI on Windows — worse than the unsafe
-// behaviour it replaced. Full Windows handling, including verifying any of this
-// on an actual Windows runner, is tracked in T19.
+// Callers therefore must not put attacker-influenceable data in argv on this
+// path. The distinction is authorship, not quantity: invocation flags are
+// constants authored in this repository, while the reviewed prompt is untrusted.
+// Callers declare which they are passing via `argsContainUntrusted`; only the
+// untrusted case is refused, so our own flags still reach npm-installed CLIs.
 //
 // `/d` skips AutoRun registry commands, `/s` fixes quote handling, `/c` runs and
-// exits. ComSpec is the documented interpreter location; SHELL is never used.
+// exits. The interpreter itself is chosen by interpreterPath below, which never
+// returns a bare name; SHELL is never used.
 const BATCH_EXTENSIONS = new Set([".cmd", ".bat"]);
+
+/** Is `resolvedPath` a Windows batch shim, i.e. reachable only through cmd.exe? */
+export function isWindowsBatchShim(resolvedPath, { platform = process.platform } = {}) {
+  return platform === "win32" && BATCH_EXTENSIONS.has(path.extname(String(resolvedPath)).toLowerCase());
+}
 
 export class WindowsArgvUnsafeError extends Error {
   constructor(message) {
@@ -92,51 +130,181 @@ export class WindowsArgvUnsafeError extends Error {
   }
 }
 
-// What may cross a cmd.exe command line. Our own invocation flags are authored
-// here and contain none of it; the reviewed prompt is the untrusted value, and
-// on the primary path it travels over stdin, which cmd.exe never parses.
-const CMD_METACHARACTERS = /[&|<>^"%!()]/;
+// Last-resort interpreter location, used when the environment supplies nothing
+// trustworthy. A literal, not a default parameter, so no env value can shadow it.
+const DEFAULT_SYSTEM_ROOT = "C:\\Windows";
+
+// The command interpreter must be an ABSOLUTE, trusted path, for exactly the
+// reason taskkillPath below is: Windows resolves an unqualified executable name
+// against the CURRENT DIRECTORY before the system directories, and our current
+// directory is the untrusted repository under review. A bare "cmd.exe" would let
+// a repo that ships cmd.exe run as the reviewer — and it would run BEFORE the
+// trusted CLI it was supposed to launch, so resolving the CLI safely buys
+// nothing.
+//
+// EVERY candidate is validated the same way, including the SystemRoot-derived
+// one: a relative SystemRoot ("." or "tools") yields a relative command that
+// Windows resolves from the repository, and an absolute SystemRoot can still
+// point INTO it. Validating only ComSpec would leave that path wide open.
+// Candidates are tried in order of specificity and the first trusted one wins;
+// if none is trustworthy we fail closed rather than guess.
+//
+// Reached only from the win32 branch, so Windows path semantics apply even when
+// this runs on a POSIX host under the `platform` test seam — path.join would
+// otherwise emit "C:\Windows/System32/cmd.exe", which path.isAbsolute rejects.
+// Default containment check for an interpreter candidate. On a non-Windows host
+// this is always false, and deliberately so: the trust root is a POSIX path, a
+// Windows path can never be inside it, and handing "C:\Windows\..." to the POSIX
+// resolver would treat it as a RELATIVE name and resolve it against the cwd —
+// the repository — refusing every interpreter on a false positive. The real
+// containment check runs where it means something, and the `isInsideRoot` seam
+// exercises the refusal path everywhere else.
+function interpreterInsideTrustRoot(candidate) {
+  if (process.platform !== "win32") return false;
+  return isInsideTrustRoot(candidate);
+}
+
+export function interpreterPath(env = process.env, { isInsideRoot = interpreterInsideTrustRoot } = {}) {
+  const configuredRoot = env.SystemRoot || env.SYSTEMROOT;
+  const candidates = [
+    env.ComSpec || env.COMSPEC,
+    configuredRoot ? path.win32.join(configuredRoot, "System32", "cmd.exe") : null,
+    path.win32.join(DEFAULT_SYSTEM_ROOT, "System32", "cmd.exe")
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate || !path.win32.isAbsolute(candidate)) continue;
+    let inside;
+    try {
+      inside = isInsideRoot(candidate);
+    } catch {
+      // A trust root that cannot be established is not a licence to trust the
+      // value — treat the candidate as untrusted and move on.
+      inside = true;
+    }
+    if (!inside) return candidate;
+  }
+
+  throw new WindowsArgvUnsafeError(
+    "Refusing to launch the Windows command interpreter: no absolute interpreter path outside " +
+    "the repository under review could be established. Check ComSpec and SystemRoot — a relative " +
+    "value, or one pointing inside the repository, lets the reviewed code run as the reviewer."
+  );
+}
+
+// What may cross a cmd.exe command line, for a token that is ALWAYS quoted.
+//
+// Quoting neutralizes the separators and redirections (& | < > ^) and block
+// syntax (parentheses) — they are literal inside a quoted token. Three things
+// survive quoting and so remain refused: the quote character itself (it ends the
+// token), % (variable expansion happens inside quotes), and ! (delayed expansion
+// when it is enabled). Control characters go too: CR and LF END a command to
+// cmd.exe, so an argument containing one starts another command outright.
+//
+// One policy now covers the shim path and the arguments, because both are quoted
+// the same way. Splitting them was what rejected "C:\\Program Files (x86)" and,
+// on the argument side, Codex's own --output-last-message path under a TEMP
+// directory like "C:\\Users\\Jane (Work)\\AppData\\Local\\Temp".
+const CMD_UNSAFE_IN_QUOTES = /["%!]|[\x00-\x1f\x7f]/;
+
+// Quote one token of a cmd.exe command string. EVERY token is quoted, not just
+// the ones containing spaces: the quoting is what makes the permitted characters
+// (& | < > ^ parentheses) literal, so a token that skipped it would be parsed as
+// command syntax. Nothing reaching here contains a quote or a control character —
+// the guard above has already run — so wrapping is sufficient with no escaping.
+function quoteForCmd(token) {
+  return `"${token}"`;
+}
 
 export function buildSpawnTarget(
   resolvedPath,
   args = [],
-  { platform = process.platform, env = process.env, argsContainUntrusted = true } = {}
+  // isInsideRoot is a seam so the ComSpec trust decision is testable without a
+  // real Windows repository; production callers pass none of these.
+  { platform = process.platform, env = process.env, argsContainUntrusted = true, isInsideRoot = interpreterInsideTrustRoot } = {}
 ) {
-  if (platform === "win32" && BATCH_EXTENSIONS.has(path.extname(resolvedPath).toLowerCase())) {
+  if (isWindowsBatchShim(resolvedPath, { platform })) {
     // Refuse only when a caller wants to put ATTACKER-INFLUENCEABLE data on the
-    // command line — that is the argv fallback, which embeds the whole prompt.
+    // command line — the argv prompt form, which embeds the whole reviewed diff.
     // Refusing every argument instead would reject our own constant flags and
-    // break every npm-installed CLI on Windows, which is worse than the unsafe
-    // behaviour it replaced.
+    // break every npm-installed CLI on Windows.
     if (argsContainUntrusted && args.length > 0) {
       throw new WindowsArgvUnsafeError(
         `Cannot safely pass untrusted arguments to the Windows batch shim "${resolvedPath}": ` +
-        `cmd.exe re-parses them and this path is not argument-safe. ` +
-        `The prompt must travel over stdin. Tracked in T19.`
+        `cmd.exe re-parses them, so the reviewed diff could execute as commands. ` +
+        `Use a provider whose prompt travels over stdin (claude, codex), an API provider, ` +
+        `or install this CLI as a native executable rather than an npm .cmd shim.`
       );
     }
-    // Belt and braces: even "trusted" flags must be metacharacter-free, so a
-    // future edit to the flag builders cannot quietly reintroduce the hole.
-    const offender = args.find((a) => CMD_METACHARACTERS.test(String(a)));
+    // The shim path and every argument land on the same command line after /c and
+    // are quoted the same way, so one policy governs both. Checked separately only
+    // to report the right remedy: a bad path is where the CLI is installed, a bad
+    // argument is something we generated.
+    if (CMD_UNSAFE_IN_QUOTES.test(resolvedPath)) {
+      throw new WindowsArgvUnsafeError(
+        `Cannot launch the Windows batch shim "${resolvedPath}" through cmd.exe: its path ` +
+        `contains a quote, %, !, or a control character, which survive quoting and are read ` +
+        `as command syntax. Install this CLI under a path without them, install it as a ` +
+        `native executable rather than an npm .cmd shim, or use an API provider.`
+      );
+    }
+    // Belt and braces: a future edit to the flag builders must not be able to
+    // reintroduce the hole just by declaring its arguments trusted.
+    const offender = args.find((a) => CMD_UNSAFE_IN_QUOTES.test(String(a)));
     if (offender !== undefined) {
       throw new WindowsArgvUnsafeError(
         `Refusing to pass argument ${JSON.stringify(offender)} to the Windows batch shim ` +
-        `"${resolvedPath}": it contains cmd.exe metacharacters. Tracked in T19.`
+        `"${resolvedPath}": it contains a quote, %, !, or a control character, which survive ` +
+        `cmd.exe quoting.`
       );
     }
-    const comspec = env.ComSpec || env.COMSPEC || "cmd.exe";
-    return { command: comspec, args: ["/d", "/s", "/c", resolvedPath, ...args], viaInterpreter: true };
+    // `/s` removes the FIRST and LAST quote of the string following `/c`. Passing
+    // the path and flags as separate Node arguments produces exactly one quote
+    // pair — the one around the path — so /s strips it and cmd.exe then splits
+    // "C:\Program Files (x86)\...\claude.cmd" at the first space and tries to run
+    // "C:\Program". The fix is the outer pair cmd.exe expects to consume: build
+    // the command string ourselves, wrap the whole thing in quotes, and pass it
+    // verbatim so Node does not re-escape our quoting. This is the same shape
+    // Node itself uses for shell:true on Windows.
+    const command = [resolvedPath, ...args.map(String)].map(quoteForCmd).join(" ");
+    return {
+      command: interpreterPath(env, { isInsideRoot }),
+      args: ["/d", "/s", "/c", `"${command}"`],
+      viaInterpreter: true,
+      // Node must not requote: it would backslash-escape the quotes above.
+      windowsVerbatimArguments: true
+    };
   }
   return { command: resolvedPath, args, viaInterpreter: false };
 }
 
-// taskkill must be an ABSOLUTE path. Windows resolves a bare executable name
-// against the CURRENT DIRECTORY before PATH, and our current directory is the
-// untrusted repository under review — so a repo shipping taskkill.exe would be
-// executed with the reviewer's privileges the moment a guard fired.
-function taskkillPath(env = process.env) {
-  const root = env.SystemRoot || env.SYSTEMROOT || "C:\\Windows";
-  return path.join(root, "System32", "taskkill.exe");
+// taskkill must be an ABSOLUTE, TRUSTED path, for the same reason the command
+// interpreter must be: Windows resolves a bare executable name against the
+// CURRENT DIRECTORY before PATH, and our current directory is the untrusted
+// repository under review — so a repo shipping taskkill.exe would be executed
+// with the reviewer's privileges the moment a guard fired.
+//
+// SystemRoot is an environment value and gets the same validation as ComSpec: a
+// relative value ('.') resolves inside the repository, and an absolute one can
+// point into it. Returns null when no trusted taskkill can be established;
+// callers fall back to direct process termination rather than guess.
+export function taskkillPath(env = process.env, { isInsideRoot = interpreterInsideTrustRoot } = {}) {
+  const configuredRoot = env.SystemRoot || env.SYSTEMROOT;
+  const candidates = [
+    configuredRoot ? path.win32.join(configuredRoot, "System32", "taskkill.exe") : null,
+    path.win32.join(DEFAULT_SYSTEM_ROOT, "System32", "taskkill.exe")
+  ];
+  for (const candidate of candidates) {
+    if (!candidate || !path.win32.isAbsolute(candidate)) continue;
+    let inside;
+    try {
+      inside = isInsideRoot(candidate);
+    } catch {
+      inside = true;
+    }
+    if (!inside) return candidate;
+  }
+  return null;
 }
 
 /**
@@ -160,13 +328,16 @@ export function isPidAlive(pid, killImpl = process.kill.bind(process)) {
 }
 
 // Minimal spawnSync wrapper used only for taskkill. shell:false unconditionally
-// — never selected from the environment.
+// — never selected from the environment. The sanitized env applies here too: it
+// costs nothing, and exempting "just this one" spawn is how the previous three
+// gaps in this class started.
 function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
     encoding: "utf8",
     stdio: "pipe",
     shell: false,
     windowsHide: true,
+    env: options.env ?? safeSpawnEnvOrRaw(),
     ...options
   });
   return {
@@ -211,7 +382,19 @@ export function terminateProcessTree(pid, options = {}) {
   }
 
   if (platform === "win32") {
-    const result = runCommandImpl(taskkillPath(options.env), ["/PID", String(pid), "/T", "/F"]);
+    const taskkill = taskkillPath(options.env, options.isInsideRoot ? { isInsideRoot: options.isInsideRoot } : {});
+    // No trusted taskkill means no tree kill — terminate the process directly
+    // rather than run whatever the repository happens to have put there.
+    if (!taskkill) {
+      try {
+        killImpl(pid, signal);
+        return { attempted: true, delivered: true, method: "kill" };
+      } catch (error) {
+        if (error?.code === "ESRCH") return { attempted: true, delivered: false, method: "kill" };
+        throw error;
+      }
+    }
+    const result = runCommandImpl(taskkill, ["/PID", String(pid), "/T", "/F"]);
     if (!result.error && result.status === 0) {
       return { attempted: true, delivered: true, method: "taskkill" };
     }

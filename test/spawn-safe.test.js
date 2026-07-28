@@ -164,7 +164,37 @@ test("T12: Windows .cmd/.bat shims are run through the interpreter, not spawned 
   });
   assert.equal(t.viaInterpreter, true);
   assert.equal(t.command, "C:\\Windows\\System32\\cmd.exe");
-  assert.deepEqual(t.args, ["/d", "/s", "/c", "C:\\npm\\claude.cmd"]);
+  // The command string carries its OWN outer quote pair for /s to strip, so the
+  // quotes around the shim path survive. See the /s note in buildSpawnTarget.
+  assert.deepEqual(t.args, ["/d", "/s", "/c", '""C:\\npm\\claude.cmd""']);
+  assert.equal(t.windowsVerbatimArguments, true, "Node must not re-escape our quoting");
+});
+
+test("cmd.exe /s cannot strip the quotes that protect a spaced shim path", () => {
+  // /s removes the FIRST and LAST quote after /c. With one quote pair — the one
+  // Node would add around the path — that pair IS the one stripped, and cmd.exe
+  // then runs "C:\Program". The outer pair is what makes the inner one survive.
+  const shim = "C:\\Program Files (x86)\\nodejs\\node_modules\\.bin\\claude.cmd";
+  const t = buildSpawnTarget(shim, ["--permission-mode", "plan", "-p", "-"], {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    argsContainUntrusted: false,
+    isInsideRoot: () => false
+  });
+  const commandString = t.args[3];
+  assert.equal(t.args.slice(0, 3).join(" "), "/d /s /c");
+  assert.ok(commandString.startsWith('""'), `must open with an outer quote: ${commandString}`);
+  assert.ok(commandString.endsWith('"'), `must close with an outer quote: ${commandString}`);
+
+  // Simulate what cmd.exe /s does: drop the first and last quote characters.
+  const first = commandString.indexOf('"');
+  const last = commandString.lastIndexOf('"');
+  const afterStripping = commandString.slice(0, first) + commandString.slice(first + 1, last) + commandString.slice(last + 1);
+  assert.equal(
+    afterStripping,
+    `"${shim}" "--permission-mode" "plan" "-p" "-"`,
+    "after /s stripping the shim path must still be quoted"
+  );
 });
 
 test("T12: a real .exe and any POSIX binary are spawned directly", () => {
@@ -251,8 +281,219 @@ test("T12: a Windows batch shim REFUSES extra argv rather than building an unsaf
       platform: "win32",
       env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }
     }),
-    (e) => e.code === "EWINARGV" && /not argument-safe/.test(e.message)
+    (e) => e.code === "EWINARGV" && /cmd\.exe re-parses them/.test(e.message)
   );
+});
+
+test("the Windows interpreter is never a bare name, whatever ComSpec says", () => {
+  // Windows resolves an unqualified executable name against the CURRENT
+  // DIRECTORY before the system directories, and the current directory is the
+  // repository under review. A bare "cmd.exe" would run a repo-supplied
+  // cmd.exe as the reviewer, BEFORE the trusted CLI it was meant to launch.
+  const shim = "C:\\npm\\claude.cmd";
+  const flags = ["-p", "-"];
+  const opts = { platform: "win32", argsContainUntrusted: false };
+
+  // ComSpec absent entirely — the case a sanitized launcher or CI env produces.
+  const bare = buildSpawnTarget(shim, flags, { ...opts, env: {} });
+  assert.ok(path.win32.isAbsolute(bare.command), `interpreter must be absolute, got ${bare.command}`);
+  assert.match(bare.command, /System32[\\/]cmd\.exe$/i);
+
+  // SystemRoot is honoured for the system path.
+  const rooted = buildSpawnTarget(shim, flags, { ...opts, env: { SystemRoot: "D:\\Win" } });
+  assert.equal(rooted.command, path.win32.join("D:\\Win", "System32", "cmd.exe"));
+
+  // A RELATIVE ComSpec is exactly the hijack vector; it must be ignored.
+  for (const bad of ["cmd.exe", ".\\cmd.exe", "tools\\cmd.exe"]) {
+    const t = buildSpawnTarget(shim, flags, { ...opts, env: { ComSpec: bad } });
+    assert.ok(path.win32.isAbsolute(t.command), `relative ComSpec ${bad} must not be used`);
+    assert.match(t.command, /System32[\\/]cmd\.exe$/i);
+  }
+
+  // An absolute ComSpec outside the trust root is legitimate and honoured.
+  // isInsideRoot is injected: the real check resolves a Windows path against the
+  // POSIX cwd on this host, which would place it inside the repo spuriously.
+  const custom = buildSpawnTarget(shim, flags, {
+    ...opts, env: { ComSpec: "C:\\Windows\\SysWOW64\\cmd.exe" }, isInsideRoot: () => false
+  });
+  assert.equal(custom.command, "C:\\Windows\\SysWOW64\\cmd.exe");
+});
+
+test("an absolute ComSpec INSIDE the reviewed repository is refused", () => {
+  // A repo cannot be allowed to point the interpreter at itself just by being
+  // absolute — trust is about location, not path shape.
+  const insideRepo = "C:\\repo\\node_modules\\.bin\\cmd.exe";
+  const t = buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "-"], {
+    platform: "win32",
+    env: { ComSpec: insideRepo, SystemRoot: "C:\\Windows" },
+    argsContainUntrusted: false,
+    isInsideRoot: (p) => p === insideRepo
+  });
+  assert.equal(t.command, "C:\\Windows\\System32\\cmd.exe");
+
+  // And if the trust root cannot be established at all, EVERY candidate is
+  // untrusted — including the system fallback — so this fails closed rather than
+  // waving one through. A guess here would be the whole vulnerability.
+  assert.throws(
+    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "-"], {
+      platform: "win32",
+      env: { ComSpec: "C:\\anywhere\\cmd.exe", SystemRoot: "C:\\Windows" },
+      argsContainUntrusted: false,
+      isInsideRoot: () => { throw new Error("no trust root"); }
+    }),
+    (err) => err.code === "EWINARGV"
+  );
+});
+
+test("the SystemRoot fallback is validated exactly like ComSpec", () => {
+  // Validating only ComSpec leaves the fallback as the hijack vector: a relative
+  // SystemRoot yields a relative command that Windows resolves from the reviewed
+  // repository, and an absolute one can still point into it.
+  const shim = "C:\\npm\\claude.cmd";
+  const flags = ["-p", "-"];
+  const base = { platform: "win32", argsContainUntrusted: false, isInsideRoot: () => false };
+
+  for (const bad of [".", "tools", "..\\win"]) {
+    const t = buildSpawnTarget(shim, flags, { ...base, env: { SystemRoot: bad } });
+    assert.ok(path.win32.isAbsolute(t.command), `relative SystemRoot ${bad} must not be used`);
+    assert.equal(t.command, "C:\\Windows\\System32\\cmd.exe", "must fall back to the literal system root");
+  }
+
+  // An absolute SystemRoot pointing INSIDE the repository is refused too, and the
+  // literal default is used instead.
+  const repoRoot = "C:\\repo\\fake";
+  const inside = buildSpawnTarget(shim, flags, {
+    ...base,
+    env: { SystemRoot: repoRoot },
+    isInsideRoot: (p) => p.startsWith(repoRoot)
+  });
+  assert.equal(inside.command, "C:\\Windows\\System32\\cmd.exe");
+});
+
+test("no trustworthy interpreter at all fails closed", () => {
+  // If even the literal system root is inside the trust root there is nothing
+  // safe left to launch, and guessing would be the whole vulnerability.
+  assert.throws(
+    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["-p", "-"], {
+      platform: "win32",
+      env: { ComSpec: "cmd.exe", SystemRoot: "." },
+      argsContainUntrusted: false,
+      isInsideRoot: () => true
+    }),
+    (err) => {
+      assert.equal(err.code, "EWINARGV");
+      assert.match(err.message, /ComSpec and SystemRoot/);
+      return true;
+    }
+  );
+});
+
+test("characters that survive cmd.exe quoting are rejected in trusted flags", () => {
+  // Every token is quoted, which makes & | < > ^ and parentheses literal. What
+  // quoting does NOT stop: a quote (it ends the token), % (variable expansion
+  // happens inside quotes), ! (delayed expansion), and CR/LF, which END the
+  // command outright — `--flag\ncalc.exe` would run calc.exe.
+  for (const payload of ["a\ncalc.exe", "a\r\ncalc.exe", "a\rb", "a\tb", "a\u0000b", 'a"b', "a%PATH%b", "a!x!b"]) {
+    assert.throws(
+      () => buildSpawnTarget("C:\\npm\\claude.cmd", ["--flag", payload], {
+        platform: "win32",
+        env: { SystemRoot: "C:\\Windows" },
+        argsContainUntrusted: false,
+        isInsideRoot: () => false
+      }),
+      (err) => err.code === "EWINARGV",
+      `${JSON.stringify(payload)} must be refused`
+    );
+  }
+  // Ordinary flags still pass — the guard must not break real invocations.
+  const ok = buildSpawnTarget("C:\\npm\\claude.cmd", ["--permission-mode", "plan", "-p", "-"], {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    argsContainUntrusted: false,
+    isInsideRoot: () => false
+  });
+  assert.equal(ok.viaInterpreter, true);
+});
+
+test("a shim PATH containing cmd.exe syntax is refused, not silently mangled", () => {
+  // The shim path lands on the command line right after /c, so it is parsed
+  // exactly like the flags are. Windows allows & ^ % ! ( ) in paths, so a global
+  // npm prefix under a username like "R&D" would otherwise split the command.
+  const base = {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    argsContainUntrusted: false,
+    isInsideRoot: () => false
+  };
+  for (const bad of [
+    "C:\\tools\\100%\\claude.cmd",
+    "C:\\tools\\a!x!b\\claude.cmd",
+    "C:\\tools\\a\nb\\claude.cmd",
+    "C:\\tools\\a\rb\\claude.cmd"
+  ]) {
+    assert.throws(
+      () => buildSpawnTarget(bad, ["-p", "-"], base),
+      (err) => {
+        assert.equal(err.code, "EWINARGV");
+        assert.match(err.message, /native executable|API provider/, "must name a remedy");
+        return true;
+      },
+      `${bad} must be refused rather than handed to cmd.exe`
+    );
+  }
+  // Quoting makes these literal, so they must NOT be refused:
+  // "C:\Program Files (x86)" is where 32-bit npm installs live, and a username
+  // like "R&D" is perfectly legal. Refusing them rejects standard installations.
+  for (const legit of [
+    "C:\\Program Files (x86)\\nodejs\\node_modules\\.bin\\claude.cmd",
+    "C:\\Users\\R&D\\AppData\\Roaming\\npm\\claude.cmd",
+    "C:\\tools\\a^b\\claude.cmd",
+    "C:\\Users\\dev\\AppData\\Roaming\\npm\\claude.cmd"
+  ]) {
+    const ok = buildSpawnTarget(legit, ["-p", "-"], base);
+    assert.equal(ok.viaInterpreter, true, `${legit} must remain launchable`);
+    assert.ok(ok.args[3].includes(`"${legit}"`), `the shim path must stay quoted: ${ok.args[3]}`);
+  }
+  // The same policy governs ARGUMENTS, because they are quoted the same way.
+  // Codex passes its own --output-last-message path, so a TEMP directory like
+  // "C:\Users\Jane (Work)\AppData\Local\Temp" must not make the provider
+  // unusable — that was the regression a path-only exemption introduced.
+  const codexShaped = buildSpawnTarget("C:\\npm\\codex.cmd", [
+    "exec", "--sandbox", "read-only",
+    "--output-last-message", "C:\\Users\\Jane (Work)\\AppData\\Local\\Temp\\out.txt"
+  ], base);
+  assert.equal(codexShaped.viaInterpreter, true);
+  assert.ok(codexShaped.args[3].includes('"C:\\Users\\Jane (Work)\\AppData\\Local\\Temp\\out.txt"'));
+});
+
+test("taskkill is validated like the interpreter, and falls back to a direct kill", () => {
+  // This branch only became reachable on Windows when CLI execution moved to
+  // spawnWithWatchdog, and it had the same unvalidated-SystemRoot defect the
+  // interpreter fix closed: a relative SystemRoot resolves inside the repository.
+  const runs = [];
+  const runCommandImpl = (cmd, args) => { runs.push({ cmd, args }); return { status: 0, error: null, stdout: "", stderr: "" }; };
+
+  const rel = terminateProcessTree(777, {
+    platform: "win32", killImpl: () => {}, runCommandImpl, env: { SystemRoot: "." }
+  });
+  assert.equal(rel.method, "taskkill");
+  assert.ok(path.win32.isAbsolute(runs[0].cmd), `relative SystemRoot must not be used: ${runs[0].cmd}`);
+  assert.match(runs[0].cmd, /System32[\\/]taskkill\.exe$/i);
+
+  // Nothing trustworthy at all: kill the process directly rather than run
+  // whatever the repository happens to have placed there.
+  const killed = [];
+  const res = terminateProcessTree(778, {
+    platform: "win32",
+    killImpl: (pid, sig) => killed.push([pid, sig]),
+    runCommandImpl: () => { throw new Error("must not run an untrusted taskkill"); },
+    env: { SystemRoot: "." },
+    isInsideRoot: () => true
+  });
+  assert.equal(res.method, "kill");
+  assert.equal(res.delivered, true);
+  assert.deepEqual(killed[0], [778, 0], "liveness probe first");
+  assert.ok(killed.some(([p, s]) => p === 778 && s === "SIGTERM"), "then a direct terminate");
 });
 
 test("T12: every supported CLI's PRIMARY invocation still works on a Windows shim", () => {
@@ -272,7 +513,8 @@ test("T12: every supported CLI's PRIMARY invocation still works on a Windows shi
     });
     assert.equal(t.viaInterpreter, true);
     assert.deepEqual(t.args.slice(0, 3), ["/d", "/s", "/c"]);
-    assert.ok(t.args.includes(`C:\\npm\\${cli}.cmd`));
+    assert.ok(t.args[3].includes(`"C:\\npm\\${cli}.cmd"`), `shim path must be quoted: ${t.args[3]}`);
+    for (const flag of flags) assert.ok(t.args[3].includes(flag), `${flag} must reach cmd.exe`);
   }
 });
 
@@ -280,9 +522,9 @@ test("T12: trusted flags are still rejected if they ever gain cmd metacharacters
   // Defence in depth: a future edit to the flag builders must not be able to
   // reintroduce the hole just by declaring its arguments trusted.
   assert.throws(
-    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["--flag", "a&b"], {
+    () => buildSpawnTarget("C:\\npm\\claude.cmd", ["--flag", "a%PATH%b"], {
       platform: "win32", env: {}, argsContainUntrusted: false
     }),
-    (e) => e.code === "EWINARGV" && /metacharacters/.test(e.message)
+    (e) => e.code === "EWINARGV" && /survive cmd\.exe quoting/.test(e.message)
   );
 });
