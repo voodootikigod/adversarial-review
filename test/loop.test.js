@@ -413,7 +413,7 @@ test("T44: probeOsConstraint permits --loop on Linux when bwrap is active withou
 });
 
 test("T44: buildFixerCmd wraps command with bwrap when mode is bwrap", () => {
-  const targetDir = path.resolve("/tmp/test-workspace");
+  const targetDir = process.cwd();
   const { cmd, args, useStdin } = buildFixerCmd("agy", { mode: "bwrap" }, {
     prompt: "P",
     timeoutMs: 60_000,
@@ -465,3 +465,22 @@ try {
   }
 });
 
+test("T44: buildFixerCmd refuses bwrap binding if target directory canonicalizes outside repo trust root", () => {
+  const outsideDir = os.homedir();
+  assert.throws(() => {
+    buildFixerCmd("agy", { mode: "bwrap" }, {
+      prompt: "P",
+      timeoutMs: 60_000,
+      fixerPath: "/usr/local/bin/agy",
+      cwd: outsideDir
+    });
+  }, /outside the repository trust root/i);
+});
+
+test("T44: getFixFiles resolves tracked files from repo root when cwd is nested", () => {
+  const repoRoot = process.cwd();
+  const nestedCwd = path.join(repoRoot, "src");
+  const findings = [{ file: "src/loop.js" }];
+  const files = getFixFiles(nestedCwd, findings, { loopFixerScope: "sc2" });
+  assert.deepEqual(files, ["src/loop.js"]);
+});

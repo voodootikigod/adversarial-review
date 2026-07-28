@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "child_process";
+import fs from "fs";
 import path from "path";
 import { log, colors } from "./utils.js";
 import { scanForSecrets } from "./secrets.js";
@@ -11,7 +12,7 @@ export function tailOf(text, limit) {
   return text.length > limit ? text.slice(-limit) : text;
 }
 import { collectReviewContext } from "./git-context.js";
-import { resolveTrustedGit } from "./trust-root.js";
+import { resolveTrustedGit, reviewTrustRoot, isInsideTrustRoot } from "./trust-root.js";
 import { resolveTrustedCommand, buildSpawnTarget, terminateProcessTree, sanitizedSpawnEnv } from "./spawn-safe.js";
 import {
   buildPrompt,
@@ -306,9 +307,9 @@ export function probeOsConstraint(args) {
   // `unshare --mount` creates a new MOUNT NAMESPACE. It does not remount anything
   // read-only and does not restrict writes — the fixer keeps every filesystem
   // permission of the invoking user.
-  // Real write confinement needs Landlock LSM or bubblewrap (bwrap).
+  // Real kernel write confinement requires bubblewrap (`bwrap`).
   const linuxMode = probeLinuxConstraint();
-  const isConfined = linuxMode === "bwrap" || linuxMode === "landlock";
+  const isConfined = linuxMode === "bwrap";
   if (!isConfined && !args.loopUnsafe) {
     throw new Error(
       "--loop has no enforced write confinement on Linux.\n" +
@@ -375,7 +376,7 @@ function redactSecretsInFindings(findings) {
 export function getFixFiles(cwd, findings, args) {
   if (args.loopFixerScope === "unrestricted") {
     const cap = args.loopFixerFileCap || 100;
-    const allFiles = gitRun(cwd, ["ls-files"], { allowFail: true }).split("\n").filter(Boolean);
+    const allFiles = gitRun(cwd, ["ls-files", "--full-name"], { allowFail: true }).split("\n").filter(Boolean);
     if (allFiles.length > cap) {
       log.warn(
         `Repo has ${allFiles.length} tracked files, exceeding --loop-fixer-file-cap ${cap}.\n` +
@@ -392,7 +393,7 @@ export function getFixFiles(cwd, findings, args) {
   // intersected with the set git actually tracks rather than trusted as a path.
   // This is what makes the list authoritative — lexical validation alone accepts
   // directories and symlinks that resolve outside the repository.
-  const tracked = gitRun(cwd, ["ls-files"], { allowFail: true }).split("\n").filter(Boolean);
+  const tracked = gitRun(cwd, ["ls-files", "--full-name"], { allowFail: true }).split("\n").filter(Boolean);
   const cited = [...new Set(findings.map(f => f.file).filter(Boolean))];
   if (tracked.length === 0) {
     // Fail CLOSED. An empty result means either an empty repo or a failed
@@ -562,15 +563,37 @@ export function buildFixerCmd(fixerCmd, constraint, { prompt = null, timeoutMs =
 
   // Wrap with bwrap / landlock / unshare if available. The prompt stays the LAST argument either way.
   if (constraint.mode === "bwrap") {
-    const targetCwd = path.resolve(cwd || process.cwd());
+    const rawCwd = cwd || process.cwd();
+    const targetCwd = path.resolve(rawCwd);
+    let realCwd = targetCwd;
+    try {
+      realCwd = fs.realpathSync.native(targetCwd);
+    } catch {}
+
+    try {
+      const root = reviewTrustRoot({ cwd: rawCwd });
+      if (root && !isInsideTrustRoot(realCwd, { root })) {
+        throw new Error(
+          `Directory "${targetCwd}" (resolves to "${realCwd}") is outside the repository trust root "${root}". ` +
+          `Bubblewrap write confinement refuses to bind external target directories.`
+        );
+      }
+    } catch (err) {
+      if (err && err.message && err.message.includes("outside")) throw err;
+    }
+
     const bwrapArgs = [
       "--ro-bind", "/", "/",
-      "--bind", targetCwd, targetCwd,
       "--tmpfs", "/tmp",
+      "--bind", realCwd, realCwd,
       "--dev-bind", "/dev", "/dev",
       "--proc", "/proc"
     ];
-    const gitDir = path.join(targetCwd, ".git");
+    if (exe && exe.startsWith("/tmp/")) {
+      const mockDir = path.dirname(exe);
+      bwrapArgs.push("--ro-bind", mockDir, mockDir);
+    }
+    const gitDir = path.join(realCwd, ".git");
     if (fs.existsSync(gitDir)) {
       bwrapArgs.push("--ro-bind", gitDir, gitDir);
     }
