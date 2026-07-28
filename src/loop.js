@@ -709,8 +709,10 @@ export async function runProviderRound(providers, context, prompt, args, reviewF
     }
   }
 
+  const providerModes = new Map();
   for (const pp of perProvider) {
     const cfg = byId.get(pp.provider);
+    if (cfg) providerModes.set(pp.provider, cfg.provider);
     pp.assessments = assessFindings(pp.result, context, { apiMode: cfg.provider !== "cli" });
   }
 
@@ -719,7 +721,8 @@ export async function runProviderRound(providers, context, prompt, args, reviewF
     minConfidence: args.minConfidence
   });
   const mergedAssessments = assessFindings(merged, context, {
-    apiMode: perProvider.some((pp) => byId.get(pp.provider).provider !== "cli")
+    apiMode: perProvider.some((pp) => byId.get(pp.provider).provider !== "cli"),
+    providerModes
   });
   const derived = deriveQuorumVerdict(perProvider, {
     failOn: args.failOn,
