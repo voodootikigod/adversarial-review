@@ -205,7 +205,12 @@ function collapseWhitespace(s) {
 export function assessFindings(result, context, { apiMode = true, cwd = process.cwd() } = {}) {
   const changed = new Set((context.changedFiles || []).map(normalizePath));
   const rawContent = context.content || "";
-  const trustRoot = path.resolve(reviewTrustRoot({ cwd }) || cwd);
+  
+  let trustRoot = path.resolve(cwd);
+  try {
+    const rootCandidate = reviewTrustRoot({ cwd });
+    if (rootCandidate) trustRoot = path.resolve(rootCandidate);
+  } catch {}
 
   const haystackShown = context.includeDiff
     ? collapseWhitespace(stripFenceSentinels(rawContent))
@@ -213,33 +218,55 @@ export function assessFindings(result, context, { apiMode = true, cwd = process.
   const haystackRaw = context.includeDiff
     ? collapseWhitespace(rawContent)
     : null;
-  const haystack = apiMode ? haystackShown : haystackRaw;
 
   return result.findings.map((f) => {
     const notes = [];
     let effectiveConfidence = f.confidence;
 
+    // Check if finding originated from or was corroborated by a local CLI provider
+    const isLocalCliFinding =
+      f.provider === "claude" ||
+      f.provider === "codex" ||
+      f.provider === "agy" ||
+      (Array.isArray(f.corroborated_by) &&
+        f.corroborated_by.some((p) => ["claude", "codex", "agy"].includes(p)));
+
+    // Preserve local CLI mode grounding for local CLI findings in mixed runs
+    const isFindingApi = apiMode && !isLocalCliFinding;
+    const haystack = isFindingApi ? haystackShown : haystackRaw;
+
     const normFile = normalizePath(f.file || "");
     const inChangeSet = !changed.size || changed.has(normFile);
 
-    // Safely check if cited file exists within the repository trust root
+    // Safely check if cited file exists within the repository trust root.
+    // Try resolving relative to trustRoot first (for repo-root-relative citations in subdirectories),
+    // then fall back to resolving relative to cwd.
     let fileExistsInRepo = false;
     let targetFilePath = null;
     if (f.file && typeof f.file === "string") {
       try {
-        const resolved = path.resolve(cwd, f.file);
-        if (isInsideTrustRoot(resolved, { root: trustRoot })) {
-          const stat = fs.statSync(resolved);
+        const candidateTrust = path.resolve(trustRoot, f.file);
+        const candidateCwd = path.resolve(cwd, f.file);
+
+        let chosenCandidate = null;
+        if (isInsideTrustRoot(candidateTrust, { root: trustRoot }) && fs.existsSync(candidateTrust)) {
+          chosenCandidate = candidateTrust;
+        } else if (isInsideTrustRoot(candidateCwd, { root: trustRoot }) && fs.existsSync(candidateCwd)) {
+          chosenCandidate = candidateCwd;
+        }
+
+        if (chosenCandidate) {
+          const stat = fs.statSync(chosenCandidate);
           if (stat.isFile() && stat.size < 2_000_000) {
             fileExistsInRepo = true;
-            targetFilePath = resolved;
+            targetFilePath = chosenCandidate;
           }
         }
       } catch {}
     }
 
     if (!inChangeSet) {
-      if (apiMode) {
+      if (isFindingApi) {
         // API mode: provider was only shown the change set in the prompt.
         // Prompt-invisible files are penalized as ungrounded for API reviewers.
         notes.push(`cited file is not in the reviewed change set (${f.file})`);
@@ -255,7 +282,7 @@ export function assessFindings(result, context, { apiMode = true, cwd = process.
     }
 
     if (haystack && f.evidence && f.evidence.trim()) {
-      const targetEvidence = apiMode
+      const targetEvidence = isFindingApi
         ? collapseWhitespace(stripFenceSentinels(f.evidence))
         : collapseWhitespace(f.evidence);
 
@@ -263,7 +290,7 @@ export function assessFindings(result, context, { apiMode = true, cwd = process.
 
       if (!inDiff) {
         let inRepoFile = false;
-        if (!apiMode && fileExistsInRepo && targetFilePath) {
+        if (!isFindingApi && fileExistsInRepo && targetFilePath) {
           try {
             const fileContent = fs.readFileSync(targetFilePath, "utf8");
             if (collapseWhitespace(fileContent).includes(targetEvidence)) {

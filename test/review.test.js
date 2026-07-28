@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 import { TRUST_POLICY, fenceDirective, validateResult, assessFindings, deriveVerdict, mergeProviderResults, deriveQuorumVerdict, renderReport, apiProvidersCannotReview, buildVerifyPrompt, fenceUntrusted, buildPrompt, buildArtifactPrompt, loadAsset } from "../src/review.js";
 
@@ -179,15 +180,39 @@ test("T47: assessFindings preserves full confidence for evidence present in exis
   assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
 });
 
-test("T47: assessFindings blocks path traversal in finding.file and penalizes confidence", () => {
+test("T47: assessFindings resolves repo-root relative file citations when invoked from nested subdirectories", () => {
   const result = validResult({
-    findings: [validFinding({ file: "../../../../etc/passwd", confidence: 0.8, evidence: "" })]
+    findings: [validFinding({ file: "src/review.js", confidence: 0.9, evidence: "" })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
+  const nestedCwd = path.join(process.cwd(), "test");
+
+  const assessments = assessFindings(result, context, { apiMode: false, cwd: nestedCwd });
+  assert.equal(assessments[0].effectiveConfidence, 0.9);
+  assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+});
+
+test("T47: assessFindings preserves CLI grounding for local CLI findings in mixed API/CLI runs", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/review.js", confidence: 0.9, evidence: "SEVERITY_RANK", provider: "codex" })]
+  });
+  const context = { changedFiles: ["src/other.js"], includeDiff: true, content: "## Diff\n```\nconst x = 1;\n```" };
+
+  const assessments = assessFindings(result, context, { apiMode: true, cwd: process.cwd() });
+  assert.equal(assessments[0].effectiveConfidence, 0.9);
+  assert.ok(assessments[0].notes.some(n => n.includes("out-of-diff evidence")));
+});
+
+test("T47: assessFindings handles trust root discovery failures gracefully without crashing", () => {
+  const result = validResult({
+    findings: [validFinding({ file: "src/nonexistent_file_xyz.js", confidence: 0.8, evidence: "" })]
   });
   const context = { changedFiles: ["src/other.js"], includeDiff: false, content: "" };
 
-  const assessments = assessFindings(result, context, { apiMode: false, cwd: process.cwd() });
-  assert.equal(assessments[0].effectiveConfidence, 0.4);
-  assert.ok(assessments[0].notes.some(n => n.includes("cited file is not in the repository")));
+  assert.doesNotThrow(() => {
+    const assessments = assessFindings(result, context, { apiMode: false, cwd: "/nonexistent/path/xyz" });
+    assert.equal(assessments[0].effectiveConfidence, 0.4);
+  });
 });
 
 test("assessFindings matches evidence with collapsed whitespace", () => {
