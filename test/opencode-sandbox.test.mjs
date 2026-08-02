@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { buildOpencodeConfig, opencodeReviewArgs, newOpencodeAgentName, OPENCODE_DEFAULT_MODEL, removeStateDirIfCreated } from "../src/llm.js";
+import { buildOpencodeConfig, opencodeReviewArgs, newOpencodeAgentName, OPENCODE_DEFAULT_MODEL, removeStateDirIfCreated, opencodeAgentListArgs, opencodeAgentIsPrimary, opencodeStateDirCandidates } from "../src/llm.js";
 
 // opencode has no read-only flag, and `--agent` does NOT fail closed: naming a
 // subagent makes it warn and fall back to the user's default primary agent, which
@@ -67,9 +67,13 @@ test("opencode honors the generated read-only config against a real write attemp
     }
 
     assert.equal(fs.existsSync(target), false, "the read-only agent must not be able to write");
-    // The banner names the agent we pinned, proving no silent fallback occurred.
-    assert.match(stderr, new RegExp(agent), `expected the pinned agent in: ${stderr}`);
-    assert.doesNotMatch(stderr, /is a subagent, not a primary agent/, "must not fall back to the user's default agent");
+    // Under --format json the run is silent on stderr, so agent identity is proven
+    // by the preflight (opencodeAgentIsPrimary) rather than by a banner. Assert it
+    // here against the same merged config the run used.
+    const listing = _spawnSync("opencode", opencodeAgentListArgs(), {
+      cwd: work, encoding: "utf8", timeout: 120_000, env: { ...process.env, OPENCODE_CONFIG: configFile }
+    });
+    assert.equal(opencodeAgentIsPrimary(listing.stdout || "", agent), true, "the pinned agent must register as primary");
   } finally {
     fs.rmSync(cfgDir, { recursive: true, force: true });
     fs.rmSync(work, { recursive: true, force: true });
@@ -195,7 +199,11 @@ test("a hostile project opencode.json cannot re-enable write on the review agent
       false,
       "a reviewed repository must not be able to grant the reviewer write access"
     );
-    assert.match(stderr, new RegExp(agent), "the per-run agent must be the one that ran");
+    const listing = _spawnSync("opencode", opencodeAgentListArgs(), {
+      cwd: work, encoding: "utf8", timeout: 120_000, env: { ...process.env, OPENCODE_CONFIG: configFile }
+    });
+    assert.equal(opencodeAgentIsPrimary(listing.stdout || "", agent), true,
+      "a hostile project config must not be able to downgrade the pinned agent");
   } finally {
     fs.rmSync(cfgDir, { recursive: true, force: true });
     fs.rmSync(work, { recursive: true, force: true });
@@ -213,6 +221,27 @@ import { fileURLToPath } from "node:url";
 
 const cliPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "cli.js");
 const REVIEW_JSON = '{"verdict":"approve","summary":"ok","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[],"next_steps":[]}';
+
+// A mock opencode must answer BOTH calls the provider makes: the `agent list`
+// preflight and the `run` itself. `agent list` takes no --agent argument, so the
+// mock resolves the name the way the real CLI does — by reading OPENCODE_CONFIG.
+// `mode` decides what the preflight reports back.
+function mockOpencode(mode) {
+  const evt = JSON.stringify({ type: "text", part: { type: "text", text: REVIEW_JSON } });
+  return [
+    "#!/bin/sh",
+    'agent=$(grep -o "adversarial-review-[0-9a-f]*" "$OPENCODE_CONFIG" | head -1)',
+    'case "$*" in',
+    `  *"agent list"*) echo "$agent (${mode})"; exit 0 ;;`,
+    "esac",
+    "cat > /dev/null",
+    `echo '${evt}'`,
+    "exit 0"
+  ].join("\n") + "\n";
+}
+
+const MOCK_OK = mockOpencode("primary");
+const MOCK_DOWNGRADED = mockOpencode("subagent");
 
 function reviewWithMockOpencode(mockBody) {
   const mocks = fs.mkdtempSync(path.join(os.tmpdir(), "adv-oc-mock-"));
@@ -246,19 +275,35 @@ function reviewWithMockOpencode(mockBody) {
 test("a sandboxed opencode run is accepted (stderr plumbing is actually wired)", { skip: process.platform === "win32" ? "posix mock" : false }, () => {
   // Echo the pinned agent back on stderr, exactly as the real banner does. If
   // onStderr is not forwarded to the watchdog, the run is refused and this fails.
-  const r = reviewWithMockOpencode(
-    `#!/bin/sh\ncat > /dev/null\nagent=""\nwhile [ $# -gt 0 ]; do\n  if [ "$1" = "--agent" ]; then agent="$2"; fi\n  shift\ndone\necho "> $agent · grok-4.5" 1>&2\ncat <<'JSON'\n${REVIEW_JSON}\nJSON\nexit 0\n`
-  );
+  const r = reviewWithMockOpencode(MOCK_OK);
   assert.equal(r.status, 0, `expected a clean review, got ${r.status}:\n${r.stderr}`);
-  assert.doesNotMatch(r.stderr || "", /never reported running the sandboxed agent/);
+  assert.doesNotMatch(r.stderr || "", /did not register the sandboxed agent/);
 });
 
 test("a silent agent downgrade is refused even though opencode exits 0", { skip: process.platform === "win32" ? "posix mock" : false }, () => {
   // The real fail-open: opencode warns, drops to the user's write-capable default,
   // returns a well-formed verdict, and exits 0. The verdict must not be trusted.
-  const r = reviewWithMockOpencode(
-    `#!/bin/sh\ncat > /dev/null\necho '! agent "x" is a subagent, not a primary agent. Falling back to default agent' 1>&2\ncat <<'JSON'\n${REVIEW_JSON}\nJSON\nexit 0\n`
-  );
+  const r = reviewWithMockOpencode(MOCK_DOWNGRADED);
   assert.notEqual(r.status, 0, "a downgraded run must not produce a passing review");
-  assert.match(r.stderr || "", /fell back to the default agent/);
+  assert.match(r.stderr || "", /did not register the sandboxed agent/);
+});
+
+test("state cleanup covers the project root, not only the process cwd", () => {
+  // opencode roots .omo in the PROJECT it operates on. Run from a package
+  // subdirectory of a monorepo, cwd and the project root differ, and watching cwd
+  // alone leaves the real state directory behind in the reviewed tree.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "adv-omo-root-"));
+  const sub = path.join(root, "packages", "app");
+  fs.mkdirSync(sub, { recursive: true });
+
+  const cands = opencodeStateDirCandidates({ cwd: sub, repoRoot: root });
+  assert.deepEqual(cands, [path.join(sub, ".omo"), path.join(root, ".omo")]);
+
+  // When they coincide, exactly one candidate — never a duplicate delete.
+  assert.deepEqual(opencodeStateDirCandidates({ cwd: root, repoRoot: root }), [path.join(root, ".omo")]);
+
+  // Unresolvable repo root degrades to cwd rather than throwing: a cleanup helper
+  // must never be the thing that fails a review.
+  assert.deepEqual(opencodeStateDirCandidates({ cwd: sub, repoRoot: "" }), [path.join(sub, ".omo")]);
+  fs.rmSync(root, { recursive: true, force: true });
 });

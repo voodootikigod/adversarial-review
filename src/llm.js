@@ -604,14 +604,22 @@ export const OPENCODE_DEFAULT_MODEL = "opencode-go/grok-4.5";
  * declaring its OWN agent whose per-agent tools and permissions are self-contained,
  * rather than by removing theirs.
  *
- * INVARIANT (enforced by test): every tool enabled here has an explicit permission
- * entry. opencode has no headless auto-deny — an enabled tool whose permission is
- * unset blocks on an interactive prompt forever, with no output and no error, until
- * the watchdog kills it. Two runs were lost to exactly that (killed at 400s and
- * 500s) before the catch-all "*": "deny" was added. The reviewer still needs to
- * READ the repository, so read/grep/glob/list are enabled AND explicitly allowed;
- * disabling everything instead makes the model stop mid-turn without answering,
- * having planned tool calls it could not make.
+ * VERIFIED PERMISSION SEMANTICS (each established by running the real CLI, because
+ * none of it is documented and two of the three shapes fail OPEN):
+ *
+ *   permission { "*": "deny" }              → the agent gets NO tools at all.
+ *   permission { "*": "allow", write:"deny" } → catch-all WINS; the explicit deny is
+ *                                             ignored and the model wrote the file.
+ *   no catch-all, explicit denies only      → unlisted tools default to "ask", and a
+ *                                             headless run BLOCKS FOREVER on the
+ *                                             prompt (two runs killed at 400s/500s).
+ *
+ * `tools: { write: false }` is NOT a security control either — with a permissive
+ * catch-all the model wrote the file regardless. `permission` is the only thing that
+ * enforces, so this config uses the one shape that is provably closed: deny
+ * everything. That means the reviewer has no read tools, so it works from the diff
+ * carried in the prompt (see OPENCODE_NO_TOOLS_PREAMBLE) rather than by inspecting
+ * the worktree. The `tools` block is kept as defense in depth, not relied upon.
  */
 export function buildOpencodeConfig(agentName = newOpencodeAgentName()) {
   return {
@@ -622,12 +630,12 @@ export function buildOpencodeConfig(agentName = newOpencodeAgentName()) {
         mode: "primary",
         tools: {
           write: false, edit: false, patch: false, bash: false, task: false,
-          read: true, grep: true, glob: true, list: true
+          read: false, grep: false, glob: false, list: false, webfetch: false
         },
-        permission: {
-          "*": "deny",
-          read: "allow", grep: "allow", glob: "allow", list: "allow"
-        }
+        // The ONLY shape verified to fail closed. See the note above before
+        // "relaxing" this to allow reads — the two obvious relaxations both let a
+        // write through, and the third hangs the run.
+        permission: { "*": "deny" }
       }
     }
   };
@@ -645,27 +653,79 @@ export function opencodeReviewArgs({ model = null, agent } = {}) {
   // Send `-m` anyway: inheriting their default would make the reviewing model, and
   // therefore the diversity of the review, depend on unrelated local config that
   // can change without notice. A review pins its own model.
-  return ["--pure", "run", "--agent", agent, "-m", model || OPENCODE_DEFAULT_MODEL];
+  // `--format json` is REQUIRED, not a preference. Under the default formatter,
+  // stdout is written for a terminal: piped, it interleaves tool-call framing into
+  // the prose and arrives corrupted ("I need to check the line count.0aRead0epath/
+  // Users/.../file.js"), so a review that used tools returned narration and no
+  // parseable JSON. `--format json` emits one JSON event per line; the assistant's
+  // answer is the concatenation of the `text` events (see extractOpencodeText).
+  return ["--pure", "run", "--agent", agent, "-m", model || OPENCODE_DEFAULT_MODEL, "--format", "json"];
 }
 
 /**
- * Fail-closed check on opencode's stderr after a run that exited 0.
+ * Pull the assistant's answer out of opencode's `--format json` event stream.
  *
- * opencode does NOT fail closed when `--agent` cannot be honored: it prints
- * `agent "X" is a subagent, not a primary agent. Falling back to default agent`
- * and completes normally under the user's write-capable default. A clean exit and
- * a well-formed JSON verdict are therefore NOT evidence the review was sandboxed.
- * The banner names the agent that actually ran, so require ours by name.
+ * The stream is JSONL: `step_start`, one or more `text` parts, `step_finish`, plus
+ * tool events. Only `text` parts are the answer — tool events carry file contents
+ * and arguments, and folding those in would feed the reviewed repository's own
+ * source back into the JSON extractor as if the model had written it.
+ *
+ * Falls back to the raw payload when nothing parses, so a plain-text reply (or a
+ * future format change) still reaches the caller's JSON extraction rather than
+ * silently becoming an empty review.
  */
-export function opencodeSandboxFailure(stderr, agentName) {
-  const text = (stderr || "").toString();
-  if (/is a subagent, not a primary agent|Falling back to default agent/i.test(text)) {
-    return `opencode fell back to the default agent — the review would have run WITHOUT the read-only sandbox.`;
+export function extractOpencodeText(stdout) {
+  const raw = (stdout || "").toString();
+  const parts = [];
+  let sawEvent = false;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let evt;
+    try {
+      evt = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!evt || typeof evt.type !== "string") continue;
+    sawEvent = true;
+    if (evt.type === "text" && typeof evt.part?.text === "string") parts.push(evt.part.text);
   }
-  if (!text.includes(agentName)) {
-    return `opencode never reported running the sandboxed agent "${agentName}"; refusing to trust the result.`;
-  }
-  return null;
+  if (!sawEvent) return raw.trim();
+  return parts.join("").trim();
+}
+
+// Without this, the model announces an intention it cannot carry out and stops:
+// "I will read `src/x.js` and return the line count" — then step_finish, no answer,
+// no JSON, a failed review. It has no tools (the only permission shape that fails
+// closed), so it must be told that plainly and pointed at the diff it was given.
+export const OPENCODE_NO_TOOLS_PREAMBLE =
+  "You have NO tools available in this environment: you cannot read files, search " +
+  "the repository, or run commands. Do not announce an intention to do so. Everything " +
+  "you need is included verbatim below — review it directly and reply with the " +
+  "required JSON and nothing else.\n\n";
+
+/** Argv that asks opencode which agents the MERGED config actually defines. */
+export function opencodeAgentListArgs() {
+  return ["--pure", "agent", "list"];
+}
+
+/**
+ * Fail-closed PREFLIGHT: is our agent registered as `primary` in the merged config?
+ *
+ * opencode does not fail closed when `--agent` cannot be honored — it falls back to
+ * the user's write-capable default and completes normally. Under `--format default`
+ * it at least warns on stderr; under `--format json`, which the review requires (see
+ * opencodeReviewArgs), stderr is EMPTY and the fallback is completely silent. There
+ * is no post-hoc signal to check, so the check has to happen before the diff is ever
+ * sent: `agent list` prints one `<name> (primary|subagent)` line per agent, computed
+ * from the same merge the run will use. Verified to report `(subagent)` when a
+ * project-local config downgrades the agent's mode.
+ */
+export function opencodeAgentIsPrimary(listing, agentName) {
+  const line = new RegExp(`^\\s*${agentName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\((\\w+)\\)\\s*$`, "m");
+  const m = (listing || "").toString().match(line);
+  return m ? m[1] === "primary" : false;
 }
 
 /**
@@ -684,15 +744,16 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
   const privateDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-review-opencode-"));
   const configFile = path.join(privateDir, "opencode.json");
 
-  // `opencode run` drops a project-local `.omo/` state directory into the project
-  // it operates on. That directory follows the project, not the process cwd, so it
-  // cannot be relocated while the agent still reads the repository — and a reviewer
-  // that leaves untracked files in the tree it just reviewed will surface them in
-  // `git status` and, because untracked content is part of the reviewed input, feed
-  // its own session state into the NEXT review. Remove it only when this run created
-  // it: a pre-existing `.omo/` belongs to the user and is never touched.
-  const stateDir = path.join(process.cwd(), ".omo");
-  const stateDirPreexisted = fs.existsSync(stateDir);
+  // `opencode run` drops a project-local `.omo/` state directory into the PROJECT it
+  // operates on — which is not necessarily the process cwd. Run from a package
+  // subdirectory of a monorepo, cwd and the project root differ, and keying cleanup
+  // to cwd alone leaves the real one behind. A reviewer must not leave untracked
+  // files in the tree it just reviewed: `git status` surfaces them, and because
+  // untracked content is part of the reviewed input, its own session state would
+  // feed into the NEXT review. Watch both candidates, and remove only what this run
+  // created — a pre-existing `.omo/` belongs to the user and is never touched.
+  const stateDirs = opencodeStateDirCandidates();
+  const statePreexisted = new Map(stateDirs.map((d) => [d, fs.existsSync(d)]));
 
   // Fresh per run: a name the reviewed repository cannot have named in advance.
   const agentName = newOpencodeAgentName();
@@ -713,27 +774,41 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
       : opencodeReviewArgs({ model, agent: agentName });
     const envOverrides = allowUnsandboxedCli ? null : { OPENCODE_CONFIG: configFile };
 
+    // PREFLIGHT, before the diff is sent anywhere: confirm the merged config really
+    // registers our agent as primary. If it does not, opencode would silently run
+    // the review under the user's write-capable default agent instead — and under
+    // --format json it does so with no warning on any stream, so this is the only
+    // place the downgrade is observable.
+    if (!allowUnsandboxedCli) {
+      let listing = "";
+      try {
+        listing = await execCli(cliCmd, opencodeAgentListArgs(), null, Math.min(timeoutMs, 120_000), {
+          argsContainUntrusted: false,
+          envOverrides
+        });
+      } catch (err) {
+        throw new Error(
+          `Could not verify the opencode read-only sandbox (\`opencode agent list\` failed): ` +
+            `${err.message}\nRefusing to send the diff to an unverified agent.`
+        );
+      }
+      if (!opencodeAgentIsPrimary(listing, agentName)) {
+        throw new Error(
+          `opencode did not register the sandboxed agent "${agentName}" as primary, so the ` +
+            `review would run under the default agent WITHOUT the read-only sandbox.\n` +
+            `Refusing to send the diff. Pass --allow-unsandboxed-cli to accept that deliberately.`
+        );
+      }
+    }
+
     try {
-      const out = await execCli(cliCmd, args, fullPrompt, timeoutMs, {
+      const out = await execCli(cliCmd, args, OPENCODE_NO_TOOLS_PREAMBLE + fullPrompt, timeoutMs, {
         stream,
         argsContainUntrusted: false,
         envOverrides,
         onStderr: (chunk) => { stderrSeen += chunk; }
       });
-      // A clean exit is NOT proof the sandbox applied — opencode warns and
-      // continues when it cannot honor --agent. Refuse the result rather than
-      // return a verdict produced by a write-capable agent.
-      if (!allowUnsandboxedCli) {
-        const breach = opencodeSandboxFailure(stderrSeen, agentName);
-        if (breach) {
-          throw new Error(
-            `${breach}\nRefusing the review result. Re-run, or pass --allow-unsandboxed-cli ` +
-              `to accept an unsandboxed opencode run deliberately.` +
-              (stderrSeen.trim() ? `\n${stderrSeen.trim()}` : "")
-          );
-        }
-      }
-      return out;
+      return extractOpencodeText(out);
     } catch (err) {
       if (err.code === "ETIMEDOUT") {
         throw Object.assign(new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)), { stdout: err.stdout, stderr: err.stderr, cause: err });
@@ -763,7 +838,7 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
     }
   } finally {
     try { fs.rmSync(privateDir, { recursive: true, force: true }); } catch { /* ignore */ }
-    removeStateDirIfCreated(stateDir, stateDirPreexisted);
+    for (const dir of stateDirs) removeStateDirIfCreated(dir, statePreexisted.get(dir));
   }
 }
 
@@ -778,6 +853,35 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
  * appeared during our run is removed. A symlink is never followed — removing one
  * could reach outside the worktree entirely.
  */
+/**
+ * Every directory opencode might root its `.omo/` state in: the process cwd, and
+ * the git worktree root when that differs (running from a package subdirectory of a
+ * monorepo is the ordinary case). Deduplicated, and degrades to cwd alone when the
+ * repo root cannot be resolved — a cleanup helper must never be the thing that
+ * fails a review.
+ */
+export function opencodeStateDirCandidates({ cwd = process.cwd(), repoRoot = null } = {}) {
+  const roots = [cwd];
+  let top = repoRoot;
+  if (top === null) {
+    try {
+      const git = resolveTrustedCommand("git");
+      if (git) {
+        top = execFileSync(git, ["rev-parse", "--show-toplevel"], {
+          cwd,
+          encoding: "utf8",
+          env: sanitizedSpawnEnv(),
+          stdio: ["ignore", "pipe", "ignore"]
+        }).trim();
+      }
+    } catch {
+      top = null;
+    }
+  }
+  if (top && top !== cwd) roots.push(top);
+  return [...new Set(roots)].map((r) => path.join(r, ".omo"));
+}
+
 export function removeStateDirIfCreated(stateDir, preexisted) {
   if (preexisted) return false;
   try {
