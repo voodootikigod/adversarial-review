@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { GATEWAY_FAMILY_MODELS } from "../src/llm.js";
+import { GATEWAY_FAMILY_MODELS, buildOpencodeConfig, newOpencodeAgentName } from "../src/llm.js";
 
 const SRC_DIR = fileURLToPath(new URL("../src/", import.meta.url));
 const CATALOG_URL = "https://ai-gateway.vercel.sh/v1/models";
@@ -208,4 +208,72 @@ test("every gateway pin still exists in the live catalog", async (t) => {
     const newer = newerInSeries(id, r.ids);
     if (newer.length) t.diagnostic(`${family}: pinned ${id}; newer available: ${newer.join(", ")}`);
   }
+});
+
+// --- opencode permission schema drift ----------------------------------------
+//
+// Same class of defect this file already guards for gateway model pins, and the
+// same fix. OPENCODE_PERMISSIONS is hand-maintained, and a key opencode adds later
+// is not merely missing — an unset permission defaults to "ask", which blocks a
+// headless review until the watchdog ceiling. That surfaces as an opaque ETIMEDOUT
+// with nothing pointing at a stale permission map, so the drift has to be caught
+// here. Skips offline, exactly like the model-catalog check above.
+
+const OPENCODE_SCHEMA_URL = "https://opencode.ai/config.json";
+
+async function fetchOpencodePermissionKeys(fetchImpl = globalThis.fetch, { timeoutMs = CATALOG_TIMEOUT_MS } = {}) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(OPENCODE_SCHEMA_URL, { signal: ac.signal });
+    if (!res || res.ok === false || (typeof res.status === "number" && res.status !== 200)) {
+      return { ok: false, reason: `schema returned status ${res?.status ?? "unknown"}` };
+    }
+    const body = await res.json();
+    const defs = body?.$defs ?? body?.definitions ?? {};
+    // PermissionConfig is `anyOf: [ <action string>, { properties: {...} } ]`.
+    const variant = (defs.PermissionConfig?.anyOf ?? []).find((v) => v?.properties);
+    const keys = Object.keys(variant?.properties ?? {});
+    if (keys.length === 0) return { ok: false, reason: "no PermissionConfig properties in schema" };
+    return { ok: true, keys: new Set(keys) };
+  } catch (err) {
+    return { ok: false, reason: `schema unreachable: ${err?.message || err}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("the opencode permission map still covers every key the schema defines", async (t) => {
+  const r = await fetchOpencodePermissionKeys();
+  if (!r.ok) {
+    t.skip(`opencode schema unavailable — ${r.reason}`);
+    return;
+  }
+  const name = newOpencodeAgentName();
+  const configured = buildOpencodeConfig(name).agent[name].permission;
+
+  const missing = [...r.keys].filter((k) => !(k in configured));
+  assert.deepEqual(
+    missing,
+    [],
+    `unset opencode permissions default to "ask" and hang a headless review — ` +
+      `add these to OPENCODE_PERMISSIONS with an explicit allow/deny: ${missing.join(", ")}`
+  );
+
+  // A key we set that the schema no longer defines is dead weight, not a hazard —
+  // report it without failing, mirroring the newer-model diagnostic above.
+  const stale = Object.keys(configured).filter((k) => !r.keys.has(k));
+  if (stale.length) t.diagnostic(`permissions set but no longer in the schema: ${stale.join(", ")}`);
+});
+
+test("nothing write-shaped is allowed in the read-only opencode agent", () => {
+  const name = newOpencodeAgentName();
+  const { permission, tools } = buildOpencodeConfig(name).agent[name];
+  const allowed = Object.entries(permission).filter(([, v]) => v === "allow").map(([k]) => k);
+  assert.deepEqual(allowed.sort(), ["glob", "grep", "list", "read"], "only inspection may be allowed");
+  for (const k of allowed) {
+    assert.doesNotMatch(k, /write|edit|patch|exec|bash/i, `"${k}" is not an inspection capability`);
+  }
+  // `tools` is defense in depth, so it must agree: nothing mutating enabled.
+  for (const k of ["write", "edit", "patch", "bash", "task"]) assert.equal(tools[k], false);
 });

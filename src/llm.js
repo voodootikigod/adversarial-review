@@ -632,12 +632,17 @@ export const OPENCODE_DEFAULT_MODEL = "opencode-go/grok-4.5";
 // permission, a review may hang until the watchdog ceiling; that is the failure this
 // list exists to prevent, and the drift shows up as a timeout, not a silent bypass.
 const OPENCODE_PERMISSIONS = {
-  // The reviewer must be able to inspect the repository around the diff.
-  read: "allow", grep: "allow", glob: "allow", list: "allow", lsp: "allow",
-  todowrite: "allow",
+  // ALLOW only what inspects. Four read paths, nothing else — a permission whose
+  // name contains "write" has no business in an agent documented as read-only,
+  // however benign the state it touches looks.
+  read: "allow", grep: "allow", glob: "allow", list: "allow",
   // Everything that mutates, executes, reaches the network, or escapes the worktree.
   edit: "deny", bash: "deny", task: "deny", webfetch: "deny", websearch: "deny",
-  external_directory: "deny", question: "deny", doom_loop: "deny", skill: "deny"
+  external_directory: "deny", question: "deny", doom_loop: "deny", skill: "deny",
+  // todowrite mutates session/todo state, and `lsp` can drive a language server into
+  // code actions and formatting. Neither was shown to be side-effect free, and an
+  // unproven capability is denied rather than assumed harmless.
+  todowrite: "deny", lsp: "deny"
 };
 export function buildOpencodeConfig(agentName = newOpencodeAgentName()) {
   return {
@@ -706,8 +711,13 @@ export function extractOpencodeText(stdout) {
     sawEvent = true;
     if (evt.type === "text" && typeof evt.part?.text === "string") parts.push(evt.part.text);
   }
-  if (!sawEvent) return raw.trim();
-  return parts.join("").trim();
+  // Falling back only when NOTHING parsed is not enough: a stream carrying step and
+  // tool events but no `text` part would return "" and abort an otherwise successful
+  // run — strictly worse than the plain-text case. Any time we end up with no answer,
+  // hand back the raw payload and let the caller's JSON extraction try.
+  const text = parts.join("").trim();
+  if (!sawEvent || !text) return raw.trim();
+  return text;
 }
 
 /** Argv that asks opencode which agents the MERGED config actually defines. */
