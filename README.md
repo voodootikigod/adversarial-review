@@ -179,8 +179,9 @@ Next steps
 
 # Provider
 --provider <name>      anthropic | openai | gemini | vercel | gateway |
-                       cursor | agent | <local-cli-cmd>.
-                       cursor/agent → Cursor Agent CLI; vercel/gateway → AI Gateway.
+                       cursor | agent | copilot | <local-cli-cmd>.
+                       cursor/agent → Cursor Agent CLI; vercel/gateway → AI Gateway;
+                       copilot → GitHub Copilot CLI (explicit-only).
 --model <name>         Force the model name (Gateway: use provider/model ids).
 --api-base <url>       Override the active provider's API base URL.
 --api-key <key>        Override the active provider's API key.
@@ -255,6 +256,14 @@ a weaker critic. Otherwise:
 `agent login` or `CURSOR_API_KEY`. Reviews run with `--mode plan` (read-only). This is
 not a localhost HTTP proxy — for third-party OpenAI-compatible proxies use
 `--provider openai --api-base <url>`.
+
+**GitHub Copilot CLI** (`--provider copilot`): requires `copilot` on `PATH` and
+`copilot login`. Reviews run with `--mode plan` (read-only). **Explicit-only** — it is
+never auto-detected, and it does **not** count toward cross-family diversity: Copilot
+routes to Claude, GPT, or Gemini depending on `--model`, so treating it as an independent
+family would fake the diversity a `--providers` run reports. On Windows an npm-installed
+`copilot` is a `.cmd` shim and is refused: Copilot takes the prompt as a command-line
+argument, which `cmd.exe` would re-parse — use `--provider claude` or `codex` there.
 
 **Vercel AI Gateway** (`--provider vercel` or `gateway`): one key, many `provider/model`
 ids (e.g. `openai/gpt-5.6-sol`, `anthropic/claude-sonnet-5`, `google/gemini-2.5-pro`). With

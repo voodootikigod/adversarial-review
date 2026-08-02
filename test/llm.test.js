@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall, GATEWAY_FAMILY_MODELS } from "../src/llm.js";
+import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall, GATEWAY_FAMILY_MODELS, cliSandboxArgs } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 import { buildSpawnTarget } from "../src/spawn-safe.js";
 import { writeMockBin, writeSimpleMockBin } from "./helpers/mock-bin.mjs";
@@ -381,6 +381,70 @@ test("an argv-prompt CLI installed as a Windows .cmd shim is not offered for rev
   assert.match(msg, /\.cmd shim/);
   assert.match(msg, /--provider claude|--provider codex/);
   assert.doesNotMatch(msg, /not installed/);
+});
+
+// --- T45: GitHub Copilot CLI --------------------------------------------------
+
+test("copilot takes the prompt as a -p ARGUMENT, never the stdin sentinel", () => {
+  // `copilot -p -` is read as a prompt of literal "-": the CLI replies
+  // "I notice your message is empty." Same shape as agy, not claude/codex.
+  assert.equal(cliRequiresArgvPrompt("copilot"), true);
+  assert.equal(cliRequiresArgvPrompt("/opt/tools/copilot"), true);
+  assert.equal(cliRequiresArgvPrompt("copilot.cmd"), true);
+  assert.equal(cliRequiresArgvPrompt("C:\\npm\\copilot.cmd"), true);
+  // Unchanged for the stdin-prompt CLIs.
+  assert.equal(cliRequiresArgvPrompt("claude"), false);
+  assert.equal(cliRequiresArgvPrompt("codex"), false);
+});
+
+test("copilot has no stdin review form, so it routes through the argv branch", () => {
+  assert.deepEqual(cliReviewArgs("copilot"), []);
+});
+
+test("copilot review args force --mode plan and end with the prompt", () => {
+  const args = cliFallbackArgs("copilot", "PROMPT");
+  assert.deepEqual(args, ["--mode", "plan", "-s", "--no-color", "--log-level", "none", "-p", "PROMPT"]);
+  // The prompt is last, immediately preceded by the flag that consumes it.
+  assert.deepEqual(args.slice(-2), ["-p", "PROMPT"]);
+
+  const withModel = cliFallbackArgs("copilot", "PROMPT", { model: "claude-sonnet-4.5" });
+  assert.deepEqual(withModel.slice(-4), ["--model", "claude-sonnet-4.5", "-p", "PROMPT"]);
+  assert.equal(cliFallbackArgs("copilot", "PROMPT").includes("--model"), false);
+
+  // Opting out of the sandbox drops plan mode but keeps the argv shape.
+  const unsandboxed = cliFallbackArgs("copilot", "PROMPT", { allowUnsandboxedCli: true });
+  assert.equal(unsandboxed.includes("--mode"), false);
+  assert.deepEqual(unsandboxed.slice(-2), ["-p", "PROMPT"]);
+});
+
+test("copilot sandbox args are plan mode, and empty when unsandboxed", () => {
+  assert.deepEqual(cliSandboxArgs("copilot"), ["--mode", "plan"]);
+  assert.deepEqual(cliSandboxArgs("copilot", { allowUnsandboxedCli: true }), []);
+});
+
+test("copilot installed as a Windows .cmd shim is not offered for review", () => {
+  // copilot ships via npm, so a Windows install IS a .cmd shim — and it carries
+  // the prompt in argv, which cmd.exe would re-parse. Must be refused, not picked.
+  assert.equal(cliUsableForReview("copilot", { platform: "win32", resolve: () => "C:\\npm\\copilot.cmd" }), false);
+  assert.equal(cliUsableForReview("copilot", { platform: "win32", resolve: () => "C:\\tools\\copilot.exe" }), true);
+  assert.equal(cliUsableForReview("copilot", { platform: "linux", resolve: () => "/usr/bin/copilot" }), true);
+});
+
+test("copilot's quoted unknown-option stderr is parsed without mangling the flag", () => {
+  // Captured verbatim from Copilot CLI 1.0.77 (commander.js quotes the flag).
+  assert.equal(
+    describeUnknownFlagRejection("copilot", "error: unknown option '--definitely-not-a-flag'\n\nTry 'copilot --help' for more information.\n"),
+    'provider "copilot" rejected flag "--definitely-not-a-flag"'
+  );
+  // The unquoted forms keep working.
+  assert.equal(
+    describeUnknownFlagRejection("claude", "error: unknown flag: --mode\n"),
+    'provider "claude" rejected flag "--mode"'
+  );
+  assert.equal(
+    describeUnknownFlagRejection("agy", "flags provided but not defined: -permission-mode\n"),
+    'provider "agy" rejected flag "--permission-mode"'
+  );
 });
 
 test("a CLI named by PATH gets its own calling convention, not the generic one", () => {

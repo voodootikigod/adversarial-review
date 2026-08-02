@@ -315,13 +315,18 @@ export function isCursorAgentCli(cliCmd) {
   return kind === "agent" || kind === "cursor-agent";
 }
 
-// agy's `-p`/`--print`/`--prompt` takes the prompt as its VALUE — it has NO stdin
-// `-` sentinel (that is a claude/codex convention). Invoked as `agy -p -` with the
-// prompt piped to stdin, agy answers the literal "-" and ignores stdin, returning
-// conversational prose ("Hello! How can I help you today?") instead of the review
-// JSON. So agy must always receive the prompt as the `-p` argument value.
+// CLIs whose `-p` takes the prompt as its VALUE and have NO stdin `-` sentinel
+// (that is a claude/codex convention). Both were verified to misread `-p -` as a
+// prompt of literal "-" rather than a request to read stdin:
+//   agy      → answers the literal "-" and ignores stdin, returning conversational
+//              prose ("Hello! How can I help you today?") instead of the review JSON.
+//   copilot  → replies "I notice your message is empty."
+// Either way the review is lost, so these must always receive the prompt as the
+// `-p` argument value.
+const ARGV_PROMPT_CLIS = new Set(["agy", "copilot"]);
+
 export function cliRequiresArgvPrompt(cliCmd) {
-  return commandKind(cliCmd) === "agy";
+  return ARGV_PROMPT_CLIS.has(commandKind(cliCmd));
 }
 
 // agy's print mode has its OWN wait budget (`--print-timeout`, default 5m0s) that
@@ -380,7 +385,10 @@ export function cliSandboxArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
   if (allowUnsandboxedCli) return [];
   const kind = commandKind(cliCmd);
   if (kind === "claude") return ["--permission-mode", "plan"];
-  if (kind === "agy" || isCursorAgentCli(cliCmd)) return ["--mode", "plan"];
+  // copilot's plan mode is a real read-only gate, not advisory: asked to create a
+  // file it answers "Per plan mode rules, I outline the approach but don't execute
+  // file changes" and writes nothing. Same intent as codex --sandbox read-only.
+  if (kind === "agy" || kind === "copilot" || isCursorAgentCli(cliCmd)) return ["--mode", "plan"];
   return [];
 }
 
@@ -396,7 +404,11 @@ export function describeUnknownFlagRejection(cliCmd, stderr) {
   if (goMatch) {
     return `provider "${cliCmd}" rejected flag "--${goMatch[1].replace(/^-+/, "")}"`;
   }
-  const unknownMatch = text.match(/unknown (?:flag|option)[:\s]+-{0,2}(\S+)/i);
+  // commander.js (copilot) quotes the flag: `error: unknown option '--foo'`.
+  // Without consuming the quote, `-{0,2}` matches zero dashes, the capture keeps
+  // the quotes, and the message reads `rejected flag "--'--foo'"`. Accept an
+  // optional opening quote and stop the capture at the closing one.
+  const unknownMatch = text.match(/unknown (?:flag|option)[:\s]+['"`]?-{0,2}([^'"`\s]+)/i);
   if (unknownMatch) {
     return `provider "${cliCmd}" rejected flag "--${unknownMatch[1].replace(/^-+/, "")}"`;
   }
@@ -453,9 +465,19 @@ export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = fals
     args.push(fullPrompt);
     return args;
   }
+  const kind = commandKind(cliCmd);
+  // copilot: -s prints the agent response alone (no session stats), and the log/
+  // color flags keep decoration out of stdout so the JSON extractor sees only the
+  // answer. Verified to return a bare `{"ok":true}` for a JSON-only prompt.
+  if (kind === "copilot") {
+    const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
+    args.push("-s", "--no-color", "--log-level", "none");
+    if (model) args.push("--model", model);
+    args.push("-p", fullPrompt);
+    return args;
+  }
   // claude and agy are Claude-Code-compatible: they need -p (print mode) when
   // the prompt is passed as a command-line argument.
-  const kind = commandKind(cliCmd);
   if (kind === "claude" || kind === "agy") {
     const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
     if (model) args.push("--model", model);
@@ -1063,7 +1085,7 @@ const TOKEN_FAMILY = {
 // for that on-host CLI, so it resolves CLI-only and is NEVER silently upgraded to
 // the family's API (which would send the diff off-host despite the user's intent).
 // Their family label is still used for diversity grouping.
-const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy", "agent", "cursor-agent"]);
+const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy", "agent", "cursor-agent", "copilot"]);
 
 // Default Vercel AI Gateway model ids per diversity family (provider/model form).
 // THE single source of truth: every gateway model id in this file reads from here.

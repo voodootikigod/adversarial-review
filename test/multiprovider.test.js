@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { selectProviders, underSatisfiedNotice, resolveProviderToken, builderFamily, GATEWAY_FAMILY_MODELS } from "../src/llm.js";
+import { selectProviders, underSatisfiedNotice, resolveProviderToken, builderFamily, GATEWAY_FAMILY_MODELS, configureLLM } from "../src/llm.js";
 import { runMultiProviderReview } from "../src/review.js";
 
 function approveResult() {
@@ -278,4 +278,53 @@ test("cursor token without agent CLI is unreachable (does not throw on IDE curso
     process.env = oldEnv;
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }
+});
+
+// --- T45: GitHub Copilot CLI ---------------------------------------------------
+
+const SKIP_WIN32_COPILOT = { skip: process.platform === "win32" ? "copilot .cmd shim is refused on Windows" : false };
+
+test("T45: copilot resolves to the local CLI and is never upgraded to an API", SKIP_WIN32_COPILOT, () => {
+  // Every family key is set. Naming the on-host binary must still resolve CLI-only,
+  // or the diff leaves the host despite the user asking for a local reviewer.
+  withMockBins(["copilot"], { OPENAI_API_KEY: "sk-a", ANTHROPIC_API_KEY: "sk-b", GEMINI_API_KEY: "sk-c" }, () => {
+    const r = resolveProviderToken("copilot", {});
+    assert.equal(r.id, "copilot");
+    assert.equal(r.family, null, "copilot routes to Claude/GPT/Gemini — it must not claim a family");
+    assert.equal(r.config.provider, "cli");
+    assert.equal(r.config.cliCmd, "copilot");
+  });
+});
+
+test("T45: copilot is unreachable when its binary is absent (no API fallback)", () => {
+  withMockBins([], { ANTHROPIC_API_KEY: "sk-present" }, () => {
+    const r = resolveProviderToken("copilot", {});
+    assert.equal(r.config, null, "no copilot binary → unreachable, must not fall back to an API");
+  });
+});
+
+test("T45: copilot does not collapse into a Big-3 family group", SKIP_WIN32_COPILOT, () => {
+  // If copilot were given a family, one of these would be deduped away and the
+  // run would silently review with fewer critics than requested.
+  withMockBins(["copilot", "codex"], {}, () => {
+    const sel = selectProviders({ providers: ["copilot", "codex"] });
+    assert.equal(sel.providers.length, 2, "copilot and codex must be distinct groups");
+    assert.deepEqual(sel.providers.map((p) => p.id).sort(), ["codex", "copilot"]);
+  });
+});
+
+test("T45: auto-detection never selects copilot, even as the only CLI on PATH", () => {
+  // copilot is explicit-only: it is a multi-provider router, so auto-selecting it
+  // would silently produce a same-family critic. With no keys and only copilot
+  // installed, detection must fail loudly rather than quietly pick it.
+  withMockBins(["copilot"], {}, () => {
+    assert.throws(() => configureLLM({}), /No LLM configuration found/);
+    // And the remedy it offers must not name copilot: installing it would NOT
+    // resolve the error, because auto-detection will never choose it.
+    try {
+      configureLLM({});
+    } catch (err) {
+      assert.doesNotMatch(err.message, /copilot/i);
+    }
+  });
 });

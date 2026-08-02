@@ -143,11 +143,15 @@ weaker critic, so non-Anthropic providers are preferred first:
 1. `ANTHROPIC_API_KEY` → Anthropic API (`claude-sonnet-4-6`)
 2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
-4. `AI_GATEWAY_API_KEY` → Vercel AI Gateway (`anthropic/claude-sonnet-4.6`)
+4. `AI_GATEWAY_API_KEY` → Vercel AI Gateway (`anthropic/claude-sonnet-5`)
 5. Local `claude`, `codex`, `agy`, or `agent` CLI
 
 `--provider cursor|agent` uses the official Cursor Agent CLI (`agent -p --mode plan`),
-not a localhost proxy. `--provider vercel|gateway` uses Vercel AI Gateway
+not a localhost proxy. `--provider copilot` uses the GitHub Copilot
+CLI (`copilot -p --mode plan`, read-only): explicit-only, never auto-detected, and NOT a
+diversity family (it routes to Claude/GPT/Gemini, so counting it would fake diversity).
+Refused on Windows, where an npm-installed `copilot` is a `.cmd` shim and its argv-borne
+prompt would be re-parsed by `cmd.exe`. `--provider vercel|gateway` uses Vercel AI Gateway
 (`provider/model` ids; one key can drive `--providers auto` across families).
 
 Force with `--provider <name>`; override the model with `--model <name>`. Gate quality
