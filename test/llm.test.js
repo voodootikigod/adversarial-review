@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall, GATEWAY_FAMILY_MODELS, cliSandboxArgs } from "../src/llm.js";
+import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall, GATEWAY_FAMILY_MODELS, cliSandboxArgs, buildOpencodeConfig, opencodeReviewArgs, newOpencodeAgentName, OPENCODE_AGENT_PREFIX, OPENCODE_DEFAULT_MODEL, isOpencodeModelUnavailable, opencodeSandboxFailure } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 import { buildSpawnTarget } from "../src/spawn-safe.js";
 import { writeMockBin, writeSimpleMockBin } from "./helpers/mock-bin.mjs";
@@ -1082,4 +1082,116 @@ test("T12 AC11: an unresolvable local CLI throws an error naming the command", a
   assert.ok(err instanceof Error);
   assert.match(err.message, /definitely-not-a-real-binary-xyz/, "the message must name the command");
   assert.match(err.message, /not found on PATH/);
+});
+
+// --- T46: opencode ------------------------------------------------------------
+
+test("the generated opencode config denies every mutating tool", () => {
+  const name = newOpencodeAgentName();
+  const cfg = buildOpencodeConfig(name);
+  const agent = cfg.agent[name];
+  assert.equal(agent.mode, "primary", "a subagent is silently ignored by --agent");
+  for (const tool of ["write", "edit", "patch", "bash", "task"]) {
+    assert.equal(agent.tools[tool], false, `${tool} must be disabled for an untrusted diff`);
+  }
+  // The reviewer still has to read the repository.
+  for (const tool of ["read", "grep", "glob", "list"]) {
+    assert.equal(agent.tools[tool], true);
+  }
+});
+
+test("every enabled opencode tool has an explicit permission (the hang guard)", () => {
+  // opencode has NO headless auto-deny: an enabled tool whose permission is unset
+  // blocks on an interactive prompt forever, with no output and no error. This
+  // shape must be structurally impossible to emit, not merely avoided by hand.
+  const name = newOpencodeAgentName();
+  const agent = buildOpencodeConfig(name).agent[name];
+  assert.equal(agent.permission["*"], "deny", "a catch-all deny is required");
+  const enabled = Object.entries(agent.tools).filter(([, on]) => on === true).map(([t]) => t);
+  assert.ok(enabled.length > 0, "the reviewer needs at least one tool");
+  const unpermitted = enabled.filter((t) => !(t in agent.permission));
+  assert.deepEqual(unpermitted, [], `enabled tools with no explicit permission would hang: ${unpermitted}`);
+  for (const t of enabled) assert.equal(agent.permission[t], "allow");
+});
+
+test("opencode review argv pins the agent and model, and never carries the prompt", () => {
+  const agent = newOpencodeAgentName();
+  const args = opencodeReviewArgs({ agent });
+  assert.deepEqual(args, ["--pure", "run", "--agent", agent, "-m", OPENCODE_DEFAULT_MODEL]);
+  // --pure blocks external plugins: plugin loading is another path the reviewed
+  // repository controls through project config, and a plugin runs code.
+  assert.ok(args.includes("--pure"));
+  // --agent is mandatory: naming a subagent (or omitting it) makes opencode fall
+  // back to the user's default primary agent, which may permit writes.
+  assert.equal(args[args.indexOf("--agent") + 1], agent);
+  assert.throws(() => opencodeReviewArgs({}), /requires the per-run agent name/);
+
+  const pinned = opencodeReviewArgs({ agent, model: "opencode-go/kimi-k3" });
+  assert.equal(pinned[pinned.indexOf("-m") + 1], "opencode-go/kimi-k3");
+
+  // The prompt travels on stdin, so the argv-size guard does not apply.
+  assert.equal(cliRequiresArgvPrompt("opencode"), false);
+  assert.equal(args.some((a) => a.includes("Prompt:")), false);
+});
+
+test("the opencode agent name is unguessable and fresh per run", () => {
+  // SECURITY: OPENCODE_CONFIG merges with project-local opencode.json from the
+  // repository under review. A repo that ships a config redefining our agent BY
+  // NAME wins that merge and re-enables write/bash — verified by live attack. A
+  // fixed name is a name the attacker knows; a per-run random one cannot be
+  // targeted by a file written before the run.
+  const seen = new Set();
+  for (let i = 0; i < 200; i++) seen.add(newOpencodeAgentName());
+  assert.equal(seen.size, 200, "every run must get a distinct agent name");
+  const one = newOpencodeAgentName();
+  assert.ok(one.startsWith(OPENCODE_AGENT_PREFIX));
+  const suffix = one.slice(OPENCODE_AGENT_PREFIX.length);
+  assert.match(suffix, /^[0-9a-f]{32}$/, "128 bits of entropy, hex-encoded");
+});
+
+test("opencode sandbox verification fails closed on a silent agent downgrade", () => {
+  const agent = newOpencodeAgentName();
+  // The real warning opencode emits, captured verbatim. It exits 0 afterwards.
+  assert.match(
+    opencodeSandboxFailure(`! agent "${agent}" is a subagent, not a primary agent. Falling back to default agent`, agent),
+    /fell back to the default agent/
+  );
+  // A banner that never names our agent is equally untrustworthy.
+  assert.match(opencodeSandboxFailure("> some-other-agent · grok-4.5", agent), /never reported running/);
+  assert.match(opencodeSandboxFailure("", agent), /never reported running/);
+  // The good case: the banner names the agent we pinned.
+  assert.equal(opencodeSandboxFailure(`> ${agent} · grok-4.5`, agent), null);
+});
+
+test("opencode's default model reaches a provider no other backend serves", () => {
+  // The reason to add opencode at all: models outside the three frontier labs.
+  assert.match(OPENCODE_DEFAULT_MODEL, /^opencode-go\//);
+});
+
+test("opencode stdout is parsed even when tool-call narration precedes the JSON", () => {
+  // Captured shape from a real run: `--format default` concatenates narration
+  // fragments directly onto the answer with no delimiter.
+  const captured =
+    "I'll audit the ticket against the repo and the referenced spec." +
+    "Reading the full spec and key implementation touchpoints next." +
+    '{"verdict":"approve","summary":"ok"}';
+  assert.equal(cleanJsonResponse(captured), '{"verdict":"approve","summary":"ok"}');
+});
+
+test("the opencode session banner is on stderr and never reaches the extractor", () => {
+  // The banner ("> agent · model") is stderr; spawnWithWatchdog resolves with
+  // stdout alone, so a banner in the payload would mean we read the wrong stream.
+  const banner = "> adversarial-review-readonly · grok-4.5";
+  const stdout = '{"verdict":"approve","summary":"ok"}';
+  const cleaned = cleanJsonResponse(stdout);
+  assert.doesNotMatch(cleaned, /adversarial-review-readonly|·/);
+  assert.equal(cleaned, stdout);
+  assert.doesNotMatch(cleaned, new RegExp(banner.slice(0, 5)));
+});
+
+test("an unavailable opencode model is reported by name, not as a bare exit code", () => {
+  assert.equal(isOpencodeModelUnavailable("Error: Your credit balance is too low to access the Anthropic API."), true);
+  assert.equal(isOpencodeModelUnavailable("no such model: opencode-go/nope"), true);
+  assert.equal(isOpencodeModelUnavailable("unauthorized"), true);
+  assert.equal(isOpencodeModelUnavailable("some unrelated crash"), false);
 });

@@ -328,3 +328,35 @@ test("T45: auto-detection never selects copilot, even as the only CLI on PATH", 
     }
   });
 });
+
+// --- T46: opencode -------------------------------------------------------------
+
+test("T46: opencode resolves to the local CLI and is never upgraded to an API", () => {
+  withMockBins(["opencode"], { OPENCODE_API_KEY: "k", ANTHROPIC_API_KEY: "sk-b", OPENAI_API_KEY: "sk-a" }, () => {
+    const r = resolveProviderToken("opencode", {});
+    assert.equal(r.id, "opencode");
+    assert.equal(r.family, null, "opencode routes to many providers — it must not claim a family");
+    assert.equal(r.config.provider, "cli");
+    assert.equal(r.config.cliCmd, "opencode");
+  });
+});
+
+test("T46: opencode is unreachable when its binary is absent (no API fallback)", () => {
+  withMockBins([], { ANTHROPIC_API_KEY: "sk-present" }, () => {
+    assert.equal(resolveProviderToken("opencode", {}).config, null);
+  });
+});
+
+test("T46: opencode and copilot are distinct groups, neither folding into a Big-3 family", () => {
+  withMockBins(["opencode", "copilot", "codex"], {}, () => {
+    const sel = selectProviders({ providers: ["opencode", "copilot", "codex"] });
+    assert.equal(sel.providers.length, 3, "three explicit reviewers must stay three");
+    assert.deepEqual(sel.providers.map((p) => p.id).sort(), ["codex", "copilot", "opencode"]);
+  });
+});
+
+test("T46: auto-detection never selects opencode, even as the only CLI on PATH", () => {
+  withMockBins(["opencode"], {}, () => {
+    assert.throws(() => configureLLM({}), /No LLM configuration found/);
+  });
+});

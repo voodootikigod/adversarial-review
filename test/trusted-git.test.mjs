@@ -53,7 +53,10 @@ test("every spawn passes a sanitized environment", () => {
     const calls = code.match(/(?:execFileSync|spawnSync|spawn|spawnImpl)\([\s\S]{0,600}?\n\s*\}\)/g) || [];
     for (const call of calls) {
       // spawn-safe.js owns the sanitizer itself; exec-watchdog forwards it.
-      if (/env:\s*(sanitizedSpawnEnv|sanitizePathEnv|safeSpawnEnvOrRaw|options\.env)/.test(call)) continue;
+      // applyEnvOverrides is allowed to WRAP a sanitizer — it is additive only and
+      // refuses PATH in any casing — but a sanitizer must still be the base it
+      // wraps, so the capture group below is unchanged and remains required.
+      if (/env:\s*(?:applyEnvOverrides\(\s*)?(sanitizedSpawnEnv|sanitizePathEnv|safeSpawnEnvOrRaw|options\.env)/.test(call)) continue;
       offenders.push(`${file}: ${call.split("\n")[0].trim()}`);
     }
   }

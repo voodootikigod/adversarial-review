@@ -265,6 +265,33 @@ family would fake the diversity a `--providers` run reports. On Windows an npm-i
 `copilot` is a `.cmd` shim and is refused: Copilot takes the prompt as a command-line
 argument, which `cmd.exe` would re-parse — use `--provider claude` or `codex` there.
 
+**opencode** (`--provider opencode`): requires `opencode` on `PATH` and an authenticated
+provider (`opencode auth list`). Its `opencode-go` provider reaches models no other
+backend here serves — `grok-4.5`, `kimi-k3`, `qwen3.7-max`, `glm-5.2`, `deepseek-v4-pro`,
+`minimax-m3` — which makes it a genuinely independent critic of Big-3-authored code.
+Default model `opencode-go/grok-4.5`; override with `--model opencode-go/<name>`.
+**Explicit-only** and, like `copilot`, **not** a diversity family.
+
+opencode has no read-only flag, so reviews run under a generated config (supplied via
+`OPENCODE_CONFIG`) that declares a dedicated read-only agent: `write`, `edit`, `patch`,
+`bash`, and `task` disabled, `read`/`grep`/`glob`/`list` explicitly allowed, everything
+else denied. Do not pass `--agent plan` yourself — opencode treats `plan` as a *subagent*
+and silently falls back to your default agent, which typically permits writes.
+`--allow-unsandboxed-cli` opts out and runs under your own config, with a warning.
+
+Three details of that sandbox are load-bearing, because `OPENCODE_CONFIG` **merges**
+with local config rather than replacing it — and that merge includes project-local
+`opencode.json` from the repository *being reviewed*:
+
+- **The agent name is random per run.** A repo that ships an `opencode.json` redefining
+  the review agent *by name* wins the merge and re-enables `write`/`bash`. A fixed name
+  is one the attacker knows; a per-run name cannot be written into a file in advance.
+- **`--pure` is always passed**, so a reviewed repo cannot load a plugin — plugins run
+  code, which would make tool permissions moot.
+- **The run is verified after the fact.** opencode exits 0 even when it silently drops
+  to your default agent, so the result is refused unless its banner names the agent we
+  pinned.
+
 **Vercel AI Gateway** (`--provider vercel` or `gateway`): one key, many `provider/model`
 ids (e.g. `openai/gpt-5.6-sol`, `anthropic/claude-sonnet-5`, `google/gemini-2.5-pro`). With
 only `AI_GATEWAY_API_KEY` set, `--providers auto` can fan across those families through

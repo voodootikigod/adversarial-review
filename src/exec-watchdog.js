@@ -100,6 +100,41 @@ export function resolveWindows({ timeoutMs, idleTimeoutMs } = {}) {
  * The setTimeout/clearTimeout seams exist so the timing behaviour is testable
  * with fake timers instead of real wall-clock sleeps.
  */
+// ALLOWLIST, deliberately not a denylist.
+//
+// sanitizedSpawnEnv only sanitizes PATH — it does NOT strip NODE_OPTIONS,
+// LD_PRELOAD, DYLD_INSERT_LIBRARIES, BASH_ENV, GIT_* and the rest, because until
+// now nothing could add them: the child simply inherited a fixed environment. This
+// seam is the first thing that can put a variable INTO a child, so enumerating
+// what may pass is the only version of it that stays safe as callers are added.
+// A denylist here would have to grow to cover every loader and interpreter hook on
+// every platform, and would be wrong by omission the first time one is missed.
+const ENV_OVERRIDE_ALLOWLIST = new Set(["OPENCODE_CONFIG"]);
+
+/**
+ * Merge caller-supplied variables into the sanitized environment. Additive only:
+ * returns a new object, never mutates the sanitized env, and accepts only keys on
+ * the allowlist above. Values must be caller-generated — nothing derived from the
+ * reviewed diff or from repository content may be routed through here.
+ */
+export function applyEnvOverrides(env, overrides) {
+  if (!overrides || typeof overrides !== "object") return env;
+  const merged = { ...env };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (!ENV_OVERRIDE_ALLOWLIST.has(key)) {
+      throw new Error(
+        `Refusing to set "${key}" in a child environment: only ` +
+          `${[...ENV_OVERRIDE_ALLOWLIST].join(", ")} may be overridden. Loader and ` +
+          `interpreter hooks (NODE_OPTIONS, LD_PRELOAD, BASH_ENV, GIT_*) would let a ` +
+          `child run code the trust boundary is meant to exclude.`
+      );
+    }
+    if (value == null) continue;
+    merged[key] = String(value);
+  }
+  return merged;
+}
+
 export function spawnWithWatchdog(cmd, args = [], options = {}) {
   const {
     input = null,
@@ -110,6 +145,13 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
     // Explicit, never inferred: the caller knows whether argv carries the
     // reviewed prompt (argv fallback) or only our own constant flags.
     argsContainUntrusted = true,
+    // Extra environment for the child, applied ON TOP OF the sanitized env — it
+    // can only ADD variables, never weaken the trust boundary. Keys that carry
+    // that boundary (PATH and its casings) are dropped, so an override cannot
+    // reintroduce a repository-local directory into the child's lookup path.
+    // Values must be caller-generated: nothing derived from the reviewed diff or
+    // from repository content may be routed through here.
+    envOverrides = null,
     setTimeoutImpl = setTimeout,
     clearTimeoutImpl = clearTimeout,
     spawnImpl = spawn,
@@ -117,7 +159,10 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
     // Progress goes to STDERR. stdout carries the --json result and the --loop
     // NDJSON event stream, and interleaving raw provider output into it produces
     // unparseable machine output for every CI consumer.
-    stdoutSink = (chunk) => process.stderr.write(chunk)
+    stdoutSink = (chunk) => process.stderr.write(chunk),
+    // Observe stderr as it arrives, including on runs that exit 0. Observation
+    // only: it cannot alter the resolved value or suppress an error.
+    onStderr = null
   } = options;
 
   const { maxMs, idleMs } = resolveWindows({ timeoutMs, idleTimeoutMs });
@@ -158,7 +203,7 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
       windowsVerbatimArguments: target.windowsVerbatimArguments === true,
       // The child does its OWN lookups (env-shebang interpreters, .cmd wrappers
       // falling back to a bare node) from what it inherits — see sanitizedSpawnEnv.
-      env: sanitizedSpawnEnv(),
+      env: applyEnvOverrides(sanitizedSpawnEnv(), envOverrides),
       // Own process group so terminateProcessTree can signal the whole tree.
       detached: process.platform !== "win32"
     });
@@ -232,6 +277,11 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
         if (text && streamStdout) stdoutSink(text);
       } else {
         stderr += text;
+        // A rejection carries stderr, but a SUCCESS resolves with stdout alone —
+        // so a caller that must inspect stderr on a clean exit (an agent CLI that
+        // warns about a silent sandbox downgrade and then exits 0) has no other
+        // way to see it. Optional, and never changes the resolve shape.
+        if (text && onStderr) onStderr(text);
       }
       if (byteCount > maxBuffer) {
         failWith(

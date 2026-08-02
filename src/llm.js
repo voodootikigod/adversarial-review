@@ -5,6 +5,7 @@ import { spawnWithWatchdog } from "./exec-watchdog.js";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import crypto from "crypto";
 import { log } from "./utils.js";
 import { sanitizeSchemaForProvider } from "./schema-validate.js";
 
@@ -247,7 +248,7 @@ export function isTrustedCliInstalled(cmd) {
   return resolveTrustedCli(cmd) !== null;
 }
 
-async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true } = {}) {
+async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true, envOverrides = null } = {}) {
   // SECURITY: no spawn site here selects a shell. A shell was once needed on
   // Windows so the interpreter would locate npm-installed `.cmd` shims, which are
   // not executable images. resolveCommand performs that lookup explicitly (PATH +
@@ -287,7 +288,8 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
     input,
     timeoutMs,
     streamStdout: stream,
-    argsContainUntrusted
+    argsContainUntrusted,
+    envOverrides
   });
 }
 
@@ -565,6 +567,234 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
   }
 }
 
+// The agent name the generated opencode config declares. Passing it explicitly is
+// mandatory: `--agent` naming something opencode considers a SUBAGENT does not fail
+// closed — it warns ("agent X is a subagent, not a primary agent. Falling back to
+// default agent") and proceeds under the user's own default, which on a normal
+// install carries {"permission": "*", "action": "allow"}. That is full write and
+// bash access applied to a prompt built from an untrusted diff.
+//
+// The name is also generated FRESH PER RUN, and that randomness is a security
+// control, not cosmetics. OPENCODE_CONFIG merges rather than replaces, and the
+// merge includes project-local `opencode.json` from the working directory — which
+// during a review IS the repository under review. Verified by attack: a repo that
+// ships an opencode.json redefining the review agent BY NAME with
+// `tools:{write,bash}=true, permission:{"*":"allow"}` wins that merge, and a live
+// run then wrote the file it was told to write. A fixed name is a name the
+// attacker knows. A per-run random one cannot be targeted by a file written before
+// the run. Verified separately: a hostile config that does NOT name our agent
+// (top-level `tools`/`permission` instead) does not broaden it.
+export const OPENCODE_AGENT_PREFIX = "adversarial-review-";
+
+export function newOpencodeAgentName() {
+  return `${OPENCODE_AGENT_PREFIX}${crypto.randomBytes(16).toString("hex")}`;
+}
+
+// Default gateway into opencode's non-frontier-lab providers, which is the reason
+// to reach for opencode at all: models no other supported provider can serve.
+// Overridable with --model. Always sent explicitly — see buildOpencodeConfig.
+export const OPENCODE_DEFAULT_MODEL = "opencode-go/grok-4.5";
+
+/**
+ * The read-only agent definition handed to opencode via OPENCODE_CONFIG.
+ *
+ * This config MERGES into the user's own (verified — their agents remain visible
+ * alongside ours), so it cannot rely on replacing anything they set. It works by
+ * declaring its OWN agent whose per-agent tools and permissions are self-contained,
+ * rather than by removing theirs.
+ *
+ * INVARIANT (enforced by test): every tool enabled here has an explicit permission
+ * entry. opencode has no headless auto-deny — an enabled tool whose permission is
+ * unset blocks on an interactive prompt forever, with no output and no error, until
+ * the watchdog kills it. Two runs were lost to exactly that (killed at 400s and
+ * 500s) before the catch-all "*": "deny" was added. The reviewer still needs to
+ * READ the repository, so read/grep/glob/list are enabled AND explicitly allowed;
+ * disabling everything instead makes the model stop mid-turn without answering,
+ * having planned tool calls it could not make.
+ */
+export function buildOpencodeConfig(agentName = newOpencodeAgentName()) {
+  return {
+    $schema: "https://opencode.ai/config.json",
+    agent: {
+      [agentName]: {
+        description: "Read-only adversarial reviewer (adversarial-review)",
+        mode: "primary",
+        tools: {
+          write: false, edit: false, patch: false, bash: false, task: false,
+          read: true, grep: true, glob: true, list: true
+        },
+        permission: {
+          "*": "deny",
+          read: "allow", grep: "allow", glob: "allow", list: "allow"
+        }
+      }
+    }
+  };
+}
+
+/** Argv for a review run. The prompt travels on stdin, so it never appears here. */
+export function opencodeReviewArgs({ model = null, agent } = {}) {
+  if (!agent) throw new Error("opencodeReviewArgs requires the per-run agent name");
+  // `--pure` blocks external plugins. Plugin loading is another path the reviewed
+  // repository controls through its own project config, and a plugin runs code —
+  // the sandbox on tools would be irrelevant if the repo could load a plugin.
+  // VERIFIED: OPENCODE_CONFIG MERGES into the user's config, it does not replace
+  // it — with our config set, `opencode agent list` still shows every agent the
+  // user defined, plus ours. So the user's default model WOULD be available.
+  // Send `-m` anyway: inheriting their default would make the reviewing model, and
+  // therefore the diversity of the review, depend on unrelated local config that
+  // can change without notice. A review pins its own model.
+  return ["--pure", "run", "--agent", agent, "-m", model || OPENCODE_DEFAULT_MODEL];
+}
+
+/**
+ * Fail-closed check on opencode's stderr after a run that exited 0.
+ *
+ * opencode does NOT fail closed when `--agent` cannot be honored: it prints
+ * `agent "X" is a subagent, not a primary agent. Falling back to default agent`
+ * and completes normally under the user's write-capable default. A clean exit and
+ * a well-formed JSON verdict are therefore NOT evidence the review was sandboxed.
+ * The banner names the agent that actually ran, so require ours by name.
+ */
+export function opencodeSandboxFailure(stderr, agentName) {
+  const text = (stderr || "").toString();
+  if (/is a subagent, not a primary agent|Falling back to default agent/i.test(text)) {
+    return `opencode fell back to the default agent — the review would have run WITHOUT the read-only sandbox.`;
+  }
+  if (!text.includes(agentName)) {
+    return `opencode never reported running the sandboxed agent "${agentName}"; refusing to trust the result.`;
+  }
+  return null;
+}
+
+/**
+ * Invoke opencode non-interactively with a generated read-only config.
+ *
+ * The prompt goes over stdin (`opencode run` reads it with no sentinel argument),
+ * so argv carries only our own constant flags and the argv-size guard does not
+ * apply. Only stdout is returned: the session banner ("> agent · model") goes to
+ * stderr and must never reach the JSON extractor.
+ */
+async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, model = null, allowUnsandboxedCli = false } = {}) {
+  // Private temp dir, mirroring callCodexCli: owned by this process, so path
+  // prediction and symlink races against a shared /tmp are not possible. It also
+  // keeps the config OUTSIDE the worktree — a config inside the repository under
+  // review would be one more thing a reviewed diff could rewrite.
+  const privateDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-review-opencode-"));
+  const configFile = path.join(privateDir, "opencode.json");
+
+  // `opencode run` drops a project-local `.omo/` state directory into the project
+  // it operates on. That directory follows the project, not the process cwd, so it
+  // cannot be relocated while the agent still reads the repository — and a reviewer
+  // that leaves untracked files in the tree it just reviewed will surface them in
+  // `git status` and, because untracked content is part of the reviewed input, feed
+  // its own session state into the NEXT review. Remove it only when this run created
+  // it: a pre-existing `.omo/` belongs to the user and is never touched.
+  const stateDir = path.join(process.cwd(), ".omo");
+  const stateDirPreexisted = fs.existsSync(stateDir);
+
+  // Fresh per run: a name the reviewed repository cannot have named in advance.
+  const agentName = newOpencodeAgentName();
+  let stderrSeen = "";
+
+  try {
+    if (allowUnsandboxedCli) {
+      // Opting out means running under the user's own agent config, which may
+      // permit writes. Say so rather than letting it look sandboxed.
+      log.warn("opencode is running WITHOUT the generated read-only config (--allow-unsandboxed-cli).");
+    } else {
+      // wx: exclusive create, defense in depth inside an already-private directory.
+      fs.writeFileSync(configFile, JSON.stringify(buildOpencodeConfig(agentName), null, 2), { mode: 0o600, flag: "wx" });
+    }
+
+    const args = allowUnsandboxedCli
+      ? ["--pure", "run", "-m", model || OPENCODE_DEFAULT_MODEL]
+      : opencodeReviewArgs({ model, agent: agentName });
+    const envOverrides = allowUnsandboxedCli ? null : { OPENCODE_CONFIG: configFile };
+
+    try {
+      const out = await execCli(cliCmd, args, fullPrompt, timeoutMs, {
+        stream,
+        argsContainUntrusted: false,
+        envOverrides,
+        onStderr: (chunk) => { stderrSeen += chunk; }
+      });
+      // A clean exit is NOT proof the sandbox applied — opencode warns and
+      // continues when it cannot honor --agent. Refuse the result rather than
+      // return a verdict produced by a write-capable agent.
+      if (!allowUnsandboxedCli) {
+        const breach = opencodeSandboxFailure(stderrSeen, agentName);
+        if (breach) {
+          throw new Error(
+            `${breach}\nRefusing the review result. Re-run, or pass --allow-unsandboxed-cli ` +
+              `to accept an unsandboxed opencode run deliberately.` +
+              (stderrSeen.trim() ? `\n${stderrSeen.trim()}` : "")
+          );
+        }
+      }
+      return out;
+    } catch (err) {
+      if (err.code === "ETIMEDOUT") {
+        throw Object.assign(new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      }
+      const stderr = err.stderr?.toString("utf8") || "";
+      const flagRejection = describeUnknownFlagRejection(cliCmd, stderr);
+      if (flagRejection) {
+        throw Object.assign(new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : "")), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      }
+      // An unreachable or unauthenticated model is the most likely failure and
+      // exits 1 with the reason only on stderr. Name the model and the command
+      // that shows what IS authenticated, rather than surfacing a bare exit code.
+      const chosen = model || OPENCODE_DEFAULT_MODEL;
+      if (isOpencodeModelUnavailable(stderr)) {
+        throw Object.assign(
+          new Error(
+            `opencode could not use model "${chosen}".\n` +
+              `Run \`opencode auth list\` to see which providers are authenticated, ` +
+              `then pass --model <provider/model> for one of them.` +
+              (stderr.trim() ? `\n${stderr.trim()}` : "")
+          ),
+          { stdout: err.stdout, stderr: err.stderr, cause: err }
+        );
+      }
+      const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
+      throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": ${err.message}${suffix}`), { stdout: err.stdout, stderr: err.stderr, cause: err });
+    }
+  } finally {
+    try { fs.rmSync(privateDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    removeStateDirIfCreated(stateDir, stateDirPreexisted);
+  }
+}
+
+/**
+ * Remove a project-local state directory that THIS run created.
+ *
+ * `opencode run` drops a `.omo/` directory into the project it operates on, and
+ * that directory follows the project rather than the process cwd — so it cannot be
+ * relocated while the agent still needs to read the repository. Whether it appears
+ * varies with the run, so this is written to be correct either way: absent is fine,
+ * pre-existing is left strictly alone (it is the user's), and only a directory that
+ * appeared during our run is removed. A symlink is never followed — removing one
+ * could reach outside the worktree entirely.
+ */
+export function removeStateDirIfCreated(stateDir, preexisted) {
+  if (preexisted) return false;
+  try {
+    const st = fs.lstatSync(stateDir);
+    if (!st.isDirectory()) return false;
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True when opencode stderr shows the model itself was the problem. */
+export function isOpencodeModelUnavailable(stderr) {
+  const text = (stderr || "").toString();
+  return /credit balance is too low|no such model|model not found|unknown model|not authenticated|unauthorized|provider .* not found/i.test(text);
+}
+
 // Invoke a local CLI agent (claude, agy, ...) by piping the prompt to stdin.
 const DEFAULT_CLI_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -586,6 +816,10 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
 
   if (commandKind(cliCmd) === "codex") {
     return callCodexCli(fullPrompt, schema, timeoutMs, { stream, model });
+  }
+
+  if (commandKind(cliCmd) === "opencode") {
+    return callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream, model, allowUnsandboxedCli });
   }
 
   const fallbackOpts = { allowUnsandboxedCli, model, timeoutMs };
@@ -1085,7 +1319,7 @@ const TOKEN_FAMILY = {
 // for that on-host CLI, so it resolves CLI-only and is NEVER silently upgraded to
 // the family's API (which would send the diff off-host despite the user's intent).
 // Their family label is still used for diversity grouping.
-const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy", "agent", "cursor-agent", "copilot"]);
+const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy", "agent", "cursor-agent", "copilot", "opencode"]);
 
 // Default Vercel AI Gateway model ids per diversity family (provider/model form).
 // THE single source of truth: every gateway model id in this file reads from here.

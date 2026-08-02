@@ -151,7 +151,16 @@ not a localhost proxy. `--provider copilot` uses the GitHub Copilot
 CLI (`copilot -p --mode plan`, read-only): explicit-only, never auto-detected, and NOT a
 diversity family (it routes to Claude/GPT/Gemini, so counting it would fake diversity).
 Refused on Windows, where an npm-installed `copilot` is a `.cmd` shim and its argv-borne
-prompt would be re-parsed by `cmd.exe`. `--provider vercel|gateway` uses Vercel AI Gateway
+prompt would be re-parsed by `cmd.exe`. `--provider opencode` uses opencode (prompt on
+stdin) under a GENERATED read-only agent config injected via `OPENCODE_CONFIG` — opencode
+has no read-only flag, and `--agent plan` does NOT fail closed (it is a subagent, so
+opencode warns and falls back to the user default agent, which may permit writes). Its
+`opencode-go` provider reaches non-frontier-lab models (grok, kimi, qwen, glm, deepseek,
+minimax); default `opencode-go/grok-4.5`. Explicit-only and NOT a diversity family. The
+agent name is RANDOM PER RUN because OPENCODE_CONFIG merges with project-local
+`opencode.json` from the repo under review: a fixed name lets a reviewed repo redefine
+the agent and re-enable write/bash (verified by attack). `--pure` blocks repo-controlled
+plugins, and the run is refused unless opencode's banner names the agent we pinned. `--provider vercel|gateway` uses Vercel AI Gateway
 (`provider/model` ids; one key can drive `--providers auto` across families).
 
 Force with `--provider <name>`; override the model with `--model <name>`. Gate quality

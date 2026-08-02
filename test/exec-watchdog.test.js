@@ -6,7 +6,8 @@ import {
   resolveWindows,
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_MAX_MS,
-  DEFAULT_MAX_BUFFER
+  DEFAULT_MAX_BUFFER,
+  applyEnvOverrides
 } from "../src/exec-watchdog.js";
 
 // ─── window resolution ──────────────────────────────────────────────────────
@@ -381,4 +382,83 @@ test("T13: maxBuffer counts BYTES, not UTF-16 units", async () => {
   child.stdout.emit("data", Buffer.from("→→→→→", "utf8")); // 15 bytes, 5 chars
   const err = await promise.catch((e) => e);
   assert.equal(err.code, "EBUFFER", "15 bytes must exceed a 10-byte cap");
+});
+
+// --- T46: envOverrides ---------------------------------------------------------
+
+test("applyEnvOverrides adds variables on top of the sanitized environment", () => {
+  const base = { PATH: "/trusted/bin", HOME: "/home/u" };
+  const merged = applyEnvOverrides(base, { OPENCODE_CONFIG: "/tmp/x/opencode.json" });
+  assert.equal(merged.OPENCODE_CONFIG, "/tmp/x/opencode.json");
+  assert.equal(merged.PATH, "/trusted/bin", "sanitized PATH survives");
+  assert.equal(merged.HOME, "/home/u");
+  assert.equal(base.OPENCODE_CONFIG, undefined, "must not mutate the input env");
+});
+
+test("applyEnvOverrides accepts ONLY allowlisted keys", () => {
+  const base = { PATH: "/trusted/bin" };
+  // PATH itself, in every casing the sanitizer treats as PATH.
+  for (const key of ["PATH", "Path", "path"]) {
+    assert.throws(() => applyEnvOverrides(base, { [key]: "/repo/node_modules/.bin" }), /only OPENCODE_CONFIG/);
+  }
+  // sanitizedSpawnEnv does NOT strip loader/interpreter hooks — it only sanitizes
+  // PATH — so this seam is the one place they could be introduced. An allowlist is
+  // what keeps that true as callers are added; a denylist would miss one.
+  for (const key of ["NODE_OPTIONS", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "GIT_DIR", "GIT_SSH_COMMAND", "PYTHONSTARTUP"]) {
+    assert.throws(
+      () => applyEnvOverrides(base, { [key]: "/repo/evil" }),
+      /Refusing to set/,
+      `${key} must be refused, not silently applied`
+    );
+  }
+  assert.equal(base.PATH, "/trusted/bin");
+});
+
+test("applyEnvOverrides is a no-op when no overrides are given", () => {
+  const base = { PATH: "/trusted/bin", HOME: "/home/u" };
+  assert.equal(applyEnvOverrides(base, null), base);
+  assert.equal(applyEnvOverrides(base, undefined), base);
+  assert.deepEqual(applyEnvOverrides(base, {}), base);
+});
+
+// Spawn once with the given options and return the env the child was handed.
+async function envHandedToChild(opts = {}) {
+  const clock = fakeClock();
+  const child = fakeChild();
+  let seenEnv = null;
+  const promise = spawnWithWatchdog("node", [], {
+    setTimeoutImpl: clock.setTimeoutImpl,
+    clearTimeoutImpl: clock.clearTimeoutImpl,
+    spawnImpl: (_cmd, _args, spawnOpts) => { seenEnv = spawnOpts.env; return child; },
+    terminateImpl: () => {},
+    ...opts
+  });
+  child.emit("close", 0);
+  await promise;
+  return seenEnv;
+}
+
+test("spawnWithWatchdog passes envOverrides to the child without losing the sanitized env", async () => {
+  const env = await envHandedToChild({ envOverrides: { OPENCODE_CONFIG: "/tmp/gen/opencode.json" } });
+  assert.equal(env.OPENCODE_CONFIG, "/tmp/gen/opencode.json");
+  assert.ok(env.PATH, "the sanitized PATH must still be present");
+});
+
+test("spawnWithWatchdog without envOverrides spawns the sanitized env unchanged", async () => {
+  const env = await envHandedToChild();
+  assert.equal(env.OPENCODE_CONFIG, undefined);
+  assert.ok(env.PATH);
+});
+
+test("an envOverrides attempt to rewrite PATH is refused, not applied", async () => {
+  // The whole point of the sanitized env: a repository-local node_modules/.bin
+  // must never re-enter the child's lookup path through this seam.
+  await assert.rejects(
+    envHandedToChild({ envOverrides: { PATH: "/repo/node_modules/.bin" } }),
+    /only OPENCODE_CONFIG/
+  );
+  await assert.rejects(
+    envHandedToChild({ envOverrides: { NODE_OPTIONS: "--require /repo/hook.js" } }),
+    /Refusing to set/
+  );
 });
