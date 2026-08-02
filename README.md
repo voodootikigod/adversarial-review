@@ -158,7 +158,10 @@ Next steps
 --context-lines <n>    Diff context lines passed to git diff -U<n> (default 10).
 --include-files        Also inline full post-change file contents (budgeted).
 --allow-summary-review Allow API providers to review summary-only large diffs.
---allow-unsandboxed-cli Allow claude/agy/agent review without plan/read-only mode.
+--allow-unsandboxed-cli Allow claude/agy/agent/copilot review without plan/read-only
+                       mode. For opencode this DISABLES the generated read-only
+                       config entirely — the reviewer gets your own agent's
+                       write/bash access on an untrusted diff.
 --allow-secrets        Send the payload even if the secret scan finds likely
                        credentials in the diff (off by default).
 
@@ -179,9 +182,10 @@ Next steps
 
 # Provider
 --provider <name>      anthropic | openai | gemini | vercel | gateway |
-                       cursor | agent | copilot | <local-cli-cmd>.
+                       cursor | agent | copilot | opencode | <local-cli-cmd>.
                        cursor/agent → Cursor Agent CLI; vercel/gateway → AI Gateway;
-                       copilot → GitHub Copilot CLI (explicit-only).
+                       copilot → GitHub Copilot CLI; opencode → opencode (incl.
+                       opencode-go models). copilot and opencode are explicit-only.
 --model <name>         Force the model name (Gateway: use provider/model ids).
 --api-base <url>       Override the active provider's API base URL.
 --api-key <key>        Override the active provider's API key.

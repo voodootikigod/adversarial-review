@@ -590,6 +590,12 @@ export function newOpencodeAgentName() {
   return `${OPENCODE_AGENT_PREFIX}${crypto.randomBytes(16).toString("hex")}`;
 }
 
+// Silence budget for an opencode run. Generous enough that a slow model turn is
+// never mistaken for a hang, short enough that the permission-prompt stall fails in
+// minutes rather than tens of minutes. resolveWindows clamps it below the ceiling,
+// so a small --timeout still wins.
+const OPENCODE_IDLE_MS = 5 * 60 * 1000;
+
 // Default gateway into opencode's non-frontier-lab providers, which is the reason
 // to reach for opencode at all: models no other supported provider can serve.
 // Overridable with --model. Always sent explicitly — see buildOpencodeConfig.
@@ -690,9 +696,13 @@ export function opencodeReviewArgs({ model = null, agent } = {}) {
  * and arguments, and folding those in would feed the reviewed repository's own
  * source back into the JSON extractor as if the model had written it.
  *
- * Falls back to the raw payload when nothing parses, so a plain-text reply (or a
- * future format change) still reaches the caller's JSON extraction rather than
- * silently becoming an empty review.
+ * THERE IS NO RAW-STDOUT FALLBACK, and reintroducing one would be a security
+ * regression, not a robustness fix. Both empty cases throw instead:
+ *   - no typed events at all → the format changed underneath us
+ *   - typed events but no assistant text → the model produced no answer
+ * In either case the only thing left on stdout is tool output, i.e. contents of the
+ * repository under review. Handing that to the caller's JSON extractor is how a
+ * planted file that looks like an approve verdict gets promoted to one.
  */
 export function extractOpencodeText(stdout) {
   const raw = (stdout || "").toString();
@@ -845,7 +855,15 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
       const out = await execCli(cliCmd, args, fullPrompt, timeoutMs, {
         stream: false,
         argsContainUntrusted: false,
-        envOverrides
+        envOverrides,
+        // The idle guard is OFF by default across this tool, and correctly so: a
+        // silent agent is usually a working agent. opencode under --format json is
+        // the exception — it emits step/tool/text events throughout, so a long
+        // silence is not thinking, it is the documented permission hang (a key we
+        // did not enumerate defaulting to "ask" on a prompt nobody can answer).
+        // Without this, that surfaces as a stall to the hard ceiling — up to 40
+        // minutes on the default budget — instead of a fast, explicit failure.
+        idleTimeoutMs: OPENCODE_IDLE_MS
       });
       return extractOpencodeText(out);
     } catch (err) {
