@@ -280,6 +280,11 @@ yourself — opencode treats `plan` as a *subagent* and silently falls back to y
 default agent, which typically permits writes. `--allow-unsandboxed-cli` opts out and
 runs under your own config, with a warning.
 
+`--stream` is ignored for opencode: under `--format json` every tool result is an
+event on stdout, and streaming mirrors those to stderr — which would put file
+contents the reviewer opened straight into a CI log. The review still returns
+normally; only the live progress output is suppressed.
+
 **Secret scanning does not cover what the model reads.** The pre-flight secret scan
 runs on the outbound payload (the diff and its context). A reviewer with `read`/`grep`
 can open files that are not in the diff at all — a gitignored `.env`, a credentials

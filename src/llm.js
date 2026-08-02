@@ -711,14 +711,20 @@ export function extractOpencodeText(stdout) {
     sawEvent = true;
     if (evt.type === "text" && typeof evt.part?.text === "string") parts.push(evt.part.text);
   }
-  // Raw fallback ONLY when nothing parsed as an event — i.e. a plain-text reply or a
-  // wholesale format change. Once events are present, the text-only rule is
-  // load-bearing and must not be relaxed to "return everything instead": tool events
-  // carry file contents from the repository under review, so a repo containing a
-  // file that looks like a verdict could have it lifted straight into the review.
-  // An event stream with no assistant text is an error, not an invitation to guess.
+  // Fail closed in BOTH directions. The text-only rule is load-bearing: tool events
+  // carry file contents from the repository under review, so a repo shipping a file
+  // that looks like a verdict could have it lifted into the review as the model's
+  // own words. There is deliberately no raw fallback — we always pass --format json,
+  // so a stream with no typed events means the format changed underneath us, and
+  // guessing at that is exactly how forged content gets promoted to a verdict.
   const text = parts.join("").trim();
-  if (!sawEvent) return raw.trim();
+  if (!sawEvent) {
+    throw new Error(
+      "opencode returned no JSON event stream despite --format json. Refusing to " +
+        "interpret raw output as the model's verdict: it may contain repository file " +
+        "contents. Check that the installed opencode still supports --format json."
+    );
+  }
   if (!text) {
     throw new Error(
       "opencode produced no assistant text (only tool/step events). Refusing to fall " +
@@ -829,8 +835,15 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
     }
 
     try {
+      // NEVER stream this provider's stdout. Under --format json every tool result
+      // is an event on stdout, and tool results carry repository file contents —
+      // including files the reviewer opened that are NOT in the diff, so never seen
+      // by the pre-flight secret scan. streamStdout mirrors raw stdout chunks to
+      // stderr, which would put a gitignored .env straight into a CI log. Progress
+      // is not worth that; the review itself still returns normally.
+      if (stream) log.substep("opencode output is not streamed: its event stream carries file contents.");
       const out = await execCli(cliCmd, args, fullPrompt, timeoutMs, {
-        stream,
+        stream: false,
         argsContainUntrusted: false,
         envOverrides
       });
