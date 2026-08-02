@@ -145,10 +145,9 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
     // Explicit, never inferred: the caller knows whether argv carries the
     // reviewed prompt (argv fallback) or only our own constant flags.
     argsContainUntrusted = true,
-    // Extra environment for the child, applied ON TOP OF the sanitized env — it
-    // can only ADD variables, never weaken the trust boundary. Keys that carry
-    // that boundary (PATH and its casings) are dropped, so an override cannot
-    // reintroduce a repository-local directory into the child's lookup path.
+    // Extra environment for the child, applied ON TOP OF the sanitized env via
+    // applyEnvOverrides — additive only, and restricted to an explicit allowlist
+    // so it cannot reintroduce a loader hook or a repository-local lookup path.
     // Values must be caller-generated: nothing derived from the reviewed diff or
     // from repository content may be routed through here.
     envOverrides = null,
@@ -159,10 +158,7 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
     // Progress goes to STDERR. stdout carries the --json result and the --loop
     // NDJSON event stream, and interleaving raw provider output into it produces
     // unparseable machine output for every CI consumer.
-    stdoutSink = (chunk) => process.stderr.write(chunk),
-    // Observe stderr as it arrives, including on runs that exit 0. Observation
-    // only: it cannot alter the resolved value or suppress an error.
-    onStderr = null
+    stdoutSink = (chunk) => process.stderr.write(chunk)
   } = options;
 
   const { maxMs, idleMs } = resolveWindows({ timeoutMs, idleTimeoutMs });
@@ -277,11 +273,6 @@ export function spawnWithWatchdog(cmd, args = [], options = {}) {
         if (text && streamStdout) stdoutSink(text);
       } else {
         stderr += text;
-        // A rejection carries stderr, but a SUCCESS resolves with stdout alone —
-        // so a caller that must inspect stderr on a clean exit (an agent CLI that
-        // warns about a silent sandbox downgrade and then exits 0) has no other
-        // way to see it. Optional, and never changes the resolve shape.
-        if (text && onStderr) onStderr(text);
       }
       if (byteCount > maxBuffer) {
         failWith(

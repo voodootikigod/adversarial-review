@@ -273,24 +273,33 @@ Default model `opencode-go/grok-4.5`; override with `--model opencode-go/<name>`
 **Explicit-only** and, like `copilot`, **not** a diversity family.
 
 opencode has no read-only flag, so reviews run under a generated config (supplied via
-`OPENCODE_CONFIG`) that declares a dedicated read-only agent: `write`, `edit`, `patch`,
-`bash`, and `task` disabled, `read`/`grep`/`glob`/`list` explicitly allowed, everything
-else denied. Do not pass `--agent plan` yourself — opencode treats `plan` as a *subagent*
-and silently falls back to your default agent, which typically permits writes.
+`OPENCODE_CONFIG`) declaring a dedicated agent with `permission: { "*": "deny" }`.
+Do not pass `--agent plan` yourself — opencode treats `plan` as a *subagent* and
+silently falls back to your default agent, which typically permits writes.
 `--allow-unsandboxed-cli` opts out and runs under your own config, with a warning.
 
-Three details of that sandbox are load-bearing, because `OPENCODE_CONFIG` **merges**
-with local config rather than replacing it — and that merge includes project-local
-`opencode.json` from the repository *being reviewed*:
+**The opencode reviewer has no tools.** It reviews the diff carried in the prompt and
+cannot open files outside it, so cross-file findings that need repository navigation
+are weaker than with `claude`, `codex`, or an API provider. That is a deliberate
+trade-off, not an oversight: of the three plausible permission shapes, only deny-all
+is safe. `{ "*": "allow", write: "deny" }` lets the catch-all win and the model wrote
+a file anyway; explicit denies with no catch-all leave unlisted tools on `"ask"`, which
+blocks a headless run forever. `tools: { write: false }` is not a control either.
+Use a different provider when you need a reviewer that reads the wider repository.
+
+Three further details are load-bearing, because `OPENCODE_CONFIG` **merges** with local
+config rather than replacing it — and that merge includes project-local `opencode.json`
+from the repository *being reviewed*:
 
 - **The agent name is random per run.** A repo that ships an `opencode.json` redefining
   the review agent *by name* wins the merge and re-enables `write`/`bash`. A fixed name
   is one the attacker knows; a per-run name cannot be written into a file in advance.
 - **`--pure` is always passed**, so a reviewed repo cannot load a plugin — plugins run
   code, which would make tool permissions moot.
-- **The run is verified after the fact.** opencode exits 0 even when it silently drops
-  to your default agent, so the result is refused unless its banner names the agent we
-  pinned.
+- **A preflight runs before the diff is sent.** `opencode agent list` must report our
+  agent as `primary` in the merged config. This is checked up front because under
+  `--format json` a silent downgrade to your default agent produces no output on any
+  stream — there is nothing to detect afterwards.
 
 **Vercel AI Gateway** (`--provider vercel` or `gateway`): one key, many `provider/model`
 ids (e.g. `openai/gpt-5.6-sol`, `anthropic/claude-sonnet-5`, `google/gemini-2.5-pro`). With

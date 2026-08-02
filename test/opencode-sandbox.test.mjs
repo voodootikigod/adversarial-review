@@ -234,6 +234,7 @@ function mockOpencode(mode) {
     'case "$*" in',
     `  *"agent list"*) echo "$agent (${mode})"; exit 0 ;;`,
     "esac",
+    '[ -n "$ADV_MOCK_RUN_FLAG" ] && : > "$ADV_MOCK_RUN_FLAG"',
     "cat > /dev/null",
     `echo '${evt}'`,
     "exit 0"
@@ -243,7 +244,7 @@ function mockOpencode(mode) {
 const MOCK_OK = mockOpencode("primary");
 const MOCK_DOWNGRADED = mockOpencode("subagent");
 
-function reviewWithMockOpencode(mockBody) {
+function reviewWithMockOpencode(mockBody, { recordPrompt = false } = {}) {
   const mocks = fs.mkdtempSync(path.join(os.tmpdir(), "adv-oc-mock-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-oc-repo-"));
   try {
@@ -260,32 +261,42 @@ function reviewWithMockOpencode(mockBody) {
     git(["commit", "-qm", "init"]);
     fs.writeFileSync(path.join(repo, "code.js"), "export const x = 2; // changed\n");
 
+    const promptFlag = path.join(mocks, "run-invoked");
     const PATH_ENV = [mocks, path.dirname(process.execPath), "/usr/bin", "/bin"].join(path.delimiter);
-    return _spawnSync(process.execPath, [cliPath, "--provider", "opencode", "--scope", "working-tree", "--allow-secrets"], {
+    const r = _spawnSync(process.execPath, [cliPath, "--provider", "opencode", "--scope", "working-tree", "--allow-secrets"], {
       cwd: repo,
       encoding: "utf8",
-      env: { HOME: process.env.HOME, PATH: PATH_ENV, ADVERSARIAL_REVIEW_CONFIG: path.join(mocks, "cfg.json") }
+      env: {
+        HOME: process.env.HOME, PATH: PATH_ENV,
+        ADVERSARIAL_REVIEW_CONFIG: path.join(mocks, "cfg.json"),
+        ADV_MOCK_RUN_FLAG: promptFlag
+      }
     });
+    if (recordPrompt) r.promptReceived = fs.existsSync(promptFlag);
+    return r;
   } finally {
     fs.rmSync(mocks, { recursive: true, force: true });
     fs.rmSync(repo, { recursive: true, force: true });
   }
 }
 
-test("a sandboxed opencode run is accepted (stderr plumbing is actually wired)", { skip: process.platform === "win32" ? "posix mock" : false }, () => {
-  // Echo the pinned agent back on stderr, exactly as the real banner does. If
-  // onStderr is not forwarded to the watchdog, the run is refused and this fails.
+test("a review runs only after the preflight confirms our agent is primary", { skip: process.platform === "win32" ? "posix mock" : false }, () => {
+  // The control is the PREFLIGHT, not anything observed after the run: under
+  // --format json a silent agent downgrade produces no output on any stream, so
+  // there is nothing to check afterwards. The mock answers `agent list` from
+  // OPENCODE_CONFIG exactly as the real CLI does.
   const r = reviewWithMockOpencode(MOCK_OK);
   assert.equal(r.status, 0, `expected a clean review, got ${r.status}:\n${r.stderr}`);
   assert.doesNotMatch(r.stderr || "", /did not register the sandboxed agent/);
 });
 
-test("a silent agent downgrade is refused even though opencode exits 0", { skip: process.platform === "win32" ? "posix mock" : false }, () => {
-  // The real fail-open: opencode warns, drops to the user's write-capable default,
-  // returns a well-formed verdict, and exits 0. The verdict must not be trusted.
-  const r = reviewWithMockOpencode(MOCK_DOWNGRADED);
-  assert.notEqual(r.status, 0, "a downgraded run must not produce a passing review");
+test("the diff is never sent when the preflight reports a downgraded agent", { skip: process.platform === "win32" ? "posix mock" : false }, () => {
+  // The real fail-open this guards: opencode drops to the user's write-capable
+  // default, returns a well-formed verdict, and exits 0. The run must not start.
+  const r = reviewWithMockOpencode(MOCK_DOWNGRADED, { recordPrompt: true });
+  assert.notEqual(r.status, 0, "a downgraded agent must not produce a passing review");
   assert.match(r.stderr || "", /did not register the sandboxed agent/);
+  assert.equal(r.promptReceived, false, "the diff must not reach an unsandboxed agent");
 });
 
 test("state cleanup covers the project root, not only the process cwd", () => {

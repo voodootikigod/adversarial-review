@@ -248,7 +248,7 @@ export function isTrustedCliInstalled(cmd) {
   return resolveTrustedCli(cmd) !== null;
 }
 
-async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true, envOverrides = null, onStderr = null } = {}) {
+async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true, envOverrides = null } = {}) {
   // SECURITY: no spawn site here selects a shell. A shell was once needed on
   // Windows so the interpreter would locate npm-installed `.cmd` shims, which are
   // not executable images. resolveCommand performs that lookup explicitly (PATH +
@@ -289,8 +289,7 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
     timeoutMs,
     streamStdout: stream,
     argsContainUntrusted,
-    envOverrides,
-    onStderr
+    envOverrides
   });
 }
 
@@ -757,7 +756,6 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
 
   // Fresh per run: a name the reviewed repository cannot have named in advance.
   const agentName = newOpencodeAgentName();
-  let stderrSeen = "";
 
   try {
     if (allowUnsandboxedCli) {
@@ -805,8 +803,7 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
       const out = await execCli(cliCmd, args, OPENCODE_NO_TOOLS_PREAMBLE + fullPrompt, timeoutMs, {
         stream,
         argsContainUntrusted: false,
-        envOverrides,
-        onStderr: (chunk) => { stderrSeen += chunk; }
+        envOverrides
       });
       return extractOpencodeText(out);
     } catch (err) {
