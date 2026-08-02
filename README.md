@@ -248,7 +248,7 @@ a weaker critic. Otherwise:
 2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
 4. `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`) → Vercel AI Gateway
-   (`--provider vercel`, default model `anthropic/claude-sonnet-4.6`)
+   (`--provider vercel`, default model `anthropic/claude-sonnet-5`)
 5. A local CLI agent on `PATH`: `claude`, `codex`, `agy`, or `agent` (Cursor Agent CLI)
 
 **Cursor Agent CLI** (`--provider cursor` or `agent`): requires `agent` on `PATH` and
@@ -257,7 +257,7 @@ not a localhost HTTP proxy — for third-party OpenAI-compatible proxies use
 `--provider openai --api-base <url>`.
 
 **Vercel AI Gateway** (`--provider vercel` or `gateway`): one key, many `provider/model`
-ids (e.g. `openai/gpt-5`, `anthropic/claude-sonnet-4.6`, `google/gemini-2.5-pro`). With
+ids (e.g. `openai/gpt-5.6-sol`, `anthropic/claude-sonnet-5`, `google/gemini-2.5-pro`). With
 only `AI_GATEWAY_API_KEY` set, `--providers auto` can fan across those families through
 the Gateway (native vendor keys still win when present). Family token `anthropic` (not
 the CLI-only token `claude`) selects the Anthropic family via Gateway/API.

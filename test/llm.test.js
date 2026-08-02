@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall } from "../src/llm.js";
+import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall, GATEWAY_FAMILY_MODELS } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 import { buildSpawnTarget } from "../src/spawn-safe.js";
 import { writeMockBin, writeSimpleMockBin } from "./helpers/mock-bin.mjs";
@@ -490,7 +490,7 @@ test("configureLLM vercel / gateway defaults (AI Gateway)", () => {
     const vercel = configureLLM({ provider: "vercel" });
     assert.equal(vercel.provider, "vercel");
     assert.equal(vercel.apiBase, "https://ai-gateway.vercel.sh/v1");
-    assert.equal(vercel.model, "anthropic/claude-sonnet-4.6");
+    assert.equal(vercel.model, GATEWAY_FAMILY_MODELS.anthropic);
     assert.equal(vercel.apiKey, "test");
 
     const alias = configureLLM({ provider: "gateway" });

@@ -819,7 +819,7 @@ export function configureLLM(args) {
         provider = "openai";
       } else if (canGw()) {
         provider = "vercel";
-        gatewayPreferModel = "openai/gpt-5";
+        gatewayPreferModel = GATEWAY_FAMILY_MODELS.openai;
       } else if (canCli("codex")) {
         provider = "cli";
         cliCmd = "codex";
@@ -851,7 +851,7 @@ export function configureLLM(args) {
         provider = "openai";
       } else if (canGw()) {
         provider = "vercel";
-        gatewayPreferModel = "anthropic/claude-sonnet-4.6";
+        gatewayPreferModel = GATEWAY_FAMILY_MODELS.anthropic;
       } else if (canCli("agy")) {
         provider = "cli";
         cliCmd = "agy";
@@ -990,7 +990,7 @@ export function configureLLM(args) {
     } else if (provider === "anthropic") {
       model = cfgModel || "claude-sonnet-4-6";
     } else if (provider === "vercel") {
-      model = gatewayPreferModel || cfgModel || "anthropic/claude-sonnet-4.6";
+      model = gatewayPreferModel || cfgModel || GATEWAY_FAMILY_MODELS.anthropic;
     }
   } else if (!model && provider === "cli" && cfgModel) {
     // A local CLI has no hardcoded default model; honor a config pin if present.
@@ -1066,9 +1066,23 @@ const TOKEN_FAMILY = {
 const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy", "agent", "cursor-agent"]);
 
 // Default Vercel AI Gateway model ids per diversity family (provider/model form).
+// THE single source of truth: every gateway model id in this file reads from here.
+// Writing one inline again reintroduces the drift this map exists to prevent —
+// test/gateway-model-drift.test.mjs fails the build if a literal reappears in src/.
+//
+// Pins track the strong tier of each family, not the cheap one, and not the
+// `-pro`/`-opus` tier above it: gate quality tracks model tier, but so do cost and
+// latency, and a review runs on every diff.
 export const GATEWAY_FAMILY_MODELS = {
-  openai: "openai/gpt-5",
-  anthropic: "anthropic/claude-sonnet-4.6",
+  openai: "openai/gpt-5.6-sol",
+  anthropic: "anthropic/claude-sonnet-5",
+  // Deliberately a generation behind its siblings, and NOT an oversight. The
+  // Gateway catalog carries no stable 3.x *pro* text model: the 3.x line is
+  // flash / flash-lite / image variants plus exactly one pro, and that one is
+  // `google/gemini-3.1-pro-preview`. Moving off 2.5-pro would mean either
+  // dropping to a weaker flash tier or pinning a preview model to a review gate.
+  // Revisit when a stable `google/gemini-3.x-pro` ships — the drift test's
+  // diagnostic will surface it.
   gemini: "google/gemini-2.5-pro"
 };
 

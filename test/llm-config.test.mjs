@@ -9,7 +9,8 @@ import {
   familyForResolution,
   cachedResolutionUsable,
   apiOutranksCliInContext,
-  resolvedCliPath
+  resolvedCliPath,
+  GATEWAY_FAMILY_MODELS
 } from "../src/llm.js";
 import { loadConfig, saveConfig, withResolution } from "../src/config-store.js";
 
@@ -218,9 +219,71 @@ test("configureLLM lets the diversity model choice outrank a config pin (gateway
   // gateway model must not reintroduce the builder's own family.
   withEnv({ CLAUDECODE: "1", AI_GATEWAY_API_KEY: "gw" }, () => {
     const config = configureLLM({
-      config: { defaults: { models: { vercel: "anthropic/claude-sonnet-4.6" } } }
+      config: { defaults: { models: { vercel: GATEWAY_FAMILY_MODELS.anthropic } } }
     });
     assert.equal(config.provider, "vercel");
-    assert.equal(config.model, "openai/gpt-5");
+    assert.equal(config.model, GATEWAY_FAMILY_MODELS.openai);
+  });
+});
+
+// --- T47 AC2/AC3/AC5: the pin map is the only source of gateway model ids ----
+
+test("the Claude-Code ladder takes its gateway model from GATEWAY_FAMILY_MODELS", () => {
+  // Builder is Claude, so the critic must not be the anthropic family.
+  withEnv({ CLAUDECODE: "1", AI_GATEWAY_API_KEY: "gw" }, () => {
+    const config = configureLLM({});
+    assert.equal(config.provider, "vercel");
+    assert.equal(config.model, GATEWAY_FAMILY_MODELS.openai);
+  });
+});
+
+test("the Cursor ladder takes its gateway model from GATEWAY_FAMILY_MODELS", () => {
+  // Builder is Cursor (openai family), so the critic prefers anthropic.
+  withEnv({ TERM_PROGRAM: "cursor", AI_GATEWAY_API_KEY: "gw" }, () => {
+    const config = configureLLM({});
+    assert.equal(config.provider, "vercel");
+    assert.equal(config.model, GATEWAY_FAMILY_MODELS.anthropic);
+  });
+});
+
+test("the gateway fallback default comes from GATEWAY_FAMILY_MODELS", () => {
+  // No builder IDE: no diversity preference is set, so the default applies.
+  withEnv({ AI_GATEWAY_API_KEY: "gw" }, () => {
+    const config = configureLLM({});
+    assert.equal(config.provider, "vercel");
+    assert.equal(config.model, GATEWAY_FAMILY_MODELS.anthropic);
+  });
+});
+
+test("gateway model precedence: --model > diversity choice > config pin > map default", () => {
+  // Rung 1: an explicit --model beats everything, including the diversity choice.
+  withEnv({ CLAUDECODE: "1", AI_GATEWAY_API_KEY: "gw" }, () => {
+    const config = configureLLM({
+      model: "openai/gpt-5-pro",
+      config: { defaults: { models: { vercel: "anthropic/claude-opus-5" } } }
+    });
+    assert.equal(config.model, "openai/gpt-5-pro");
+  });
+
+  // Rung 2: the diversity choice beats a config pin (covered above, asserted here
+  // against the map so a pin change cannot silently break the ordering).
+  withEnv({ CLAUDECODE: "1", AI_GATEWAY_API_KEY: "gw" }, () => {
+    const config = configureLLM({
+      config: { defaults: { models: { vercel: "anthropic/claude-opus-5" } } }
+    });
+    assert.equal(config.model, GATEWAY_FAMILY_MODELS.openai);
+  });
+
+  // Rung 3: with no diversity preference, a config pin beats the map default.
+  withEnv({ AI_GATEWAY_API_KEY: "gw" }, () => {
+    const config = configureLLM({
+      config: { defaults: { models: { vercel: "anthropic/claude-opus-5" } } }
+    });
+    assert.equal(config.model, "anthropic/claude-opus-5");
+  });
+
+  // Rung 4: nothing set — the map default.
+  withEnv({ AI_GATEWAY_API_KEY: "gw" }, () => {
+    assert.equal(configureLLM({}).model, GATEWAY_FAMILY_MODELS.anthropic);
   });
 });
