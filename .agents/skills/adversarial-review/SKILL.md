@@ -164,10 +164,10 @@ preflight (`opencode agent list`) must report our agent as primary before the di
 sent. The generated config enumerates EVERY permission
 key in opencode's schema: an unset key defaults to "ask" and hangs a headless run, `"*"` is
 not a wildcard, and `edit` (not `write`) governs modification. read/grep/glob/list are
-allowed; edit/bash/task/webfetch/websearch/external_directory are denied. NOTE: the pre-flight secret
-scan covers the outbound payload only -- a reviewer with read/grep can open files that
-are not in the diff (a gitignored .env) and quote them in a finding. True of any
-tool-using reviewer; prefer an API provider for repos holding real credentials. `--provider vercel|gateway` uses Vercel AI Gateway
+allowed; edit/bash/task/webfetch/websearch/external_directory are denied. Secrets are scanned on the way OUT as
+well as in: a tool-using reviewer can read a gitignored .env that was never in the diff,
+so the review response is scanned before it is rendered, printed as --json, or
+ledgered. Matches are masked in place (the finding survives, the credential does not). `--provider vercel|gateway` uses Vercel AI Gateway
 (`provider/model` ids; one key can drive `--providers auto` across families).
 
 Force with `--provider <name>`; override the model with `--model <name>`. Gate quality

@@ -289,13 +289,17 @@ event on stdout, and streaming mirrors those to stderr — which would put file
 contents the reviewer opened straight into a CI log. The review still returns
 normally; only the live progress output is suppressed.
 
-**Secret scanning does not cover what the model reads.** The pre-flight secret scan
-runs on the outbound payload (the diff and its context). A reviewer with `read`/`grep`
-can open files that are not in the diff at all — a gitignored `.env`, a credentials
-file — and quote them in a finding, which then lands in your terminal or CI log
-unscanned. This is true of any tool-using reviewer (`claude`, `codex`, `agent`) and is
-not specific to opencode, but opencode enables it by default. Prefer an API provider
-for repositories holding real credentials, and treat review output as sensitive.
+**Secrets are scanned on the way out as well as the way in.** The pre-flight scan
+covers the outbound payload (the diff and its context). It cannot cover what a
+tool-using reviewer *reads*: with `read`/`grep`, a model can open a gitignored `.env`
+that was never in the diff and quote it into a finding. So the review response is
+scanned too, before it is rendered, printed as `--json`, or written to the findings
+ledger. Matches are masked in place and the redaction is announced on stderr.
+
+Redaction is surgical rather than dropping the field, because "you committed a live
+key" is one of the most valuable things this tool reports — the finding survives with
+the credential masked. The scan is heuristic, so treat review output from a
+tool-enabled provider as sensitive regardless.
 
 The permission block enumerates **every** key in opencode's schema, which matters for
 two non-obvious reasons: an unset key defaults to `"ask"`, and an interactive prompt
