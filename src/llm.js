@@ -711,12 +711,21 @@ export function extractOpencodeText(stdout) {
     sawEvent = true;
     if (evt.type === "text" && typeof evt.part?.text === "string") parts.push(evt.part.text);
   }
-  // Falling back only when NOTHING parsed is not enough: a stream carrying step and
-  // tool events but no `text` part would return "" and abort an otherwise successful
-  // run — strictly worse than the plain-text case. Any time we end up with no answer,
-  // hand back the raw payload and let the caller's JSON extraction try.
+  // Raw fallback ONLY when nothing parsed as an event — i.e. a plain-text reply or a
+  // wholesale format change. Once events are present, the text-only rule is
+  // load-bearing and must not be relaxed to "return everything instead": tool events
+  // carry file contents from the repository under review, so a repo containing a
+  // file that looks like a verdict could have it lifted straight into the review.
+  // An event stream with no assistant text is an error, not an invitation to guess.
   const text = parts.join("").trim();
-  if (!sawEvent || !text) return raw.trim();
+  if (!sawEvent) return raw.trim();
+  if (!text) {
+    throw new Error(
+      "opencode produced no assistant text (only tool/step events). Refusing to fall " +
+        "back to the raw event stream, which carries repository file contents that " +
+        "could be mistaken for the model's verdict."
+    );
+  }
   return text;
 }
 

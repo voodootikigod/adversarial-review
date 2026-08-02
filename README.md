@@ -280,6 +280,14 @@ yourself — opencode treats `plan` as a *subagent* and silently falls back to y
 default agent, which typically permits writes. `--allow-unsandboxed-cli` opts out and
 runs under your own config, with a warning.
 
+**Secret scanning does not cover what the model reads.** The pre-flight secret scan
+runs on the outbound payload (the diff and its context). A reviewer with `read`/`grep`
+can open files that are not in the diff at all — a gitignored `.env`, a credentials
+file — and quote them in a finding, which then lands in your terminal or CI log
+unscanned. This is true of any tool-using reviewer (`claude`, `codex`, `agent`) and is
+not specific to opencode, but opencode enables it by default. Prefer an API provider
+for repositories holding real credentials, and treat review output as sensitive.
+
 The permission block enumerates **every** key in opencode's schema, which matters for
 two non-obvious reasons: an unset key defaults to `"ask"`, and an interactive prompt
 in a headless run blocks forever; and neither `"*"` nor `write` means what it looks
