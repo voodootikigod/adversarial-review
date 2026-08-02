@@ -161,9 +161,10 @@ name is RANDOM PER RUN because OPENCODE_CONFIG merges with project-local `openco
 from the repo under review: a fixed name lets a reviewed repo redefine the agent and
 re-enable write/bash (verified by attack). `--pure` blocks repo-controlled plugins, and a
 preflight (`opencode agent list`) must report our agent as primary before the diff is
-sent. NOTE: this reviewer has NO tools (deny-all is the only permission shape that fails
-closed), so it reviews the inlined diff and cannot navigate the wider repository -- prefer
-another provider when cross-file context matters. `--provider vercel|gateway` uses Vercel AI Gateway
+sent. The generated config enumerates EVERY permission
+key in opencode's schema: an unset key defaults to "ask" and hangs a headless run, `"*"` is
+not a wildcard, and `edit` (not `write`) governs modification. read/grep/glob/list are
+allowed; edit/bash/task/webfetch/websearch/external_directory are denied. `--provider vercel|gateway` uses Vercel AI Gateway
 (`provider/model` ids; one key can drive `--providers auto` across families).
 
 Force with `--provider <name>`; override the model with `--model <name>`. Gate quality

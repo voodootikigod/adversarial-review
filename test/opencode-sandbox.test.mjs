@@ -330,6 +330,4 @@ test("--allow-unsandboxed-cli still produces a parseable review", { skip: proces
   // emits the JSONL event stream, so a missing --format json shows up as a failure.
   const r = reviewWithMockOpencode(MOCK_OK, { unsandboxed: true });
   assert.equal(r.status, 0, `unsandboxed review must still parse, got ${r.status}:\n${r.stderr}`);
-  // And the user's agent genuinely has tools, so it must not be told it has none.
-  assert.equal(r.promptSaw?.includes("You have NO tools"), false, "the no-tools preamble is false on this path");
 });

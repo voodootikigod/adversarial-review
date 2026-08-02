@@ -273,19 +273,19 @@ Default model `opencode-go/grok-4.5`; override with `--model opencode-go/<name>`
 **Explicit-only** and, like `copilot`, **not** a diversity family.
 
 opencode has no read-only flag, so reviews run under a generated config (supplied via
-`OPENCODE_CONFIG`) declaring a dedicated agent with `permission: { "*": "deny" }`.
-Do not pass `--agent plan` yourself — opencode treats `plan` as a *subagent* and
-silently falls back to your default agent, which typically permits writes.
-`--allow-unsandboxed-cli` opts out and runs under your own config, with a warning.
+`OPENCODE_CONFIG`) declaring a dedicated agent that can read the repository —
+`read`, `grep`, `glob`, `list` allowed — with `edit`, `bash`, `task`, `webfetch`,
+`websearch`, `external_directory` and the rest denied. Do not pass `--agent plan`
+yourself — opencode treats `plan` as a *subagent* and silently falls back to your
+default agent, which typically permits writes. `--allow-unsandboxed-cli` opts out and
+runs under your own config, with a warning.
 
-**The opencode reviewer has no tools.** It reviews the diff carried in the prompt and
-cannot open files outside it, so cross-file findings that need repository navigation
-are weaker than with `claude`, `codex`, or an API provider. That is a deliberate
-trade-off, not an oversight: of the three plausible permission shapes, only deny-all
-is safe. `{ "*": "allow", write: "deny" }` lets the catch-all win and the model wrote
-a file anyway; explicit denies with no catch-all leave unlisted tools on `"ask"`, which
-blocks a headless run forever. `tools: { write: false }` is not a control either.
-Use a different provider when you need a reviewer that reads the wider repository.
+The permission block enumerates **every** key in opencode's schema, which matters for
+two non-obvious reasons: an unset key defaults to `"ask"`, and an interactive prompt
+in a headless run blocks forever; and neither `"*"` nor `write` means what it looks
+like — `"*"` is not a wildcard, and modification is governed by `edit`, so denying
+`write` denies nothing. `tools: { write: false }` is not a control either. Verified
+against the real CLI: reads work, writes are blocked, shell commands are blocked.
 
 Three further details are load-bearing, because `OPENCODE_CONFIG` **merges** with local
 config rather than replacing it — and that merge includes project-local `opencode.json`

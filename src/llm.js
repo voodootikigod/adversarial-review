@@ -603,23 +603,42 @@ export const OPENCODE_DEFAULT_MODEL = "opencode-go/grok-4.5";
  * declaring its OWN agent whose per-agent tools and permissions are self-contained,
  * rather than by removing theirs.
  *
- * VERIFIED PERMISSION SEMANTICS (each established by running the real CLI, because
- * none of it is documented and two of the three shapes fail OPEN):
+ * PERMISSION SEMANTICS — read the schema before changing this
+ * (https://opencode.ai/config.json, $defs.PermissionConfig). Two things there are
+ * easy to get wrong, and getting them wrong fails OPEN:
  *
- *   permission { "*": "deny" }              → the agent gets NO tools at all.
- *   permission { "*": "allow", write:"deny" } → catch-all WINS; the explicit deny is
- *                                             ignored and the model wrote the file.
- *   no catch-all, explicit denies only      → unlisted tools default to "ask", and a
- *                                             headless run BLOCKS FOREVER on the
- *                                             prompt (two runs killed at 400s/500s).
+ *   - There is no `write` or `patch` permission key. File modification is governed
+ *     by `edit`. Denying "write" denies nothing; it is absorbed by
+ *     additionalProperties and silently ignored.
+ *   - `"*"` is NOT a wildcard. It is likewise just an unrecognized key. A config of
+ *     `{ "*": "deny" }` does not deny anything by wildcard, and
+ *     `{ "*": "allow", write: "deny" }` was verified to let the model write a file.
  *
- * `tools: { write: false }` is NOT a security control either — with a permissive
- * catch-all the model wrote the file regardless. `permission` is the only thing that
- * enforces, so this config uses the one shape that is provably closed: deny
- * everything. That means the reviewer has no read tools, so it works from the diff
- * carried in the prompt (see OPENCODE_NO_TOOLS_PREAMBLE) rather than by inspecting
- * the worktree. The `tools` block is kept as defense in depth, not relied upon.
+ * A key left UNSET defaults to "ask", and an interactive prompt in a headless run
+ * blocks forever with no output and no error — two runs were killed by an external
+ * timeout at 400s and 500s before this was understood. So every key the schema
+ * defines is enumerated explicitly below: nothing is left to default, and nothing
+ * relies on a wildcard that does not exist.
+ *
+ * `tools: { write: false }` is NOT a security control — with a permissive permission
+ * set the model wrote the file regardless. `permission` is what enforces; the
+ * `tools` block is defense in depth and is not relied upon.
+ *
+ * Verified against the real CLI under this exact config: reading a file works,
+ * writing one is blocked, and running a shell command is blocked.
  */
+// Every key in $defs.PermissionConfig. An unlisted key defaults to "ask", which
+// hangs a headless run — so this list must stay exhaustive. If opencode adds a new
+// permission, a review may hang until the watchdog ceiling; that is the failure this
+// list exists to prevent, and the drift shows up as a timeout, not a silent bypass.
+const OPENCODE_PERMISSIONS = {
+  // The reviewer must be able to inspect the repository around the diff.
+  read: "allow", grep: "allow", glob: "allow", list: "allow", lsp: "allow",
+  todowrite: "allow",
+  // Everything that mutates, executes, reaches the network, or escapes the worktree.
+  edit: "deny", bash: "deny", task: "deny", webfetch: "deny", websearch: "deny",
+  external_directory: "deny", question: "deny", doom_loop: "deny", skill: "deny"
+};
 export function buildOpencodeConfig(agentName = newOpencodeAgentName()) {
   return {
     $schema: "https://opencode.ai/config.json",
@@ -629,12 +648,9 @@ export function buildOpencodeConfig(agentName = newOpencodeAgentName()) {
         mode: "primary",
         tools: {
           write: false, edit: false, patch: false, bash: false, task: false,
-          read: false, grep: false, glob: false, list: false, webfetch: false
+          read: true, grep: true, glob: true, list: true
         },
-        // The ONLY shape verified to fail closed. See the note above before
-        // "relaxing" this to allow reads — the two obvious relaxations both let a
-        // write through, and the third hangs the run.
-        permission: { "*": "deny" }
+        permission: { ...OPENCODE_PERMISSIONS }
       }
     }
   };
@@ -693,16 +709,6 @@ export function extractOpencodeText(stdout) {
   if (!sawEvent) return raw.trim();
   return parts.join("").trim();
 }
-
-// Without this, the model announces an intention it cannot carry out and stops:
-// "I will read `src/x.js` and return the line count" — then step_finish, no answer,
-// no JSON, a failed review. It has no tools (the only permission shape that fails
-// closed), so it must be told that plainly and pointed at the diff it was given.
-export const OPENCODE_NO_TOOLS_PREAMBLE =
-  "You have NO tools available in this environment: you cannot read files, search " +
-  "the repository, or run commands. Do not announce an intention to do so. Everything " +
-  "you need is included verbatim below — review it directly and reply with the " +
-  "required JSON and nothing else.\n\n";
 
 /** Argv that asks opencode which agents the MERGED config actually defines. */
 export function opencodeAgentListArgs() {
@@ -804,11 +810,7 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
     }
 
     try {
-      // The preamble is a statement of fact about the deny-all config. On the
-      // unsandboxed path the user's own agent DOES have tools, so telling it
-      // otherwise would suppress exactly the capability they opted in for.
-      const payload = allowUnsandboxedCli ? fullPrompt : OPENCODE_NO_TOOLS_PREAMBLE + fullPrompt;
-      const out = await execCli(cliCmd, args, payload, timeoutMs, {
+      const out = await execCli(cliCmd, args, fullPrompt, timeoutMs, {
         stream,
         argsContainUntrusted: false,
         envOverrides

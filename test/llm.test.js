@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall, GATEWAY_FAMILY_MODELS, cliSandboxArgs, buildOpencodeConfig, opencodeReviewArgs, newOpencodeAgentName, OPENCODE_AGENT_PREFIX, OPENCODE_DEFAULT_MODEL, OPENCODE_NO_TOOLS_PREAMBLE, isOpencodeModelUnavailable, opencodeAgentIsPrimary, opencodeAgentListArgs, extractOpencodeText } from "../src/llm.js";
+import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall, GATEWAY_FAMILY_MODELS, cliSandboxArgs, buildOpencodeConfig, opencodeReviewArgs, newOpencodeAgentName, OPENCODE_AGENT_PREFIX, OPENCODE_DEFAULT_MODEL, isOpencodeModelUnavailable, opencodeAgentIsPrimary, opencodeAgentListArgs, extractOpencodeText } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 import { buildSpawnTarget } from "../src/spawn-safe.js";
 import { writeMockBin, writeSimpleMockBin } from "./helpers/mock-bin.mjs";
@@ -1086,32 +1086,42 @@ test("T12 AC11: an unresolvable local CLI throws an error naming the command", a
 
 // --- T46: opencode ------------------------------------------------------------
 
-test("the generated opencode config is the one permission shape that fails closed", () => {
-  // VERIFIED against the real CLI, because none of this is documented and two of
-  // the three plausible shapes fail OPEN:
-  //   { "*": "allow", write: "deny" } -> catch-all wins, the model WROTE the file
-  //   explicit denies with no catch-all -> unlisted tools "ask" and the run HANGS
-  //   { "*": "deny" } -> no tools at all; the only shape that is provably closed
-  // `tools: { write: false }` is NOT a control either: with a permissive catch-all
-  // the model wrote the file regardless.
+test("the generated opencode config enumerates every permission the schema defines", () => {
+  // Read https://opencode.ai/config.json ($defs.PermissionConfig) before changing
+  // this. Two mistakes here fail OPEN and were both made during development:
+  //   - there is no `write`/`patch` permission key; `edit` governs modification,
+  //     and denying "write" denies nothing (additionalProperties swallows it)
+  //   - `"*"` is not a wildcard; `{ "*": "allow", write: "deny" }` let the model
+  //     write a file
+  // And a key left UNSET defaults to "ask", which blocks a headless run forever.
+  // So the list must stay exhaustive: nothing defaulted, no wildcard relied upon.
+  const SCHEMA_KEYS = [
+    "read", "edit", "glob", "grep", "list", "bash", "task", "external_directory",
+    "todowrite", "question", "webfetch", "websearch", "lsp", "doom_loop", "skill"
+  ];
   const name = newOpencodeAgentName();
   const agent = buildOpencodeConfig(name).agent[name];
   assert.equal(agent.mode, "primary", "a subagent is silently ignored by --agent");
-  assert.deepEqual(agent.permission, { "*": "deny" }, "any other shape has been shown to fail open or hang");
-  // The tools block is defense in depth, not the control — nothing may be enabled.
-  const enabled = Object.entries(agent.tools).filter(([, on]) => on === true);
-  assert.deepEqual(enabled, [], `no tool may be enabled: ${enabled.map(([t]) => t)}`);
-  for (const tool of ["write", "edit", "patch", "bash", "task"]) {
-    assert.equal(agent.tools[tool], false);
-  }
-});
 
-test("the opencode prompt states plainly that no tools exist", () => {
-  // Without it the model announces "I will read src/x.js", stops at step_finish,
-  // and returns no JSON at all — a failed review rather than a wrong one.
-  assert.match(OPENCODE_NO_TOOLS_PREAMBLE, /NO tools/);
-  assert.match(OPENCODE_NO_TOOLS_PREAMBLE, /cannot read files/);
-  assert.ok(OPENCODE_NO_TOOLS_PREAMBLE.endsWith("\n\n"), "must not run into the prompt body");
+  const missing = SCHEMA_KEYS.filter((k) => !(k in agent.permission));
+  assert.deepEqual(missing, [], `unset permissions default to "ask" and hang a headless run: ${missing}`);
+  assert.equal("*" in agent.permission, false, '"*" is not a wildcard — relying on it fails open');
+  assert.equal("write" in agent.permission, false, '"write" is not a permission key — `edit` governs modification');
+
+  // Everything that mutates, executes, reaches the network, or escapes the tree.
+  for (const k of ["edit", "bash", "task", "webfetch", "websearch", "external_directory", "doom_loop", "skill"]) {
+    assert.equal(agent.permission[k], "deny", `${k} must be denied for an untrusted diff`);
+  }
+  // The reviewer still needs to inspect the repository around the diff.
+  for (const k of ["read", "grep", "glob", "list"]) {
+    assert.equal(agent.permission[k], "allow");
+    assert.equal(agent.tools[k], true);
+  }
+  // `tools` is defense in depth, not the control — it was verified NOT to block a
+  // write on its own, so `permission` must carry the enforcement.
+  for (const k of ["write", "edit", "patch", "bash", "task"]) {
+    assert.equal(agent.tools[k], false);
+  }
 });
 
 test("opencode review argv pins the agent and model, and never carries the prompt", () => {
