@@ -235,7 +235,7 @@ function mockOpencode(mode) {
     `  *"agent list"*) echo "$agent (${mode})"; exit 0 ;;`,
     "esac",
     '[ -n "$ADV_MOCK_RUN_FLAG" ] && : > "$ADV_MOCK_RUN_FLAG"',
-    "cat > /dev/null",
+    'if [ -n "$ADV_MOCK_PROMPT_COPY" ]; then cat > "$ADV_MOCK_PROMPT_COPY"; else cat > /dev/null; fi',
     `echo '${evt}'`,
     "exit 0"
   ].join("\n") + "\n";
@@ -244,7 +244,7 @@ function mockOpencode(mode) {
 const MOCK_OK = mockOpencode("primary");
 const MOCK_DOWNGRADED = mockOpencode("subagent");
 
-function reviewWithMockOpencode(mockBody, { recordPrompt = false } = {}) {
+function reviewWithMockOpencode(mockBody, { recordPrompt = false, unsandboxed = false } = {}) {
   const mocks = fs.mkdtempSync(path.join(os.tmpdir(), "adv-oc-mock-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-oc-repo-"));
   try {
@@ -263,16 +263,21 @@ function reviewWithMockOpencode(mockBody, { recordPrompt = false } = {}) {
 
     const promptFlag = path.join(mocks, "run-invoked");
     const PATH_ENV = [mocks, path.dirname(process.execPath), "/usr/bin", "/bin"].join(path.delimiter);
-    const r = _spawnSync(process.execPath, [cliPath, "--provider", "opencode", "--scope", "working-tree", "--allow-secrets"], {
+    const argv = [cliPath, "--provider", "opencode", "--scope", "working-tree", "--allow-secrets"];
+    if (unsandboxed) argv.push("--allow-unsandboxed-cli");
+    const promptCopy = path.join(mocks, "prompt.txt");
+    const r = _spawnSync(process.execPath, argv, {
       cwd: repo,
       encoding: "utf8",
       env: {
         HOME: process.env.HOME, PATH: PATH_ENV,
         ADVERSARIAL_REVIEW_CONFIG: path.join(mocks, "cfg.json"),
-        ADV_MOCK_RUN_FLAG: promptFlag
+        ADV_MOCK_RUN_FLAG: promptFlag,
+        ADV_MOCK_PROMPT_COPY: promptCopy
       }
     });
     if (recordPrompt) r.promptReceived = fs.existsSync(promptFlag);
+    r.promptSaw = fs.existsSync(promptCopy) ? fs.readFileSync(promptCopy, "utf8") : "";
     return r;
   } finally {
     fs.rmSync(mocks, { recursive: true, force: true });
@@ -317,4 +322,14 @@ test("state cleanup covers the project root, not only the process cwd", () => {
   // must never be the thing that fails a review.
   assert.deepEqual(opencodeStateDirCandidates({ cwd: sub, repoRoot: "" }), [path.join(sub, ".omo")]);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("--allow-unsandboxed-cli still produces a parseable review", { skip: process.platform === "win32" ? "posix mock" : false }, () => {
+  // Opting out of the SANDBOX must not also opt out of a parseable review.
+  // --format json is what makes stdout machine-readable at all, and the mock only
+  // emits the JSONL event stream, so a missing --format json shows up as a failure.
+  const r = reviewWithMockOpencode(MOCK_OK, { unsandboxed: true });
+  assert.equal(r.status, 0, `unsandboxed review must still parse, got ${r.status}:\n${r.stderr}`);
+  // And the user's agent genuinely has tools, so it must not be told it has none.
+  assert.equal(r.promptSaw?.includes("You have NO tools"), false, "the no-tools preamble is false on this path");
 });

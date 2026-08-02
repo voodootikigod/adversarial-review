@@ -767,8 +767,12 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
       fs.writeFileSync(configFile, JSON.stringify(buildOpencodeConfig(agentName), null, 2), { mode: 0o600, flag: "wx" });
     }
 
+    // `--format json` is required on BOTH paths: it is what makes stdout
+    // machine-readable at all (the default formatter interleaves tool framing into
+    // the prose), and extractOpencodeText parses the result either way. Opting out
+    // of the sandbox must not also opt out of a parseable review.
     const args = allowUnsandboxedCli
-      ? ["--pure", "run", "-m", model || OPENCODE_DEFAULT_MODEL]
+      ? ["--pure", "run", "-m", model || OPENCODE_DEFAULT_MODEL, "--format", "json"]
       : opencodeReviewArgs({ model, agent: agentName });
     const envOverrides = allowUnsandboxedCli ? null : { OPENCODE_CONFIG: configFile };
 
@@ -800,7 +804,11 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
     }
 
     try {
-      const out = await execCli(cliCmd, args, OPENCODE_NO_TOOLS_PREAMBLE + fullPrompt, timeoutMs, {
+      // The preamble is a statement of fact about the deny-all config. On the
+      // unsandboxed path the user's own agent DOES have tools, so telling it
+      // otherwise would suppress exactly the capability they opted in for.
+      const payload = allowUnsandboxedCli ? fullPrompt : OPENCODE_NO_TOOLS_PREAMBLE + fullPrompt;
+      const out = await execCli(cliCmd, args, payload, timeoutMs, {
         stream,
         argsContainUntrusted: false,
         envOverrides
