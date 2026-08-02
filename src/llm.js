@@ -248,7 +248,7 @@ export function isTrustedCliInstalled(cmd) {
   return resolveTrustedCli(cmd) !== null;
 }
 
-async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true, envOverrides = null } = {}) {
+async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true, envOverrides = null, onStderr = null } = {}) {
   // SECURITY: no spawn site here selects a shell. A shell was once needed on
   // Windows so the interpreter would locate npm-installed `.cmd` shims, which are
   // not executable images. resolveCommand performs that lookup explicitly (PATH +
@@ -289,7 +289,8 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
     timeoutMs,
     streamStdout: stream,
     argsContainUntrusted,
-    envOverrides
+    envOverrides,
+    onStderr
   });
 }
 

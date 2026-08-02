@@ -201,3 +201,64 @@ test("a hostile project opencode.json cannot re-enable write on the review agent
     fs.rmSync(work, { recursive: true, force: true });
   }
 });
+
+// The sandbox verdict is only as good as its WIRING. `opencodeSandboxFailure` was
+// correct and unit-tested while `onStderr` was never threaded through execCli, so
+// stderrSeen stayed empty and every real review was refused. Unit tests on the
+// predicate cannot see that; these drive the actual bin/cli.js path with a mock
+// opencode, so the stderr plumbing is exercised end to end.
+
+import { spawnSync as _spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const cliPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "cli.js");
+const REVIEW_JSON = '{"verdict":"approve","summary":"ok","coverage":{"files_examined":["code.js"],"files_skipped":[]},"findings":[],"next_steps":[]}';
+
+function reviewWithMockOpencode(mockBody) {
+  const mocks = fs.mkdtempSync(path.join(os.tmpdir(), "adv-oc-mock-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-oc-repo-"));
+  try {
+    const mock = path.join(mocks, "opencode");
+    fs.writeFileSync(mock, mockBody);
+    fs.chmodSync(mock, 0o755);
+
+    const git = (a) => _spawnSync("git", a, { cwd: repo, encoding: "utf8" });
+    git(["init", "-q"]);
+    git(["config", "user.email", "t@t.t"]);
+    git(["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "code.js"), "export const x = 1;\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "init"]);
+    fs.writeFileSync(path.join(repo, "code.js"), "export const x = 2; // changed\n");
+
+    const PATH_ENV = [mocks, path.dirname(process.execPath), "/usr/bin", "/bin"].join(path.delimiter);
+    return _spawnSync(process.execPath, [cliPath, "--provider", "opencode", "--scope", "working-tree", "--allow-secrets"], {
+      cwd: repo,
+      encoding: "utf8",
+      env: { HOME: process.env.HOME, PATH: PATH_ENV, ADVERSARIAL_REVIEW_CONFIG: path.join(mocks, "cfg.json") }
+    });
+  } finally {
+    fs.rmSync(mocks, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+test("a sandboxed opencode run is accepted (stderr plumbing is actually wired)", { skip: process.platform === "win32" ? "posix mock" : false }, () => {
+  // Echo the pinned agent back on stderr, exactly as the real banner does. If
+  // onStderr is not forwarded to the watchdog, the run is refused and this fails.
+  const r = reviewWithMockOpencode(
+    `#!/bin/sh\ncat > /dev/null\nagent=""\nwhile [ $# -gt 0 ]; do\n  if [ "$1" = "--agent" ]; then agent="$2"; fi\n  shift\ndone\necho "> $agent · grok-4.5" 1>&2\ncat <<'JSON'\n${REVIEW_JSON}\nJSON\nexit 0\n`
+  );
+  assert.equal(r.status, 0, `expected a clean review, got ${r.status}:\n${r.stderr}`);
+  assert.doesNotMatch(r.stderr || "", /never reported running the sandboxed agent/);
+});
+
+test("a silent agent downgrade is refused even though opencode exits 0", { skip: process.platform === "win32" ? "posix mock" : false }, () => {
+  // The real fail-open: opencode warns, drops to the user's write-capable default,
+  // returns a well-formed verdict, and exits 0. The verdict must not be trusted.
+  const r = reviewWithMockOpencode(
+    `#!/bin/sh\ncat > /dev/null\necho '! agent "x" is a subagent, not a primary agent. Falling back to default agent' 1>&2\ncat <<'JSON'\n${REVIEW_JSON}\nJSON\nexit 0\n`
+  );
+  assert.notEqual(r.status, 0, "a downgraded run must not produce a passing review");
+  assert.match(r.stderr || "", /fell back to the default agent/);
+});
