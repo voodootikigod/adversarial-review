@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
 import { HELP_TEXT, parseArgs } from "../src/utils.js";
 
 test("parseArgs rejects missing values and invalid integers", () => {
@@ -216,8 +217,29 @@ test("HELP_TEXT documents vercel/gateway and cursor/agent provider tokens", () =
   // Pin exact placeholder spelling so hollow-test invert-comparison on `<name>`
   // / `<local-cli-cmd>` cannot silently rewrite the help surface.
   assert.match(HELP_TEXT, /--provider <name>\s+Force provider:.*vercel/);
-  assert.match(HELP_TEXT, /gateway \| cursor \| agent \| <local-cli-cmd>\./);
+  assert.match(HELP_TEXT, /gateway \| cursor \| agent \| copilot \| opencode \|\s+<local-cli-cmd>\./);
+  // README's options cheat-sheet is what most operators actually skim, so it must
+  // not understate the flag that HELP_TEXT warns about.
+  const readme = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  const optionsBlock = readme.slice(readme.indexOf("--provider <name>"), readme.indexOf("--model <name>"));
+  assert.match(optionsBlock, /opencode/, "README --provider list must name opencode");
+  const unsandboxed = readme.slice(readme.indexOf("--allow-unsandboxed-cli"));
+  assert.match(unsandboxed.slice(0, 400), /DISABLES|write\/bash/, "README must state the opencode blast radius");
   assert.match(HELP_TEXT, /--model <name>\s+Force the model name \(Gateway: use provider\/model ids\)\./);
+});
+
+test("HELP_TEXT names every selectable provider and the opencode sandbox blast radius", () => {
+  // Discovery happens through --help, so a provider documented only in the README
+  // is a provider most operators never learn exists.
+  for (const token of ["copilot", "opencode"]) {
+    assert.match(HELP_TEXT, new RegExp(token), `--help must name the ${token} provider`);
+  }
+  // --allow-unsandboxed-cli means something materially worse for opencode than for
+  // claude/agy: not "skip plan mode" but "run with full write/bash on an untrusted
+  // diff". Help must say so, or the flag reads as uniformly minor.
+  const flagSection = HELP_TEXT.slice(HELP_TEXT.indexOf("--allow-unsandboxed-cli"));
+  assert.match(flagSection.slice(0, 500), /opencode/i);
+  assert.match(flagSection.slice(0, 500), /DISABLES|write\/bash/);
 });
 
 test("T13 AC10: --stream parses as a boolean and is documented", () => {

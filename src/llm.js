@@ -5,6 +5,7 @@ import { spawnWithWatchdog } from "./exec-watchdog.js";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import crypto from "crypto";
 import { log } from "./utils.js";
 import { sanitizeSchemaForProvider } from "./schema-validate.js";
 
@@ -247,7 +248,7 @@ export function isTrustedCliInstalled(cmd) {
   return resolveTrustedCli(cmd) !== null;
 }
 
-async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true } = {}) {
+async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true, envOverrides = null } = {}) {
   // SECURITY: no spawn site here selects a shell. A shell was once needed on
   // Windows so the interpreter would locate npm-installed `.cmd` shims, which are
   // not executable images. resolveCommand performs that lookup explicitly (PATH +
@@ -287,7 +288,8 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
     input,
     timeoutMs,
     streamStdout: stream,
-    argsContainUntrusted
+    argsContainUntrusted,
+    envOverrides
   });
 }
 
@@ -315,13 +317,18 @@ export function isCursorAgentCli(cliCmd) {
   return kind === "agent" || kind === "cursor-agent";
 }
 
-// agy's `-p`/`--print`/`--prompt` takes the prompt as its VALUE — it has NO stdin
-// `-` sentinel (that is a claude/codex convention). Invoked as `agy -p -` with the
-// prompt piped to stdin, agy answers the literal "-" and ignores stdin, returning
-// conversational prose ("Hello! How can I help you today?") instead of the review
-// JSON. So agy must always receive the prompt as the `-p` argument value.
+// CLIs whose `-p` takes the prompt as its VALUE and have NO stdin `-` sentinel
+// (that is a claude/codex convention). Both were verified to misread `-p -` as a
+// prompt of literal "-" rather than a request to read stdin:
+//   agy      → answers the literal "-" and ignores stdin, returning conversational
+//              prose ("Hello! How can I help you today?") instead of the review JSON.
+//   copilot  → replies "I notice your message is empty."
+// Either way the review is lost, so these must always receive the prompt as the
+// `-p` argument value.
+const ARGV_PROMPT_CLIS = new Set(["agy", "copilot"]);
+
 export function cliRequiresArgvPrompt(cliCmd) {
-  return commandKind(cliCmd) === "agy";
+  return ARGV_PROMPT_CLIS.has(commandKind(cliCmd));
 }
 
 // agy's print mode has its OWN wait budget (`--print-timeout`, default 5m0s) that
@@ -380,7 +387,10 @@ export function cliSandboxArgs(cliCmd, { allowUnsandboxedCli = false } = {}) {
   if (allowUnsandboxedCli) return [];
   const kind = commandKind(cliCmd);
   if (kind === "claude") return ["--permission-mode", "plan"];
-  if (kind === "agy" || isCursorAgentCli(cliCmd)) return ["--mode", "plan"];
+  // copilot's plan mode is a real read-only gate, not advisory: asked to create a
+  // file it answers "Per plan mode rules, I outline the approach but don't execute
+  // file changes" and writes nothing. Same intent as codex --sandbox read-only.
+  if (kind === "agy" || kind === "copilot" || isCursorAgentCli(cliCmd)) return ["--mode", "plan"];
   return [];
 }
 
@@ -396,7 +406,11 @@ export function describeUnknownFlagRejection(cliCmd, stderr) {
   if (goMatch) {
     return `provider "${cliCmd}" rejected flag "--${goMatch[1].replace(/^-+/, "")}"`;
   }
-  const unknownMatch = text.match(/unknown (?:flag|option)[:\s]+-{0,2}(\S+)/i);
+  // commander.js (copilot) quotes the flag: `error: unknown option '--foo'`.
+  // Without consuming the quote, `-{0,2}` matches zero dashes, the capture keeps
+  // the quotes, and the message reads `rejected flag "--'--foo'"`. Accept an
+  // optional opening quote and stop the capture at the closing one.
+  const unknownMatch = text.match(/unknown (?:flag|option)[:\s]+['"`]?-{0,2}([^'"`\s]+)/i);
   if (unknownMatch) {
     return `provider "${cliCmd}" rejected flag "--${unknownMatch[1].replace(/^-+/, "")}"`;
   }
@@ -453,9 +467,19 @@ export function cliFallbackArgs(cliCmd, fullPrompt, { allowUnsandboxedCli = fals
     args.push(fullPrompt);
     return args;
   }
+  const kind = commandKind(cliCmd);
+  // copilot: -s prints the agent response alone (no session stats), and the log/
+  // color flags keep decoration out of stdout so the JSON extractor sees only the
+  // answer. Verified to return a bare `{"ok":true}` for a JSON-only prompt.
+  if (kind === "copilot") {
+    const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
+    args.push("-s", "--no-color", "--log-level", "none");
+    if (model) args.push("--model", model);
+    args.push("-p", fullPrompt);
+    return args;
+  }
   // claude and agy are Claude-Code-compatible: they need -p (print mode) when
   // the prompt is passed as a command-line argument.
-  const kind = commandKind(cliCmd);
   if (kind === "claude" || kind === "agy") {
     const args = [...cliSandboxArgs(cliCmd, { allowUnsandboxedCli })];
     if (model) args.push("--model", model);
@@ -543,6 +567,396 @@ async function callCodexCli(fullPrompt, schema, timeoutMs = 10 * 60 * 1000, { st
   }
 }
 
+// The agent name the generated opencode config declares. Passing it explicitly is
+// mandatory: `--agent` naming something opencode considers a SUBAGENT does not fail
+// closed — it warns ("agent X is a subagent, not a primary agent. Falling back to
+// default agent") and proceeds under the user's own default, which on a normal
+// install carries {"permission": "*", "action": "allow"}. That is full write and
+// bash access applied to a prompt built from an untrusted diff.
+//
+// The name is also generated FRESH PER RUN, and that randomness is a security
+// control, not cosmetics. OPENCODE_CONFIG merges rather than replaces, and the
+// merge includes project-local `opencode.json` from the working directory — which
+// during a review IS the repository under review. Verified by attack: a repo that
+// ships an opencode.json redefining the review agent BY NAME with
+// `tools:{write,bash}=true, permission:{"*":"allow"}` wins that merge, and a live
+// run then wrote the file it was told to write. A fixed name is a name the
+// attacker knows. A per-run random one cannot be targeted by a file written before
+// the run. Verified separately: a hostile config that does NOT name our agent
+// (top-level `tools`/`permission` instead) does not broaden it.
+export const OPENCODE_AGENT_PREFIX = "adversarial-review-";
+
+export function newOpencodeAgentName() {
+  return `${OPENCODE_AGENT_PREFIX}${crypto.randomBytes(16).toString("hex")}`;
+}
+
+// Silence budget for an opencode run. Generous enough that a slow model turn is
+// never mistaken for a hang, short enough that the permission-prompt stall fails in
+// minutes rather than tens of minutes. resolveWindows clamps it below the ceiling,
+// so a small --timeout still wins.
+const OPENCODE_IDLE_MS = 5 * 60 * 1000;
+
+// Default gateway into opencode's non-frontier-lab providers, which is the reason
+// to reach for opencode at all: models no other supported provider can serve.
+// Overridable with --model. Always sent explicitly — see buildOpencodeConfig.
+export const OPENCODE_DEFAULT_MODEL = "opencode-go/grok-4.5";
+
+/**
+ * The read-only agent definition handed to opencode via OPENCODE_CONFIG.
+ *
+ * This config MERGES into the user's own (verified — their agents remain visible
+ * alongside ours), so it cannot rely on replacing anything they set. It works by
+ * declaring its OWN agent whose per-agent tools and permissions are self-contained,
+ * rather than by removing theirs.
+ *
+ * PERMISSION SEMANTICS — read the schema before changing this
+ * (https://opencode.ai/config.json, $defs.PermissionConfig). Two things there are
+ * easy to get wrong, and getting them wrong fails OPEN:
+ *
+ *   - There is no `write` or `patch` permission key. File modification is governed
+ *     by `edit`. Denying "write" denies nothing; it is absorbed by
+ *     additionalProperties and silently ignored.
+ *   - `"*"` is NOT a wildcard. It is likewise just an unrecognized key. A config of
+ *     `{ "*": "deny" }` does not deny anything by wildcard, and
+ *     `{ "*": "allow", write: "deny" }` was verified to let the model write a file.
+ *
+ * A key left UNSET defaults to "ask", and an interactive prompt in a headless run
+ * blocks forever with no output and no error — two runs were killed by an external
+ * timeout at 400s and 500s before this was understood. So every key the schema
+ * defines is enumerated explicitly below: nothing is left to default, and nothing
+ * relies on a wildcard that does not exist.
+ *
+ * `tools: { write: false }` is NOT a security control — with a permissive permission
+ * set the model wrote the file regardless. `permission` is what enforces; the
+ * `tools` block is defense in depth and is not relied upon.
+ *
+ * Verified against the real CLI under this exact config: reading a file works,
+ * writing one is blocked, and running a shell command is blocked.
+ */
+// Every key in $defs.PermissionConfig. An unlisted key defaults to "ask", which
+// hangs a headless run — so this list must stay exhaustive. If opencode adds a new
+// permission, a review may hang until the watchdog ceiling; that is the failure this
+// list exists to prevent, and the drift shows up as a timeout, not a silent bypass.
+const OPENCODE_PERMISSIONS = {
+  // ALLOW only what inspects. Four read paths, nothing else — a permission whose
+  // name contains "write" has no business in an agent documented as read-only,
+  // however benign the state it touches looks.
+  read: "allow", grep: "allow", glob: "allow", list: "allow",
+  // Everything that mutates, executes, reaches the network, or escapes the worktree.
+  edit: "deny", bash: "deny", task: "deny", webfetch: "deny", websearch: "deny",
+  external_directory: "deny", question: "deny", doom_loop: "deny", skill: "deny",
+  // todowrite mutates session/todo state, and `lsp` can drive a language server into
+  // code actions and formatting. Neither was shown to be side-effect free, and an
+  // unproven capability is denied rather than assumed harmless.
+  todowrite: "deny", lsp: "deny"
+};
+export function buildOpencodeConfig(agentName = newOpencodeAgentName()) {
+  return {
+    $schema: "https://opencode.ai/config.json",
+    agent: {
+      [agentName]: {
+        description: "Read-only adversarial reviewer (adversarial-review)",
+        mode: "primary",
+        tools: {
+          write: false, edit: false, patch: false, bash: false, task: false,
+          read: true, grep: true, glob: true, list: true
+        },
+        permission: { ...OPENCODE_PERMISSIONS }
+      }
+    }
+  };
+}
+
+/** Argv for a review run. The prompt travels on stdin, so it never appears here. */
+export function opencodeReviewArgs({ model = null, agent } = {}) {
+  if (!agent) throw new Error("opencodeReviewArgs requires the per-run agent name");
+  // `--pure` blocks external plugins. Plugin loading is another path the reviewed
+  // repository controls through its own project config, and a plugin runs code —
+  // the sandbox on tools would be irrelevant if the repo could load a plugin.
+  // VERIFIED: OPENCODE_CONFIG MERGES into the user's config, it does not replace
+  // it — with our config set, `opencode agent list` still shows every agent the
+  // user defined, plus ours. So the user's default model WOULD be available.
+  // Send `-m` anyway: inheriting their default would make the reviewing model, and
+  // therefore the diversity of the review, depend on unrelated local config that
+  // can change without notice. A review pins its own model.
+  // `--format json` is REQUIRED, not a preference. Under the default formatter,
+  // stdout is written for a terminal: piped, it interleaves tool-call framing into
+  // the prose and arrives corrupted ("I need to check the line count.0aRead0epath/
+  // Users/.../file.js"), so a review that used tools returned narration and no
+  // parseable JSON. `--format json` emits one JSON event per line; the assistant's
+  // answer is the concatenation of the `text` events (see extractOpencodeText).
+  return ["--pure", "run", "--agent", agent, "-m", model || OPENCODE_DEFAULT_MODEL, "--format", "json"];
+}
+
+/**
+ * Pull the assistant's answer out of opencode's `--format json` event stream.
+ *
+ * The stream is JSONL: `step_start`, one or more `text` parts, `step_finish`, plus
+ * tool events. Only `text` parts are the answer — tool events carry file contents
+ * and arguments, and folding those in would feed the reviewed repository's own
+ * source back into the JSON extractor as if the model had written it.
+ *
+ * THERE IS NO RAW-STDOUT FALLBACK, and reintroducing one would be a security
+ * regression, not a robustness fix. Both empty cases throw instead:
+ *   - no typed events at all → the format changed underneath us
+ *   - typed events but no assistant text → the model produced no answer
+ * In either case the only thing left on stdout is tool output, i.e. contents of the
+ * repository under review. Handing that to the caller's JSON extractor is how a
+ * planted file that looks like an approve verdict gets promoted to one.
+ */
+export function extractOpencodeText(stdout) {
+  const raw = (stdout || "").toString();
+  const parts = [];
+  let sawEvent = false;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let evt;
+    try {
+      evt = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!evt || typeof evt.type !== "string") continue;
+    sawEvent = true;
+    if (evt.type === "text" && typeof evt.part?.text === "string") parts.push(evt.part.text);
+  }
+  // Fail closed in BOTH directions. The text-only rule is load-bearing: tool events
+  // carry file contents from the repository under review, so a repo shipping a file
+  // that looks like a verdict could have it lifted into the review as the model's
+  // own words. There is deliberately no raw fallback — we always pass --format json,
+  // so a stream with no typed events means the format changed underneath us, and
+  // guessing at that is exactly how forged content gets promoted to a verdict.
+  const text = parts.join("").trim();
+  if (!sawEvent) {
+    throw new Error(
+      "opencode returned no JSON event stream despite --format json. Refusing to " +
+        "interpret raw output as the model's verdict: it may contain repository file " +
+        "contents. Check that the installed opencode still supports --format json."
+    );
+  }
+  if (!text) {
+    throw new Error(
+      "opencode produced no assistant text (only tool/step events). Refusing to fall " +
+        "back to the raw event stream, which carries repository file contents that " +
+        "could be mistaken for the model's verdict."
+    );
+  }
+  return text;
+}
+
+/** Argv that asks opencode which agents the MERGED config actually defines. */
+export function opencodeAgentListArgs() {
+  return ["--pure", "agent", "list"];
+}
+
+/**
+ * Fail-closed PREFLIGHT: is our agent registered as `primary` in the merged config?
+ *
+ * opencode does not fail closed when `--agent` cannot be honored — it falls back to
+ * the user's write-capable default and completes normally. Under `--format default`
+ * it at least warns on stderr; under `--format json`, which the review requires (see
+ * opencodeReviewArgs), stderr is EMPTY and the fallback is completely silent. There
+ * is no post-hoc signal to check, so the check has to happen before the diff is ever
+ * sent: `agent list` prints one `<name> (primary|subagent)` line per agent, computed
+ * from the same merge the run will use. Verified to report `(subagent)` when a
+ * project-local config downgrades the agent's mode.
+ */
+export function opencodeAgentIsPrimary(listing, agentName) {
+  const line = new RegExp(`^\\s*${agentName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\((\\w+)\\)\\s*$`, "m");
+  const m = (listing || "").toString().match(line);
+  return m ? m[1] === "primary" : false;
+}
+
+/**
+ * Invoke opencode non-interactively with a generated read-only config.
+ *
+ * The prompt goes over stdin (`opencode run` reads it with no sentinel argument),
+ * so argv carries only our own constant flags and the argv-size guard does not
+ * apply. Only stdout is returned: the session banner ("> agent · model") goes to
+ * stderr and must never reach the JSON extractor.
+ */
+async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, model = null, allowUnsandboxedCli = false } = {}) {
+  // Private temp dir, mirroring callCodexCli: owned by this process, so path
+  // prediction and symlink races against a shared /tmp are not possible. It also
+  // keeps the config OUTSIDE the worktree — a config inside the repository under
+  // review would be one more thing a reviewed diff could rewrite.
+  const privateDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-review-opencode-"));
+  const configFile = path.join(privateDir, "opencode.json");
+
+  // `opencode run` drops a project-local `.omo/` state directory into the PROJECT it
+  // operates on — which is not necessarily the process cwd. Run from a package
+  // subdirectory of a monorepo, cwd and the project root differ, and keying cleanup
+  // to cwd alone leaves the real one behind. A reviewer must not leave untracked
+  // files in the tree it just reviewed: `git status` surfaces them, and because
+  // untracked content is part of the reviewed input, its own session state would
+  // feed into the NEXT review. Watch both candidates, and remove only what this run
+  // created — a pre-existing `.omo/` belongs to the user and is never touched.
+  const stateDirs = opencodeStateDirCandidates();
+  const statePreexisted = new Map(stateDirs.map((d) => [d, fs.existsSync(d)]));
+
+  // Fresh per run: a name the reviewed repository cannot have named in advance.
+  const agentName = newOpencodeAgentName();
+
+  try {
+    if (allowUnsandboxedCli) {
+      // Opting out means running under the user's own agent config, which may
+      // permit writes. Say so rather than letting it look sandboxed.
+      log.warn("opencode is running WITHOUT the generated read-only config (--allow-unsandboxed-cli).");
+    } else {
+      // wx: exclusive create, defense in depth inside an already-private directory.
+      fs.writeFileSync(configFile, JSON.stringify(buildOpencodeConfig(agentName), null, 2), { mode: 0o600, flag: "wx" });
+    }
+
+    // `--format json` is required on BOTH paths: it is what makes stdout
+    // machine-readable at all (the default formatter interleaves tool framing into
+    // the prose), and extractOpencodeText parses the result either way. Opting out
+    // of the sandbox must not also opt out of a parseable review.
+    const args = allowUnsandboxedCli
+      ? ["--pure", "run", "-m", model || OPENCODE_DEFAULT_MODEL, "--format", "json"]
+      : opencodeReviewArgs({ model, agent: agentName });
+    const envOverrides = allowUnsandboxedCli ? null : { OPENCODE_CONFIG: configFile };
+
+    // PREFLIGHT, before the diff is sent anywhere: confirm the merged config really
+    // registers our agent as primary. If it does not, opencode would silently run
+    // the review under the user's write-capable default agent instead — and under
+    // --format json it does so with no warning on any stream, so this is the only
+    // place the downgrade is observable.
+    if (!allowUnsandboxedCli) {
+      let listing = "";
+      try {
+        listing = await execCli(cliCmd, opencodeAgentListArgs(), null, Math.min(timeoutMs, 120_000), {
+          argsContainUntrusted: false,
+          envOverrides
+        });
+      } catch (err) {
+        throw new Error(
+          `Could not verify the opencode read-only sandbox (\`opencode agent list\` failed): ` +
+            `${err.message}\nRefusing to send the diff to an unverified agent.`
+        );
+      }
+      if (!opencodeAgentIsPrimary(listing, agentName)) {
+        throw new Error(
+          `opencode did not register the sandboxed agent "${agentName}" as primary, so the ` +
+            `review would run under the default agent WITHOUT the read-only sandbox.\n` +
+            `Refusing to send the diff. Pass --allow-unsandboxed-cli to accept that deliberately.`
+        );
+      }
+    }
+
+    try {
+      // NEVER stream this provider's stdout. Under --format json every tool result
+      // is an event on stdout, and tool results carry repository file contents —
+      // including files the reviewer opened that are NOT in the diff, so never seen
+      // by the pre-flight secret scan. streamStdout mirrors raw stdout chunks to
+      // stderr, which would put a gitignored .env straight into a CI log. Progress
+      // is not worth that; the review itself still returns normally.
+      if (stream) log.substep("opencode output is not streamed: its event stream carries file contents.");
+      const out = await execCli(cliCmd, args, fullPrompt, timeoutMs, {
+        stream: false,
+        argsContainUntrusted: false,
+        envOverrides,
+        // The idle guard is OFF by default across this tool, and correctly so: a
+        // silent agent is usually a working agent. opencode under --format json is
+        // the exception — it emits step/tool/text events throughout, so a long
+        // silence is not thinking, it is the documented permission hang (a key we
+        // did not enumerate defaulting to "ask" on a prompt nobody can answer).
+        // Without this, that surfaces as a stall to the hard ceiling — up to 40
+        // minutes on the default budget — instead of a fast, explicit failure.
+        idleTimeoutMs: OPENCODE_IDLE_MS
+      });
+      return extractOpencodeText(out);
+    } catch (err) {
+      if (err.code === "ETIMEDOUT") {
+        throw Object.assign(new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      }
+      const stderr = err.stderr?.toString("utf8") || "";
+      const flagRejection = describeUnknownFlagRejection(cliCmd, stderr);
+      if (flagRejection) {
+        throw Object.assign(new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : "")), { stdout: err.stdout, stderr: err.stderr, cause: err });
+      }
+      // An unreachable or unauthenticated model is the most likely failure and
+      // exits 1 with the reason only on stderr. Name the model and the command
+      // that shows what IS authenticated, rather than surfacing a bare exit code.
+      const chosen = model || OPENCODE_DEFAULT_MODEL;
+      if (isOpencodeModelUnavailable(stderr)) {
+        throw Object.assign(
+          new Error(
+            `opencode could not use model "${chosen}".\n` +
+              `Run \`opencode auth list\` to see which providers are authenticated, ` +
+              `then pass --model <provider/model> for one of them.` +
+              (stderr.trim() ? `\n${stderr.trim()}` : "")
+          ),
+          { stdout: err.stdout, stderr: err.stderr, cause: err }
+        );
+      }
+      const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
+      throw Object.assign(new Error(`Failed to execute local CLI agent "${cliCmd}": ${err.message}${suffix}`), { stdout: err.stdout, stderr: err.stderr, cause: err });
+    }
+  } finally {
+    try { fs.rmSync(privateDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    for (const dir of stateDirs) removeStateDirIfCreated(dir, statePreexisted.get(dir));
+  }
+}
+
+/**
+ * Remove a project-local state directory that THIS run created.
+ *
+ * `opencode run` drops a `.omo/` directory into the project it operates on, and
+ * that directory follows the project rather than the process cwd — so it cannot be
+ * relocated while the agent still needs to read the repository. Whether it appears
+ * varies with the run, so this is written to be correct either way: absent is fine,
+ * pre-existing is left strictly alone (it is the user's), and only a directory that
+ * appeared during our run is removed. A symlink is never followed — removing one
+ * could reach outside the worktree entirely.
+ */
+/**
+ * Every directory opencode might root its `.omo/` state in: the process cwd, and
+ * the git worktree root when that differs (running from a package subdirectory of a
+ * monorepo is the ordinary case). Deduplicated, and degrades to cwd alone when the
+ * repo root cannot be resolved — a cleanup helper must never be the thing that
+ * fails a review.
+ */
+export function opencodeStateDirCandidates({ cwd = process.cwd(), repoRoot = null } = {}) {
+  const roots = [cwd];
+  let top = repoRoot;
+  if (top === null) {
+    try {
+      const git = resolveTrustedCommand("git");
+      if (git) {
+        top = execFileSync(git, ["rev-parse", "--show-toplevel"], {
+          cwd,
+          encoding: "utf8",
+          env: sanitizedSpawnEnv(),
+          stdio: ["ignore", "pipe", "ignore"]
+        }).trim();
+      }
+    } catch {
+      top = null;
+    }
+  }
+  if (top && top !== cwd) roots.push(top);
+  return [...new Set(roots)].map((r) => path.join(r, ".omo"));
+}
+
+export function removeStateDirIfCreated(stateDir, preexisted) {
+  if (preexisted) return false;
+  try {
+    const st = fs.lstatSync(stateDir);
+    if (!st.isDirectory()) return false;
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True when opencode stderr shows the model itself was the problem. */
+export function isOpencodeModelUnavailable(stderr) {
+  const text = (stderr || "").toString();
+  return /credit balance is too low|no such model|model not found|unknown model|not authenticated|unauthorized|provider .* not found/i.test(text);
+}
+
 // Invoke a local CLI agent (claude, agy, ...) by piping the prompt to stdin.
 const DEFAULT_CLI_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -564,6 +978,10 @@ async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { ti
 
   if (commandKind(cliCmd) === "codex") {
     return callCodexCli(fullPrompt, schema, timeoutMs, { stream, model });
+  }
+
+  if (commandKind(cliCmd) === "opencode") {
+    return callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream, model, allowUnsandboxedCli });
   }
 
   const fallbackOpts = { allowUnsandboxedCli, model, timeoutMs };
@@ -819,7 +1237,7 @@ export function configureLLM(args) {
         provider = "openai";
       } else if (canGw()) {
         provider = "vercel";
-        gatewayPreferModel = "openai/gpt-5";
+        gatewayPreferModel = GATEWAY_FAMILY_MODELS.openai;
       } else if (canCli("codex")) {
         provider = "cli";
         cliCmd = "codex";
@@ -851,7 +1269,7 @@ export function configureLLM(args) {
         provider = "openai";
       } else if (canGw()) {
         provider = "vercel";
-        gatewayPreferModel = "anthropic/claude-sonnet-4.6";
+        gatewayPreferModel = GATEWAY_FAMILY_MODELS.anthropic;
       } else if (canCli("agy")) {
         provider = "cli";
         cliCmd = "agy";
@@ -990,7 +1408,7 @@ export function configureLLM(args) {
     } else if (provider === "anthropic") {
       model = cfgModel || "claude-sonnet-4-6";
     } else if (provider === "vercel") {
-      model = gatewayPreferModel || cfgModel || "anthropic/claude-sonnet-4.6";
+      model = gatewayPreferModel || cfgModel || GATEWAY_FAMILY_MODELS.anthropic;
     }
   } else if (!model && provider === "cli" && cfgModel) {
     // A local CLI has no hardcoded default model; honor a config pin if present.
@@ -1063,12 +1481,26 @@ const TOKEN_FAMILY = {
 // for that on-host CLI, so it resolves CLI-only and is NEVER silently upgraded to
 // the family's API (which would send the diff off-host despite the user's intent).
 // Their family label is still used for diversity grouping.
-const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy", "agent", "cursor-agent"]);
+const CLI_ONLY_TOKENS = new Set(["codex", "claude", "agy", "agent", "cursor-agent", "copilot", "opencode"]);
 
 // Default Vercel AI Gateway model ids per diversity family (provider/model form).
+// THE single source of truth: every gateway model id in this file reads from here.
+// Writing one inline again reintroduces the drift this map exists to prevent —
+// test/gateway-model-drift.test.mjs fails the build if a literal reappears in src/.
+//
+// Pins track the strong tier of each family, not the cheap one, and not the
+// `-pro`/`-opus` tier above it: gate quality tracks model tier, but so do cost and
+// latency, and a review runs on every diff.
 export const GATEWAY_FAMILY_MODELS = {
-  openai: "openai/gpt-5",
-  anthropic: "anthropic/claude-sonnet-4.6",
+  openai: "openai/gpt-5.6-sol",
+  anthropic: "anthropic/claude-sonnet-5",
+  // Deliberately a generation behind its siblings, and NOT an oversight. The
+  // Gateway catalog carries no stable 3.x *pro* text model: the 3.x line is
+  // flash / flash-lite / image variants plus exactly one pro, and that one is
+  // `google/gemini-3.1-pro-preview`. Moving off 2.5-pro would mean either
+  // dropping to a weaker flash tier or pinning a preview model to a review gate.
+  // Revisit when a stable `google/gemini-3.x-pro` ships — the drift test's
+  // diagnostic will surface it.
   gemini: "google/gemini-2.5-pro"
 };
 

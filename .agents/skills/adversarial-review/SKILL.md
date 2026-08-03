@@ -143,11 +143,31 @@ weaker critic, so non-Anthropic providers are preferred first:
 1. `ANTHROPIC_API_KEY` → Anthropic API (`claude-sonnet-4-6`)
 2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
-4. `AI_GATEWAY_API_KEY` → Vercel AI Gateway (`anthropic/claude-sonnet-4.6`)
+4. `AI_GATEWAY_API_KEY` → Vercel AI Gateway (`anthropic/claude-sonnet-5`)
 5. Local `claude`, `codex`, `agy`, or `agent` CLI
 
 `--provider cursor|agent` uses the official Cursor Agent CLI (`agent -p --mode plan`),
-not a localhost proxy. `--provider vercel|gateway` uses Vercel AI Gateway
+not a localhost proxy. `--provider copilot` uses the GitHub Copilot
+CLI (`copilot -p --mode plan`, read-only): explicit-only, never auto-detected, and NOT a
+diversity family (it routes to Claude/GPT/Gemini, so counting it would fake diversity).
+Refused on Windows, where an npm-installed `copilot` is a `.cmd` shim and its argv-borne
+prompt would be re-parsed by `cmd.exe`. `--provider opencode` uses opencode (prompt on
+stdin) under a GENERATED read-only agent config injected via `OPENCODE_CONFIG` — opencode
+has no read-only flag, and `--agent plan` does NOT fail closed (it is a subagent, so
+opencode warns and falls back to the user default agent, which may permit writes). Its
+`opencode-go` provider reaches non-frontier-lab models (grok, kimi, qwen, glm, deepseek,
+minimax); default `opencode-go/grok-4.5`. Explicit-only and NOT a diversity family. The agent
+name is RANDOM PER RUN because OPENCODE_CONFIG merges with project-local `opencode.json`
+from the repo under review: a fixed name lets a reviewed repo redefine the agent and
+re-enable write/bash (verified by attack). `--pure` blocks repo-controlled plugins, and a
+preflight (`opencode agent list`) must report our agent as primary before the diff is
+sent. The generated config enumerates EVERY permission
+key in opencode's schema: an unset key defaults to "ask" and hangs a headless run, `"*"` is
+not a wildcard, and `edit` (not `write`) governs modification. read/grep/glob/list are
+allowed; edit/bash/task/webfetch/websearch/external_directory are denied. Secrets are scanned on the way OUT as
+well as in: a tool-using reviewer can read a gitignored .env that was never in the diff,
+so the review response is scanned before it is rendered, printed as --json, or
+ledgered. Matches are masked in place (the finding survives, the credential does not). `--provider vercel|gateway` uses Vercel AI Gateway
 (`provider/model` ids; one key can drive `--providers auto` across families).
 
 Force with `--provider <name>`; override the model with `--model <name>`. Gate quality

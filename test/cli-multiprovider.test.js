@@ -369,3 +369,67 @@ test("T14: the CLI error boundary scopes resume-hint extraction to config.cliCmd
   assert.match(src, /resumeHintForError\(err,\s*\{\s*cli:/,
     "resumeHintForError at the CLI boundary must be scoped to the CLI that ran");
 });
+
+// A reviewer with file-read tools can open a gitignored .env that was never in the
+// diff and quote it into a finding. The pre-flight scan never saw that file, so the
+// only thing standing between it and a CI log is output-side redaction. This drives
+// the real bin/cli.js with a mock CLI that returns exactly such a finding.
+test("a secret the model read outside the diff is redacted before it is printed", { skip: process.platform === "win32" ? "posix mock" : false }, () => {
+  const mocks = fs.mkdtempSync(path.join(os.tmpdir(), "adv-leak-mocks-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "adv-leak-repo-"));
+  const KEY = "AKIAIOSFODNN7EXAMPLE";
+  try {
+    const leaked = JSON.stringify({
+      verdict: "needs-attention",
+      summary: `Found ${KEY} while reading .env`,
+      coverage: { files_examined: ["code.js"], files_skipped: [] },
+      findings: [{
+        severity: "critical", category: "secrets",
+        title: "Live AWS key in .env",
+        body: `The gitignored .env contains ${KEY}.`,
+        exploit_scenario: `Anyone with the key (${KEY}) gains access.`,
+        evidence: "export const x = 2;",
+        file: "code.js", line_start: 1, line_end: 1,
+        confidence: 0.9, recommendation: `Rotate ${KEY} now.`
+      }],
+      next_steps: [`Rotate ${KEY}.`]
+    });
+
+    const bin = path.join(mocks, "claude");
+    fs.writeFileSync(bin, `#!/bin/sh\ncat > /dev/null\ncat <<'JSON'\n${leaked}\nJSON\nexit 0\n`);
+    fs.chmodSync(bin, 0o755);
+
+    const git = (a) => spawnSync("git", a, { cwd: repo, encoding: "utf8" });
+    git(["init", "-q"]);
+    git(["config", "user.email", "t@t.t"]);
+    git(["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "code.js"), "export const x = 1;\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "init"]);
+    fs.writeFileSync(path.join(repo, "code.js"), "export const x = 2;\n");
+
+    const PATH_ENV = [mocks, path.dirname(process.execPath), "/usr/bin", "/bin"].join(path.delimiter);
+    const ledger = path.join(mocks, "findings.jsonl");
+    const r = spawnSync(process.execPath, [
+      path.join(root, "bin", "cli.js"), "--provider", "claude", "--scope", "working-tree",
+      "--allow-secrets", "--findings-ledger", ledger
+    ], {
+      cwd: repo, encoding: "utf8",
+      env: { HOME: process.env.HOME, PATH: PATH_ENV, ADVERSARIAL_REVIEW_CONFIG: path.join(mocks, "cfg.json") }
+    });
+
+    const printed = `${r.stdout || ""}${r.stderr || ""}`;
+    assert.doesNotMatch(printed, new RegExp(KEY), `the key reached the console:\n${printed.slice(0, 600)}`);
+    // The finding itself must survive — suppressing "you committed a live key" would
+    // gut the tool's most valuable output.
+    assert.match(printed, /Live AWS key in \.env/, "the finding must still be reported");
+    assert.match(printed, /Redacted likely secret/, "the redaction must be announced, not silent");
+    // And it must not reach the ledger either.
+    if (fs.existsSync(ledger)) {
+      assert.doesNotMatch(fs.readFileSync(ledger, "utf8"), new RegExp(KEY), "the key reached the findings ledger");
+    }
+  } finally {
+    fs.rmSync(mocks, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});

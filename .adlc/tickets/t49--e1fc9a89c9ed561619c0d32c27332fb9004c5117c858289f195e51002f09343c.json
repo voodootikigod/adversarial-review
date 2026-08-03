@@ -1,0 +1,14 @@
+{
+  "body": "Follow-up hardening from T46 (PR #56). BLOCKED on upstream opencode support — check feasibility FIRST and close as won't-fix if the signal still does not exist.\n\nESTABLISHED DURING T46 (do not re-litigate)\n- opencode does NOT fail closed when `--agent` cannot be honored: it warns and continues under the user's default primary agent, which typically permits write and bash.\n- Under `--format default` that warning appears on stderr. Under `--format json` — which the review requires, because the default formatter interleaves tool framing into stdout and corrupts the payload — stderr is EMPTY and the fallback is completely silent. Verified: passing `--agent plan` (a subagent) produced no warning on any stream.\n- Because there is no post-run signal, verification was moved to a PREFLIGHT: `opencode agent list` prints `<name> (primary|subagent)` computed from the same merged config the run will use, and the diff is not sent unless our agent is primary. Verified to report `(subagent)` when a project-local config downgrades the mode.\n\nTHE RESIDUAL\nThe preflight proves the merged config REGISTERS the agent as primary. It does not prove `run --agent <name>` HONORED it. Any divergence between list-time and run-time config loading, or a future opencode change that honors --agent at list time but not at run time, fails open with a clean exit and a normal-looking verdict. This was raised in three separate review passes and is the last known gap in the T46 sandbox.\n\nGOAL\nA signal the run itself emits that could not be produced by a fallback to the user's default agent, checked before the result is trusted.\n\nACCEPTANCE CRITERIA\nAC1  Establish whether opencode's `--format json` event stream exposes the active agent (session metadata, a step field, or an agent id on any event). Inspect a real stream. If it does not, close this ticket as blocked-upstream and record what was checked — do NOT invent a proxy signal that a fallback could also produce.\nAC2  If a signal exists: after a run, require it to name the per-run agent, and refuse the result otherwise. The refusal must state that the review may have run unsandboxed. Verified in test/llm.test.js.\nAC3  A PATH-gated test asserts the signal is present in a real sandboxed run and names the generated agent.\nAC4  The check is verified to FAIL when the signal is absent — a test that cannot fail is not a control. Assert against a captured stream with the identity removed.\nAC5  The existing preflight is retained, not replaced: it is what stops the diff being sent at all, and this attestation only guards the result afterwards.\nAC6  npm test passes.\n\nVERIFICATION COMMAND\nnpm test",
+  "category": "feature",
+  "duration": 2,
+  "edges": [],
+  "id": "T49",
+  "rails": [],
+  "scope": [
+    "src/llm.js",
+    "test/opencode-sandbox.test.mjs",
+    "test/llm.test.js"
+  ],
+  "title": "Add an in-band attestation that the opencode sandbox agent actually ran"
+}

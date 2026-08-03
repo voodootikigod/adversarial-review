@@ -67,12 +67,20 @@ ${colors.bold("Options:")}
                         credentials in the diff (off by default).
   --timeout <seconds>   Per-request timeout for API and local CLI providers (default 120).
   --allow-unsandboxed-cli
-                        Allow claude/agy/agent review without plan/read-only mode
-                        (older CLIs or write-capable agent). Default review
-                        isolation uses plan mode.
+                        Allow claude/agy/agent/copilot review without plan/
+                        read-only mode. For opencode this goes further: it
+                        DISABLES the generated read-only config entirely, so the
+                        reviewer runs with your own agent's write/bash access on
+                        an untrusted diff. Default review isolation uses plan
+                        mode (or, for opencode, the generated config).
   --provider <name>     Force provider: anthropic | openai | gemini | vercel |
-                        gateway | cursor | agent | <local-cli-cmd>.
-                        cursor/agent → Cursor Agent CLI; vercel/gateway → AI Gateway.
+                        gateway | cursor | agent | copilot | opencode |
+                        <local-cli-cmd>.
+                        cursor/agent → Cursor Agent CLI; vercel/gateway → AI
+                        Gateway; copilot → GitHub Copilot CLI; opencode →
+                        opencode (incl. opencode-go models). copilot and
+                        opencode are explicit-only and are never auto-detected,
+                        and neither counts toward cross-family diversity.
   --model <name>        Force the model name (Gateway: use provider/model ids).
   --api-base <url>      Override the active provider's API base URL.
   --api-key <key>       Override the active provider's API key.

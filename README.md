@@ -158,7 +158,10 @@ Next steps
 --context-lines <n>    Diff context lines passed to git diff -U<n> (default 10).
 --include-files        Also inline full post-change file contents (budgeted).
 --allow-summary-review Allow API providers to review summary-only large diffs.
---allow-unsandboxed-cli Allow claude/agy/agent review without plan/read-only mode.
+--allow-unsandboxed-cli Allow claude/agy/agent/copilot review without plan/read-only
+                       mode. For opencode this DISABLES the generated read-only
+                       config entirely — the reviewer gets your own agent's
+                       write/bash access on an untrusted diff.
 --allow-secrets        Send the payload even if the secret scan finds likely
                        credentials in the diff (off by default).
 
@@ -179,8 +182,10 @@ Next steps
 
 # Provider
 --provider <name>      anthropic | openai | gemini | vercel | gateway |
-                       cursor | agent | <local-cli-cmd>.
-                       cursor/agent → Cursor Agent CLI; vercel/gateway → AI Gateway.
+                       cursor | agent | copilot | opencode | <local-cli-cmd>.
+                       cursor/agent → Cursor Agent CLI; vercel/gateway → AI Gateway;
+                       copilot → GitHub Copilot CLI; opencode → opencode (incl.
+                       opencode-go models). copilot and opencode are explicit-only.
 --model <name>         Force the model name (Gateway: use provider/model ids).
 --api-base <url>       Override the active provider's API base URL.
 --api-key <key>        Override the active provider's API key.
@@ -248,7 +253,7 @@ a weaker critic. Otherwise:
 2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
 3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
 4. `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`) → Vercel AI Gateway
-   (`--provider vercel`, default model `anthropic/claude-sonnet-4.6`)
+   (`--provider vercel`, default model `anthropic/claude-sonnet-5`)
 5. A local CLI agent on `PATH`: `claude`, `codex`, `agy`, or `agent` (Cursor Agent CLI)
 
 **Cursor Agent CLI** (`--provider cursor` or `agent`): requires `agent` on `PATH` and
@@ -256,8 +261,69 @@ a weaker critic. Otherwise:
 not a localhost HTTP proxy — for third-party OpenAI-compatible proxies use
 `--provider openai --api-base <url>`.
 
+**GitHub Copilot CLI** (`--provider copilot`): requires `copilot` on `PATH` and
+`copilot login`. Reviews run with `--mode plan` (read-only). **Explicit-only** — it is
+never auto-detected, and it does **not** count toward cross-family diversity: Copilot
+routes to Claude, GPT, or Gemini depending on `--model`, so treating it as an independent
+family would fake the diversity a `--providers` run reports. On Windows an npm-installed
+`copilot` is a `.cmd` shim and is refused: Copilot takes the prompt as a command-line
+argument, which `cmd.exe` would re-parse — use `--provider claude` or `codex` there.
+
+**opencode** (`--provider opencode`): requires `opencode` on `PATH` and an authenticated
+provider (`opencode auth list`). Its `opencode-go` provider reaches models no other
+backend here serves — `grok-4.5`, `kimi-k3`, `qwen3.7-max`, `glm-5.2`, `deepseek-v4-pro`,
+`minimax-m3` — which makes it a genuinely independent critic of Big-3-authored code.
+Default model `opencode-go/grok-4.5`; override with `--model opencode-go/<name>`.
+**Explicit-only** and, like `copilot`, **not** a diversity family.
+
+opencode has no read-only flag, so reviews run under a generated config (supplied via
+`OPENCODE_CONFIG`) declaring a dedicated agent that can read the repository —
+`read`, `grep`, `glob`, `list` allowed — with `edit`, `bash`, `task`, `webfetch`,
+`websearch`, `external_directory` and the rest denied. Do not pass `--agent plan`
+yourself — opencode treats `plan` as a *subagent* and silently falls back to your
+default agent, which typically permits writes. `--allow-unsandboxed-cli` opts out and
+runs under your own config, with a warning.
+
+`--stream` is ignored for opencode: under `--format json` every tool result is an
+event on stdout, and streaming mirrors those to stderr — which would put file
+contents the reviewer opened straight into a CI log. The review still returns
+normally; only the live progress output is suppressed.
+
+**Secrets are scanned on the way out as well as the way in.** The pre-flight scan
+covers the outbound payload (the diff and its context). It cannot cover what a
+tool-using reviewer *reads*: with `read`/`grep`, a model can open a gitignored `.env`
+that was never in the diff and quote it into a finding. So the review response is
+scanned too, before it is rendered, printed as `--json`, or written to the findings
+ledger. Matches are masked in place and the redaction is announced on stderr.
+
+Redaction is surgical rather than dropping the field, because "you committed a live
+key" is one of the most valuable things this tool reports — the finding survives with
+the credential masked. The scan is heuristic, so treat review output from a
+tool-enabled provider as sensitive regardless.
+
+The permission block enumerates **every** key in opencode's schema, which matters for
+two non-obvious reasons: an unset key defaults to `"ask"`, and an interactive prompt
+in a headless run blocks forever; and neither `"*"` nor `write` means what it looks
+like — `"*"` is not a wildcard, and modification is governed by `edit`, so denying
+`write` denies nothing. `tools: { write: false }` is not a control either. Verified
+against the real CLI: reads work, writes are blocked, shell commands are blocked.
+
+Three further details are load-bearing, because `OPENCODE_CONFIG` **merges** with local
+config rather than replacing it — and that merge includes project-local `opencode.json`
+from the repository *being reviewed*:
+
+- **The agent name is random per run.** A repo that ships an `opencode.json` redefining
+  the review agent *by name* wins the merge and re-enables `write`/`bash`. A fixed name
+  is one the attacker knows; a per-run name cannot be written into a file in advance.
+- **`--pure` is always passed**, so a reviewed repo cannot load a plugin — plugins run
+  code, which would make tool permissions moot.
+- **A preflight runs before the diff is sent.** `opencode agent list` must report our
+  agent as `primary` in the merged config. This is checked up front because under
+  `--format json` a silent downgrade to your default agent produces no output on any
+  stream — there is nothing to detect afterwards.
+
 **Vercel AI Gateway** (`--provider vercel` or `gateway`): one key, many `provider/model`
-ids (e.g. `openai/gpt-5`, `anthropic/claude-sonnet-4.6`, `google/gemini-2.5-pro`). With
+ids (e.g. `openai/gpt-5.6-sol`, `anthropic/claude-sonnet-5`, `google/gemini-2.5-pro`). With
 only `AI_GATEWAY_API_KEY` set, `--providers auto` can fan across those families through
 the Gateway (native vendor keys still win when present). Family token `anthropic` (not
 the CLI-only token `claude`) selects the Anthropic family via Gateway/API.

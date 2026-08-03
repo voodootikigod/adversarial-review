@@ -6,7 +6,7 @@ import { collectArtifactContext } from "../src/artifact-context.js";
 import { configureLLM, selectProviders, underSatisfiedNotice } from "../src/llm.js";
 import { loadConfig, defaultConfigPath } from "../src/config-store.js";
 import { persistAutoResolution, withProviderFallback } from "../src/resolution-lifecycle.js";
-import { scanForSecrets } from "../src/secrets.js";
+import { scanForSecrets, redactSecretsInResult } from "../src/secrets.js";
 import { toLedgerEntries, appendLedger } from "../src/findings-ledger.js";
 import {
   buildPrompt,
@@ -112,7 +112,7 @@ async function runMultiProvider(args, context, prompt) {
     const cfg = byId.get(pp.provider);
     pp.assessments = assessFindings(pp.result, context, { apiMode: cfg.provider !== "cli" });
   }
-  const merged = mergeProviderResults(perProvider, {
+  let merged = mergeProviderResults(perProvider, {
     failOn: args.failOn,
     minConfidence: args.minConfidence
   });
@@ -157,6 +157,7 @@ async function runMultiProvider(args, context, prompt) {
   // are visible even with --json. The quorum verdict already gated on each
   // provider's OWN assessment, so this merged note is informational — do not
   // claim it changed the gate (that would contradict the per-provider gating).
+  merged = scrubResult(merged);
   mergedAssessments.forEach((a, i) => {
     for (const note of a.notes) {
       log.warn(`Finding "${merged.findings[i].title}": ${note} (grounding note — verify before relying on it).`);
@@ -173,6 +174,29 @@ async function runMultiProvider(args, context, prompt) {
     console.log(renderReport(merged, context, mergedAssessments, derived));
   }
   process.exit(derived.verdict === "needs-attention" ? 2 : 0);
+}
+
+// Redact secrets from the model's OWN OUTPUT before anything prints, logs, or
+// ledgers it.
+//
+// The pre-flight scan covers the outbound payload. It cannot cover this: a reviewer
+// with file-read tools (opencode, claude, codex, the Cursor agent) can open a
+// gitignored .env that was never in the diff and quote it into a finding. This is
+// the boundary where that content actually leaves the process, so it is the only
+// place a scan closes the hole for every provider at once.
+//
+// Runs AFTER grounding: assessments compare `evidence` against the real diff, and
+// redacting first would break that comparison and mislabel findings as ungrounded.
+function scrubResult(result) {
+  const { result: clean, hits } = redactSecretsInResult(result);
+  if (hits.length) {
+    log.warn(
+      `Redacted likely secret(s) from the review output (${hits.map((h) => h.pattern).join(", ")}). ` +
+        `The reviewer can read files outside the diff, so this content was never covered by the ` +
+        `pre-flight scan. The finding text is preserved with the credential masked.`
+    );
+  }
+  return clean;
 }
 
 // Append gating findings to the ADLC findings ledger when --findings-ledger is
@@ -391,6 +415,7 @@ async function main() {
     log.warn(`Model verdict was "${result.verdict}"; the gate derived "${derived.verdict}" from the findings (--fail-on ${args.failOn}, --min-confidence ${args.minConfidence}).`);
   }
 
+  result = scrubResult(result);
   recordFindings(args, result, assessments);
 
   // 5. Emit output. Align JSON verdict with the derived gate (same as multi-provider

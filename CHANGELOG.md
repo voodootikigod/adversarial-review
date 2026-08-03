@@ -6,14 +6,23 @@ All notable changes to this project are documented here.
 
 ### Fixed
 - **`--provider agy`**: pass `--mode plan` instead of Claude’s `--permission-mode plan` (agy 1.1.2 rejects the latter). Unknown-flag rejections from local CLIs are now reported as `provider "X" rejected flag "Y"` instead of being masked as a prompt-size error.
+- **Quoted unknown-flag rejections**: commander-based CLIs (GitHub Copilot) report `unknown option '--foo'`, which was mangled into `rejected flag "--'--foo'"`. The flag name is now extracted cleanly.
+- **Gateway model pins are no longer duplicated**: `GATEWAY_FAMILY_MODELS` read like the source of truth but the two auto-detection ladder branches and the fallback default each hardcoded the same strings, so editing the map alone changed nothing. All three now read from it, and a test fails the build if a model-id literal reappears elsewhere in `src/`.
 
 ### Breaking changes
 - **`--provider cursor` no longer targets a localhost HTTP proxy** (`http://127.0.0.1:8765`). It now resolves to the official Cursor Agent CLI (`agent` / `cursor-agent`) in plan/read-only mode. Third-party OpenAI-compatible proxies: `--provider openai --api-base <url>`.
 
 ### Added
 - **Cursor Agent CLI provider**: `--provider cursor|agent` invokes `agent -p --mode plan --trust` (subscription / `CURSOR_API_KEY`). Auto-detect inside Cursor falls back to `agent` instead of a dead proxy.
-- **Vercel AI Gateway provider**: `--provider vercel|gateway` with `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`), base `https://ai-gateway.vercel.sh/v1`, default model `anthropic/claude-sonnet-4.6`.
+- **Vercel AI Gateway provider**: `--provider vercel|gateway` with `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`), base `https://ai-gateway.vercel.sh/v1`, default model `anthropic/claude-sonnet-5`.
 - **One-key multi-family routing**: when only a Gateway credential is set, `--providers auto` / family tokens resolve openai + anthropic + gemini through the Gateway with distinct `provider/model` ids (native vendor keys still win when present).
+- **GitHub Copilot CLI provider**: `--provider copilot` invokes `copilot -p … --mode plan` (read-only). Explicit-only — never auto-detected, and not counted as a diversity family, because Copilot routes to Claude/GPT/Gemini depending on `--model`. The prompt travels in argv, so an npm-installed `copilot.cmd` on Windows is refused rather than re-parsed by `cmd.exe`.
+- **opencode provider**: `--provider opencode` reaches models no other backend here serves via `opencode-go` (grok, kimi, qwen, glm, deepseek, minimax); default `opencode-go/grok-4.5`. Also explicit-only and not a diversity family. opencode has no read-only flag, so reviews run under a generated config injected via `OPENCODE_CONFIG` — read/grep/glob/list allowed, everything else denied — with a fresh random agent name per run, `--pure`, and an `opencode agent list` preflight that must confirm the agent is primary before the diff is sent.
+- **Secret scanning on the model's output**, not just the payload sent to it. A tool-using reviewer can open a gitignored `.env` that was never in the diff and quote it into a finding; the response is now scanned before it is rendered, printed as `--json`, or written to the findings ledger. Matches are masked in place so a finding *about* a hardcoded credential survives with the credential itself removed.
+- **Gateway model drift detection**: a test fetches the public gateway catalog and fails when a pinned model is no longer served, reporting newer same-tier models without failing. A parallel test checks opencode's published config schema, because a permission key left unset defaults to `"ask"` and would hang a headless review. Both skip cleanly offline.
+
+### Changed
+- **Gateway default models moved forward**, each staying in its existing tier so cost and latency are unchanged: `openai/gpt-5` → `openai/gpt-5.6-sol` (context 400k → 1.05M) and `anthropic/claude-sonnet-4.6` → `anthropic/claude-sonnet-5`. `google/gemini-2.5-pro` deliberately holds: the catalog carries no stable 3.x *pro* text model, only flash tiers and a preview.
 
 ## [2.0.0] — 2026-06-18
 
