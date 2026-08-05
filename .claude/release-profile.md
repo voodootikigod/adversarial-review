@@ -6,6 +6,7 @@ versionSource: package.json
 bumpSites:
   - package.json:version
   - skills/adversarial-review/SKILL.md:metadata.version
+  - .agents/skills/adversarial-review/SKILL.md:metadata.version
 preconditions:
   - npm test
 landing: pr
@@ -29,6 +30,21 @@ protected environment.
 **Expected-but-alarming:** pushing the tag prints `Cannot create ref due to creations being
 restricted`. That is the admin-only tag ruleset announcing itself — the tag still lands via
 admin bypass. `* [new tag]` plus `git ls-remote --tags origin v{{version}}` is the confirmation.
+That bypass is on *tag creation only*; it is not a licence to bypass either human gate.
+
+**The two SKILL.md files are one bump site in two places.** `skills/adversarial-review/SKILL.md`
+and `.agents/skills/adversarial-review/SKILL.md` are held byte-for-byte identical by the drift
+guard in `test/skill-assets.test.js`, so bumping one without the other turns the post-bump test
+run red. `npm run sync-skill` only copies `references/` — it does *not* copy `SKILL.md`, so the
+mirror is a manual `cp`. Both are declared in `bumpSites` above; before 2.10.0 only the first
+was, and the release survived solely because the drift guard failed the tree for an unrelated
+reason.
+
+**No `changelogCommand` — `CHANGELOG.md` is hand-curated.** It was last cut into a version
+heading at `[2.0.0]`, so `[Unreleased]` accumulated already-published entries from 2.1–2.9,
+including a `### Breaking changes` heading that refers to **2.8.0**. Do not read that heading as
+a major-bump signal: check `git tag --contains <sha>` before letting changelog text drive the
+semver decision. 2.10.0 nearly shipped as 3.0.0 on exactly this.
 
 Publishing is tokenless via OIDC — `NPM_TOKEN` was deliberately deleted — so provenance is
 automatic; `npm view adversarial-review@{{version}} --json` should include `dist.attestations`
