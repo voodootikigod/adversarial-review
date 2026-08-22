@@ -245,16 +245,20 @@ self-assessment can be argued out of blocking — this one can't.
 
 ## Choosing the model
 
-If `--provider` is not given, the LLM is auto-detected. Inside Claude Code or Cursor, a
-**different provider from the builder is preferred** — a model reviewing its own output is
-a weaker critic. Otherwise:
+If `--provider` is not given, the LLM is auto-detected. Inside Claude Code, Cursor, or
+Antigravity, a **different provider from the builder is preferred** — a model reviewing
+its own output is a weaker critic:
 
-1. `ANTHROPIC_API_KEY` → Anthropic API (default model `claude-sonnet-4-6`)
-2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
-3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
-4. `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`) → Vercel AI Gateway
-   (`--provider vercel`, default model `anthropic/claude-sonnet-5`)
-5. A local CLI agent on `PATH`: `claude`, `codex`, `agy`, or `agent` (Cursor Agent CLI)
+- **Inside Claude Code** (`CLAUDECODE` / `CLAUDE_CODE`): Gemini API → OpenAI API → Vercel AI Gateway (non-Anthropic model) → `codex`/`agy`/`agent` CLI → Anthropic API/`claude` CLI (with warning).
+- **Inside Cursor** (`TERM_PROGRAM=cursor`): Gemini API → Anthropic API → OpenAI API → Vercel AI Gateway → `agy`/`claude`/`codex` CLI → `agent` CLI (with warning).
+- **Inside Antigravity** (`ANTIGRAVITY_AGENT` / `ANTIGRAVITY_CONVERSATION_ID`): Anthropic API → OpenAI API → Vercel AI Gateway (non-Gemini model) → `codex`/`claude`/`agent` CLI → Gemini API/`agy` CLI (with warning).
+- **Everywhere else** (default order):
+  1. `ANTHROPIC_API_KEY` → Anthropic API (default model `claude-sonnet-4-6`)
+  2. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
+  3. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
+  4. `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`) → Vercel AI Gateway
+     (`--provider vercel`, default model `anthropic/claude-sonnet-5`)
+  5. A local CLI agent on `PATH`: `claude`, `codex`, `agy`, or `agent` (Cursor Agent CLI)
 
 **Cursor Agent CLI** (`--provider cursor` or `agent`): requires `agent` on `PATH` and
 `agent login` or `CURSOR_API_KEY`. Reviews run with `--mode plan` (read-only). This is

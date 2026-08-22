@@ -1301,7 +1301,8 @@ export function apiOutranksCliInContext(contextKey, { env = process.env } = {}) 
   const anth = has("ANTHROPIC_API_KEY");
   if (contextKey === "claudecode") return gem || oai || gw; // ANTHROPIC is below the CLIs here
   if (contextKey === "cursor") return gem || anth || oai || gw;
-  return anth || gem || oai || gw; // default / antigravity: all APIs rank above local CLIs
+  if (contextKey === "antigravity") return anth || oai || gw; // GEMINI is below the CLIs here
+  return anth || gem || oai || gw; // default: all APIs rank above local CLIs
 }
 
 // Look up a user-pinned model for a resolved provider from config.defaults.models.
@@ -1334,6 +1335,7 @@ export function configureLLM(args) {
   if (!provider) {
     const isClaudeCodeEnv = !!(process.env.CLAUDECODE || process.env.CLAUDE_CODE);
     const isCursorEnv = process.env.TERM_PROGRAM === "cursor";
+    const isAntigravityEnv = !!(process.env.ANTIGRAVITY_AGENT || process.env.ANTIGRAVITY_CONVERSATION_ID);
     const gw = gatewayCredential();
 
     // Exclusion set (populated by the fallback path after a provider fails): skip
@@ -1418,6 +1420,36 @@ export function configureLLM(args) {
         provider = "cli";
         cliCmd = canCursorAgent();
         log.warn("Running in Cursor, but fell back to the Cursor Agent CLI for review.");
+        log.info("This review is not a pure adversarial review (same provider). To minimize bias, we will execute it in a fresh, isolated context window.");
+      } else {
+        throw new Error(NO_LLM_CONFIG_MSG);
+      }
+    } else if (isAntigravityEnv) {
+      // Builder is Antigravity (Gemini family). Prefer a non-Gemini critic.
+      if (canAnthropic()) {
+        provider = "anthropic";
+      } else if (canOpenai()) {
+        provider = "openai";
+      } else if (canGw()) {
+        provider = "vercel";
+        gatewayPreferModel = GATEWAY_FAMILY_MODELS.anthropic;
+      } else if (canCli("codex")) {
+        provider = "cli";
+        cliCmd = "codex";
+      } else if (canCli("claude")) {
+        provider = "cli";
+        cliCmd = "claude";
+      } else if (canCursorAgent()) {
+        provider = "cli";
+        cliCmd = canCursorAgent();
+      } else if (canGemini()) {
+        provider = "gemini";
+        log.warn("Running in Antigravity, but fell back to Gemini for review.");
+        log.info("This review is not a pure adversarial review (same provider). To minimize bias, we will execute it in a fresh, isolated context window.");
+      } else if (canCli("agy")) {
+        provider = "cli";
+        cliCmd = "agy";
+        log.warn("Running in Antigravity, but fell back to agy for review.");
         log.info("This review is not a pure adversarial review (same provider). To minimize bias, we will execute it in a fresh, isolated context window.");
       } else {
         throw new Error(NO_LLM_CONFIG_MSG);
