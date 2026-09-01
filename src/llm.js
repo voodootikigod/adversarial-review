@@ -248,7 +248,23 @@ export function isTrustedCliInstalled(cmd) {
   return resolveTrustedCli(cmd) !== null;
 }
 
-async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, { stream = false, argsContainUntrusted = true, envOverrides = null } = {}) {
+// One source of truth for the CLI default budget: execCli's parameter default and
+// buildExecCliWatchdogOptions' option default must agree, or a caller that omits
+// timeoutMs gets a different ceiling depending on which door it came through.
+export const DEFAULT_CLI_TIMEOUT_MS = 10 * 60 * 1000;
+
+export function buildExecCliWatchdogOptions({ stream = false, argsContainUntrusted = true, envOverrides = null, idleTimeoutMs = undefined, input = null, timeoutMs = DEFAULT_CLI_TIMEOUT_MS } = {}) {
+  return {
+    input,
+    timeoutMs,
+    streamStdout: stream,
+    argsContainUntrusted,
+    envOverrides,
+    idleTimeoutMs
+  };
+}
+
+async function execCli(cliCmd, args, input = null, timeoutMs = DEFAULT_CLI_TIMEOUT_MS, opts = {}) {
   // SECURITY: no spawn site here selects a shell. A shell was once needed on
   // Windows so the interpreter would locate npm-installed `.cmd` shims, which are
   // not executable images. resolveCommand performs that lookup explicitly (PATH +
@@ -284,13 +300,8 @@ async function execCli(cliCmd, args, input = null, timeoutMs = 10 * 60 * 1000, {
     );
   }
 
-  return spawnWithWatchdog(trusted, args, {
-    input,
-    timeoutMs,
-    streamStdout: stream,
-    argsContainUntrusted,
-    envOverrides
-  });
+  const watchdogOpts = buildExecCliWatchdogOptions({ ...opts, input, timeoutMs });
+  return spawnWithWatchdog(trusted, args, watchdogOpts);
 }
 
 // Claude-Code-compatible CLIs (claude, agy): always use print mode (-p) with the
@@ -745,6 +756,59 @@ export function extractOpencodeText(stdout) {
   return text;
 }
 
+/** Upper bound on error events retained from an opencode event stream. */
+export const MAX_OPENCODE_ERRORS = 20;
+
+/**
+ * Extract error messages from opencode's `--format json` event stream on failure.
+ * Applies the same robust per-line JSON parsing guards as extractOpencodeText.
+ *
+ * The result is capped. stdout is only bounded by the watchdog's 10MB maxBuffer, so
+ * a run that emits error events in a loop would otherwise build a list of tens of
+ * thousands of strings that the three isOpencode* classifiers then each re-scan.
+ * The first few errors are the diagnostic ones; the rest are noise.
+ */
+export function extractOpencodeErrors(stdout, { max = MAX_OPENCODE_ERRORS } = {}) {
+  const raw = (stdout || "").toString();
+  const errors = [];
+  for (const line of raw.split("\n")) {
+    if (errors.length >= max) break;
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let evt;
+    try {
+      evt = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!evt || typeof evt.type !== "string") continue;
+    if (evt.type === "error") {
+      const msg = (typeof evt.error?.data?.message === "string" && evt.error.data.message) ||
+                  (typeof evt.error?.message === "string" && evt.error.message) || "";
+      if (msg) {
+        // Sanitize: truncate and strip control characters to avoid log injection or oversized dumps
+        const sanitized = msg.slice(0, 300).replace(/[\x00-\x1F\x7F]/g, " ").trim();
+        if (sanitized) errors.push(sanitized);
+      }
+    }
+  }
+  return errors;
+}
+
+/**
+ * Pinned execution options for opencode subprocess runs.
+ * Hardcodes stream: false (avoids leaking repo secrets from tool events onto stderr)
+ * and idleTimeoutMs: OPENCODE_IDLE_MS (avoids stalling on permission prompt hangs).
+ */
+export function opencodeExecOptions({ envOverrides = null } = {}) {
+  return {
+    stream: false,
+    argsContainUntrusted: false,
+    envOverrides,
+    idleTimeoutMs: OPENCODE_IDLE_MS
+  };
+}
+
 /** Argv that asks opencode which agents the MERGED config actually defines. */
 export function opencodeAgentListArgs() {
   return ["--pure", "agent", "list"];
@@ -823,9 +887,10 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
     // --format json it does so with no warning on any stream, so this is the only
     // place the downgrade is observable.
     if (!allowUnsandboxedCli) {
-      let listing = "";
+      let listing;
       try {
         listing = await execCli(cliCmd, opencodeAgentListArgs(), null, Math.min(timeoutMs, 120_000), {
+          stream: false,
           argsContainUntrusted: false,
           envOverrides
         });
@@ -852,39 +917,69 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
       // stderr, which would put a gitignored .env straight into a CI log. Progress
       // is not worth that; the review itself still returns normally.
       if (stream) log.substep("opencode output is not streamed: its event stream carries file contents.");
-      const out = await execCli(cliCmd, args, fullPrompt, timeoutMs, {
-        stream: false,
-        argsContainUntrusted: false,
-        envOverrides,
-        // The idle guard is OFF by default across this tool, and correctly so: a
-        // silent agent is usually a working agent. opencode under --format json is
-        // the exception — it emits step/tool/text events throughout, so a long
-        // silence is not thinking, it is the documented permission hang (a key we
-        // did not enumerate defaulting to "ask" on a prompt nobody can answer).
-        // Without this, that surfaces as a stall to the hard ceiling — up to 40
-        // minutes on the default budget — instead of a fast, explicit failure.
-        idleTimeoutMs: OPENCODE_IDLE_MS
-      });
+
+      // The idle guard is OFF by default across this tool, and correctly so: a
+      // silent agent is usually a working agent. opencode under --format json is
+      // the exception — it emits step/tool/text events throughout, so a long
+      // silence is not thinking, it is the documented permission hang (a key we
+      // did not enumerate defaulting to "ask" on a prompt nobody can answer).
+      // Without this, that surfaces as a stall to the hard ceiling — up to 40
+      // minutes on the default budget — instead of a fast, explicit failure.
+      const out = await execCli(cliCmd, args, fullPrompt, timeoutMs, opencodeExecOptions({ envOverrides }));
       return extractOpencodeText(out);
     } catch (err) {
+      const stderr = err.stderr?.toString("utf8") || "";
       if (err.code === "ETIMEDOUT") {
         throw Object.assign(new Error(timeoutExceededMessage(`local CLI agent "${cliCmd}"`, timeoutMs)), { stdout: err.stdout, stderr: err.stderr, cause: err });
       }
-      const stderr = err.stderr?.toString("utf8") || "";
+      if (err.code === "EIDLE") {
+        const idleSeconds = err.idleMs ? Math.round(err.idleMs / 1000) : Math.round((OPENCODE_IDLE_MS || 0) / 1000);
+        const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
+        throw Object.assign(
+          new Error(
+            `opencode produced no output for ${idleSeconds}s (idle timeout exceeded).\n` +
+              `This usually indicates opencode is waiting for interactive permission confirmation, or the review target is too large.` +
+              suffix
+          ),
+          { stdout: err.stdout, stderr: err.stderr, cause: err }
+        );
+      }
+      // Partial stdout is carried on the watchdog error itself; there is no other
+      // source, because the only way into this catch is the rejection of the await
+      // above (a successful call returns before reaching here).
+      const stdoutErrors = extractOpencodeErrors(err.stdout);
+
       const flagRejection = describeUnknownFlagRejection(cliCmd, stderr);
       if (flagRejection) {
         throw Object.assign(new Error(flagRejection + (stderr.trim() ? `\n${stderr.trim()}` : "")), { stdout: err.stdout, stderr: err.stderr, cause: err });
       }
-      // An unreachable or unauthenticated model is the most likely failure and
-      // exits 1 with the reason only on stderr. Name the model and the command
-      // that shows what IS authenticated, rather than surfacing a bare exit code.
       const chosen = model || OPENCODE_DEFAULT_MODEL;
-      if (isOpencodeModelUnavailable(stderr)) {
+      if (isOpencodeModelUnavailable(stderr, stdoutErrors)) {
         throw Object.assign(
           new Error(
             `opencode could not use model "${chosen}".\n` +
               `Run \`opencode auth list\` to see which providers are authenticated, ` +
               `then pass --model <provider/model> for one of them.` +
+              (stderr.trim() ? `\n${stderr.trim()}` : "")
+          ),
+          { stdout: err.stdout, stderr: err.stderr, cause: err }
+        );
+      }
+      if (isOpencodeRateLimited(stderr, stdoutErrors)) {
+        throw Object.assign(
+          new Error(
+            `opencode request was rate-limited or quota was exhausted for model "${chosen}".\n` +
+              `Wait and retry, or check your account quota.` +
+              (stderr.trim() ? `\n${stderr.trim()}` : "")
+          ),
+          { stdout: err.stdout, stderr: err.stderr, cause: err }
+        );
+      }
+      if (isOpencodeTransportFailure(stderr, stdoutErrors)) {
+        throw Object.assign(
+          new Error(
+            `opencode encountered a transport failure while contacting model "${chosen}".\n` +
+              `Check your network connection and retry.` +
               (stderr.trim() ? `\n${stderr.trim()}` : "")
           ),
           { stdout: err.stdout, stderr: err.stderr, cause: err }
@@ -899,17 +994,6 @@ async function callOpencodeCli(cliCmd, fullPrompt, timeoutMs, { stream = false, 
   }
 }
 
-/**
- * Remove a project-local state directory that THIS run created.
- *
- * `opencode run` drops a `.omo/` directory into the project it operates on, and
- * that directory follows the project rather than the process cwd — so it cannot be
- * relocated while the agent still needs to read the repository. Whether it appears
- * varies with the run, so this is written to be correct either way: absent is fine,
- * pre-existing is left strictly alone (it is the user's), and only a directory that
- * appeared during our run is removed. A symlink is never followed — removing one
- * could reach outside the worktree entirely.
- */
 /**
  * Every directory opencode might root its `.omo/` state in: the process cwd, and
  * the git worktree root when that differs (running from a package subdirectory of a
@@ -939,6 +1023,18 @@ export function opencodeStateDirCandidates({ cwd = process.cwd(), repoRoot = nul
   return [...new Set(roots)].map((r) => path.join(r, ".omo"));
 }
 
+/**
+ * Remove a project-local state directory that THIS run created.
+ *
+ * `opencode run` drops a `.omo/` state directory into the project it operates on, and
+ * that directory follows the project rather than the process cwd — so it cannot be
+ * relocated while the agent still needs to read the repository. Whether it appears
+ * varies with the run, so this is written to be correct either way: absent is fine,
+ * pre-existing is left strictly alone (it is the user's), and only a directory that
+ * appeared during our run is removed. Using lstatSync ensures a symlink is never
+ * followed (isDirectory is false for symlinks), so removing one cannot reach outside
+ * the worktree.
+ */
 export function removeStateDirIfCreated(stateDir, preexisted) {
   if (preexisted) return false;
   try {
@@ -951,15 +1047,54 @@ export function removeStateDirIfCreated(stateDir, preexisted) {
   }
 }
 
-/** True when opencode stderr shows the model itself was the problem. */
-export function isOpencodeModelUnavailable(stderr) {
+/** True when opencode output indicates rate limits, quota exhaustion, or server overload. */
+export function isOpencodeRateLimited(stderr, stdoutErrors = []) {
   const text = (stderr || "").toString();
-  return /credit balance is too low|no such model|model not found|unknown model|not authenticated|unauthorized|provider .* not found/i.test(text);
+  // \b around 429 is load-bearing: unanchored, it matches inside any longer number
+  // (a byte count, a port, a session id), and a plain crash would then be reported as
+  // "rate-limited — wait and retry", which is the wrong thing for the user to do.
+  const ratePattern = /quota|rate.?limit|\b429\b|too many requests|overloaded|resource exhausted/i;
+  if (ratePattern.test(text)) return true;
+  for (const err of stdoutErrors) {
+    const errText = typeof err === "string" ? err : `${err.name || ""} ${err.message || ""}`;
+    if (ratePattern.test(errText)) return true;
+  }
+  return false;
+}
+
+/** True when opencode output shows a network transport or connection failure. */
+export function isOpencodeTransportFailure(stderr, stdoutErrors = []) {
+  const text = (stderr || "").toString();
+  const transportPattern = /ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|fetch failed|server error|transport failure/i;
+  if (transportPattern.test(text)) return true;
+  for (const err of stdoutErrors) {
+    const errText = typeof err === "string" ? err : `${err.name || ""} ${err.message || ""}`;
+    if (transportPattern.test(errText)) return true;
+  }
+  return false;
+}
+
+/** True when opencode output shows the model/auth itself was the problem. */
+export function isOpencodeModelUnavailable(stderr, stdoutErrors = []) {
+  const text = (stderr || "").toString();
+  const modelPattern = /credit balance|no such model|model not found|unknown model|not authenticated|unauthenticated|authentication failed|invalid api key|unauthorized|provider .* not found|could not use model|opencode auth list/i;
+  if (modelPattern.test(text)) return true;
+  for (const err of stdoutErrors) {
+    const errText = typeof err === "string" ? err : `${err.name || ""} ${err.message || ""}`;
+    if (modelPattern.test(errText)) return true;
+  }
+  return false;
+}
+
+/** True when opencode is unavailable due to model, auth, rate limit, quota, or transport failures. */
+export function isOpencodeUnavailable(stderr, stdoutErrors = []) {
+  return isOpencodeModelUnavailable(stderr, stdoutErrors) ||
+         isOpencodeRateLimited(stderr, stdoutErrors) ||
+         isOpencodeTransportFailure(stderr, stdoutErrors);
 }
 
 // Invoke a local CLI agent (claude, agy, ...) by piping the prompt to stdin.
-const DEFAULT_CLI_TIMEOUT_MS = 10 * 60 * 1000;
-
+// The budget default is DEFAULT_CLI_TIMEOUT_MS, declared once near execCli.
 async function callCliLLM(cliCmd, prompt, systemInstruction, schema = null, { timeoutMs: rawTimeoutMs = DEFAULT_CLI_TIMEOUT_MS, allowUnsandboxedCli = false, model = null, stream = false } = {}) {
   // Normalize ONCE, at the boundary. Everything downstream — the watchdog window,
   // the agent's own --print-timeout, and the overrun message — must read the same

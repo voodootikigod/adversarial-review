@@ -3,9 +3,10 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall, GATEWAY_FAMILY_MODELS, cliSandboxArgs, buildOpencodeConfig, opencodeReviewArgs, newOpencodeAgentName, OPENCODE_AGENT_PREFIX, OPENCODE_DEFAULT_MODEL, isOpencodeModelUnavailable, opencodeAgentIsPrimary, opencodeAgentListArgs, extractOpencodeText } from "../src/llm.js";
+import { budgetSeconds, cliRequiresArgvPrompt, cliUnusableMessage, cliUsableForReview, normalizeTimeoutMs, cleanJsonResponse, configureLLM, cliFallbackArgs, cliPrintTimeoutArgs, cliReviewArgs, describeUnknownFlagRejection, isCliPrintTimeoutStderr, maxArgvPromptBytes, parseRetryAfterMs, timeoutExceededMessage, isCmdInstalled, llmCall, GATEWAY_FAMILY_MODELS, cliSandboxArgs, buildOpencodeConfig, opencodeReviewArgs, newOpencodeAgentName, OPENCODE_AGENT_PREFIX, OPENCODE_DEFAULT_MODEL, isOpencodeModelUnavailable, isOpencodeTransportFailure, isOpencodeRateLimited, isOpencodeUnavailable, removeStateDirIfCreated, opencodeAgentIsPrimary, opencodeAgentListArgs, extractOpencodeText, extractOpencodeErrors, MAX_OPENCODE_ERRORS, opencodeExecOptions, buildExecCliWatchdogOptions, DEFAULT_CLI_TIMEOUT_MS } from "../src/llm.js";
 import { loadSchema } from "../src/review.js";
 import { buildSpawnTarget } from "../src/spawn-safe.js";
+import { spawnWithWatchdog } from "../src/exec-watchdog.js";
 import { writeMockBin, writeSimpleMockBin } from "./helpers/mock-bin.mjs";
 
 test("cleanJsonResponse extracts plain valid JSON", () => {
@@ -1242,9 +1243,241 @@ test("the opencode session banner is on stderr and never reaches the extractor",
   assert.doesNotMatch(cleaned, new RegExp(banner.slice(0, 5)));
 });
 
-test("an unavailable opencode model is reported by name, not as a bare exit code", () => {
+test("isOpencodeTransportFailure identifies network and connection errors in stderr and stdoutErrors", () => {
+  assert.equal(isOpencodeTransportFailure("getaddrinfo ENOTFOUND api.opencode.ai"), true);
+  assert.equal(isOpencodeTransportFailure("connect ECONNREFUSED 127.0.0.1:443"), true);
+  assert.equal(isOpencodeTransportFailure("read ECONNRESET"), true);
+  assert.equal(isOpencodeTransportFailure("ETIMEDOUT"), true);
+  assert.equal(isOpencodeTransportFailure("fetch failed"), true);
+  assert.equal(isOpencodeTransportFailure("unauthorized"), false);
+
+  // Structured stdout errors
+  assert.equal(isOpencodeTransportFailure("", ["getaddrinfo ENOTFOUND api.opencode.ai"]), true);
+  assert.equal(isOpencodeTransportFailure("", [{ name: "FetchError", message: "fetch failed" }]), true);
+  assert.equal(isOpencodeTransportFailure("", [{ name: "ServerCrash", message: "Unexpected server error" }]), true);
+  assert.equal(isOpencodeTransportFailure("", ["not authenticated"]), false);
+});
+
+test("isOpencodeModelUnavailable identifies auth, quota, and model name errors in stderr and stdoutErrors", () => {
   assert.equal(isOpencodeModelUnavailable("Error: Your credit balance is too low to access the Anthropic API."), true);
   assert.equal(isOpencodeModelUnavailable("no such model: opencode-go/nope"), true);
   assert.equal(isOpencodeModelUnavailable("unauthorized"), true);
-  assert.equal(isOpencodeModelUnavailable("some unrelated crash"), false);
+  assert.equal(isOpencodeModelUnavailable("provider anthropic not found"), true);
+  assert.equal(isOpencodeModelUnavailable("opencode could not use model"), true);
+  // Transient 5xx / connection crashes are NOT model availability issues.
+  assert.equal(isOpencodeModelUnavailable("HTTP 500 Internal Server Error"), false);
+  assert.equal(isOpencodeModelUnavailable("ECONNREFUSED"), false);
+
+  // Structured stdout errors
+  assert.equal(isOpencodeModelUnavailable("", ["Your credit balance is too low"]), true);
+  assert.equal(isOpencodeModelUnavailable("", [{ name: "AuthError", message: "invalid api key" }]), true);
+  assert.equal(isOpencodeModelUnavailable("", [{ name: "ModelError", message: "model not found" }]), true);
+  assert.equal(isOpencodeModelUnavailable("", ["connect ECONNREFUSED"]), false);
+});
+
+test("isOpencodeRateLimited identifies quota, 429, and overload errors", () => {
+  assert.equal(isOpencodeRateLimited("rate limit exceeded"), true);
+  assert.equal(isOpencodeRateLimited("HTTP 429 Too Many Requests"), true);
+  assert.equal(isOpencodeRateLimited("Server overloaded"), true);
+  assert.equal(isOpencodeRateLimited("quota exceeded for current billing cycle"), true);
+  assert.equal(isOpencodeRateLimited("", [{ name: "RateLimitError", message: "too many requests" }]), true);
+  assert.equal(isOpencodeRateLimited("unauthorized"), false);
+  assert.equal(isOpencodeRateLimited("ECONNREFUSED"), false);
+
+  // The bare status code must not match inside a longer number. Misreading a plain
+  // crash as a rate limit tells the user to "wait and retry" a failure that will
+  // never clear on its own.
+  assert.equal(isOpencodeRateLimited("read 4291 bytes before EOF"), false);
+  assert.equal(isOpencodeRateLimited("listening on 127.0.0.1:14290"), false);
+  assert.equal(isOpencodeRateLimited("session ses_8429ab"), false);
+  assert.equal(isOpencodeRateLimited("HTTP 429"), true);
+  assert.equal(isOpencodeRateLimited("status=429, retrying"), true);
+});
+
+test("isOpencodeUnavailable combines model, rate limit, and transport failures", () => {
+  assert.equal(isOpencodeUnavailable("unauthorized"), true);
+  assert.equal(isOpencodeUnavailable("ECONNREFUSED"), true);
+  assert.equal(isOpencodeUnavailable("rate limit exceeded"), true);
+  assert.equal(isOpencodeUnavailable("", [{ name: "AuthError", message: "not authenticated" }]), true);
+  assert.equal(isOpencodeUnavailable("", [{ name: "TransportError", message: "ETIMEDOUT" }]), true);
+  assert.equal(isOpencodeUnavailable("", [{ name: "RateLimitError", message: "quota exceeded" }]), true);
+  assert.equal(isOpencodeUnavailable("some random build error"), false);
+
+  // The opencode sandbox tests use this predicate to decide whether to SKIP a
+  // security assertion, so it is also a test oracle. Pin it against the output those
+  // runs actually produce: if a future broadening matches ordinary opencode output,
+  // those tests would silently stop asserting instead of failing.
+  assert.equal(isOpencodeUnavailable(""), false);
+  assert.equal(isOpencodeUnavailable("adv-review-1a2b3c (primary)\ngeneral (subagent)"), false);
+  assert.equal(isOpencodeUnavailable('{"type":"step_start"}'), false);
+  assert.equal(isOpencodeUnavailable("> adv-review-1a2b3c \u00b7 anthropic/claude-sonnet-4-6"), false);
+  assert.equal(isOpencodeUnavailable("", [{ name: "Finding", message: "the diff weakens an authorization check" }]), false);
+});
+
+test("removeStateDirIfCreated obeys lstat and preexistence checks", () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "adv-statetest-"));
+  try {
+    const insideDir = path.join(tmpRoot, "sub", ".omo");
+    fs.mkdirSync(insideDir, { recursive: true });
+    assert.equal(fs.existsSync(insideDir), true);
+
+    // Preexisted returns false without removal
+    assert.equal(removeStateDirIfCreated(insideDir, true), false);
+    assert.equal(fs.existsSync(insideDir), true);
+
+    // Non-existent directory returns false
+    assert.equal(removeStateDirIfCreated(path.join(tmpRoot, "nonexistent"), false), false);
+
+    // Legitimate removal
+    assert.equal(removeStateDirIfCreated(insideDir, false), true);
+    assert.equal(fs.existsSync(insideDir), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("extractOpencodeErrors extracts error events from JSON stream while ignoring non-JSON noise", () => {
+  const stream = [
+    "Preamble banner line",
+    '{"type":"step_start"}',
+    '{"type":"text","part":{"text":"hello"}}',
+    "Invalid { not json",
+    '{"type":"error","error":{"data":{"message":"Provider token expired"}}}',
+    '{"type":"error","error":{"message":"Fallback error format"}}',
+    "Trailing garbage"
+  ].join("\n");
+
+  assert.deepEqual(extractOpencodeErrors(stream), [
+    "Provider token expired",
+    "Fallback error format"
+  ]);
+});
+
+test("extractOpencodeErrors strips control characters and truncates long messages", () => {
+  const longMessage = "a".repeat(400) + "\x00\x1b[31mbad\x7f";
+  const stream = JSON.stringify({
+    type: "error",
+    error: { data: { message: longMessage } }
+  });
+  const errors = extractOpencodeErrors(stream);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].length, 300);
+  assert.doesNotMatch(errors[0], /[\x00-\x1F\x7F]/);
+});
+
+test("extractOpencodeErrors caps the number of retained error events", () => {
+  const flood = Array.from({ length: MAX_OPENCODE_ERRORS * 5 }, (_, i) =>
+    JSON.stringify({ type: "error", error: { data: { message: `boom ${i}` } } })
+  ).join("\n");
+  const errors = extractOpencodeErrors(flood);
+  assert.equal(errors.length, MAX_OPENCODE_ERRORS);
+  assert.equal(errors[0], "boom 0", "the cap must keep the first (diagnostic) errors, not the last");
+});
+
+test("opencodeExecOptions enforces pinned sandbox options (stream: false, idleTimeout finite)", () => {
+  const opts = opencodeExecOptions({ envOverrides: { FOO: "bar" } });
+  assert.equal(opts.stream, false, "streaming stdout must be disabled to prevent secret leakage from tool events");
+  assert.equal(opts.argsContainUntrusted, false);
+  assert.deepEqual(opts.envOverrides, { FOO: "bar" });
+  assert.equal(typeof opts.idleTimeoutMs, "number");
+  assert.ok(opts.idleTimeoutMs > 0, "idleTimeoutMs must be positive to prevent permission-prompt stalls");
+});
+
+test("buildExecCliWatchdogOptions defaults the budget to the same constant execCli does", () => {
+  assert.equal(buildExecCliWatchdogOptions().timeoutMs, DEFAULT_CLI_TIMEOUT_MS);
+  assert.equal(buildExecCliWatchdogOptions().streamStdout, false);
+  assert.equal(buildExecCliWatchdogOptions().argsContainUntrusted, true, "argv is untrusted unless a caller proves otherwise");
+});
+
+test("buildExecCliWatchdogOptions maps execCli options to spawnWithWatchdog correctly", () => {
+  const opencodeOpts = opencodeExecOptions({ envOverrides: { KEY: "value" } });
+  const mapped = buildExecCliWatchdogOptions({
+    ...opencodeOpts,
+    input: "diff payload",
+    timeoutMs: 60_000
+  });
+
+  assert.equal(mapped.input, "diff payload");
+  assert.equal(mapped.timeoutMs, 60_000);
+  assert.equal(mapped.streamStdout, false);
+  assert.equal(mapped.argsContainUntrusted, false);
+  assert.deepEqual(mapped.envOverrides, { KEY: "value" });
+  assert.equal(mapped.idleTimeoutMs, opencodeOpts.idleTimeoutMs);
+});
+
+test("idle timeout options terminate silent hung child processes", async () => {
+  const started = Date.now();
+  const idleBudget = 1200;
+  const watchdogOpts = buildExecCliWatchdogOptions({
+    ...opencodeExecOptions(),
+    timeoutMs: 10_000,
+    idleTimeoutMs: idleBudget
+  });
+  const err = await spawnWithWatchdog(
+    process.execPath,
+    ["-e", "setInterval(()=>{},1000)"],
+    watchdogOpts
+  ).catch((e) => e);
+  assert.equal(err.code, "EIDLE");
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < idleBudget * 4, `must kill at the idle budget rather than the hard ceiling (elapsed: ${elapsed}ms)`);
+});
+
+test("opencode CLI review path forces stream: false: the event stream never reaches stderr", async () => {
+  // The pin under test is a leak guard, not a preference. Under --format json every
+  // tool result is an event on stdout carrying repository file contents — including
+  // files the reviewer opened that the pre-flight secret scan never saw. streamStdout
+  // mirrors raw stdout to stderr, which in CI is a log. So asserting the returned
+  // text is not enough: assert the payload never appeared on stderr, with stream:true
+  // explicitly requested by the caller.
+  const CANARY = "CANARY_REPO_SECRET_9137";
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-mock-"));
+  const mockCode = `
+import fs from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--pure" && args[1] === "agent" && args[2] === "list") {
+  const config = JSON.parse(fs.readFileSync(process.env.OPENCODE_CONFIG, "utf8"));
+  const agentName = Object.keys(config.agent)[0];
+  process.stdout.write(agentName + " (primary)\\n");
+  process.exit(0);
+}
+if (args[0] === "--pure" && args[1] === "run") {
+  fs.readFileSync(0, "utf8");
+  process.stdout.write('{"type":"step_start"}\\n');
+  // Stands in for a tool result that carried a gitignored file into the event stream.
+  process.stdout.write('{"type":"tool","state":{"output":"${CANARY}"}}\\n');
+  process.stdout.write('{"type":"text","part":{"text":"{\\\\"verdict\\\\":\\\\"approve\\\\"}"}}\\n{"type":"step_finish"}\\n');
+  process.exit(0);
+}
+`;
+  writeMockBin(tmpDir, "opencode", mockCode);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${tmpDir}${path.delimiter}${oldPath}`;
+  const realStderrWrite = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = (chunk, ...rest) => {
+    captured += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return realStderrWrite(chunk, ...rest);
+  };
+  let result;
+  try {
+    result = await llmCall(
+      { provider: "cli", cliCmd: "opencode", timeoutMs: 10000, stream: true },
+      "review me",
+      "system instruction"
+    );
+  } finally {
+    process.stderr.write = realStderrWrite;
+    process.env.PATH = oldPath;
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+
+  assert.equal(result, '{"verdict":"approve"}');
+  assert.doesNotMatch(
+    captured,
+    new RegExp(CANARY),
+    "tool-event contents must never be mirrored to stderr, even when the caller asked for --stream"
+  );
+  assert.doesNotMatch(captured, /"type":"step_start"/, "the raw event stream must not be mirrored to stderr");
+  assert.match(captured, /not streamed/, "the downgrade must be announced rather than silent");
 });
