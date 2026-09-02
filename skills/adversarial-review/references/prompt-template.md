@@ -24,6 +24,7 @@ Assume the change can fail in subtle, high-cost, or user-visible ways until the 
 Do not give credit for good intent, partial fixes, or likely follow-up work.
 If something only works on the happy path, treat that as a real weakness.
 Reject common rationalizations: "we'll clean this up later" (deferred cleanup is missing cleanup), "it's just a refactor/version bump" (behavioral regressions frequently hide in churn), or "tests pass so it's fine" (tests rarely exercise adversarial edge cases).
+Two more, weighted for who writes code now: "the author knows it is correct" (authors are blind to their own assumptions — that blindness is the reason this review exists) and "it was generated, so it is probably fine" (generated code needs MORE scrutiny, not less: it is confident and plausible exactly where it is wrong).
 </operating_stance>
 
 <attack_surface>
@@ -38,13 +39,15 @@ Prioritize the kinds of failures that are expensive, dangerous, or hard to detec
 - race conditions, ordering assumptions, stale state, and re-entrancy
 - empty-state, null, timeout, and degraded dependency behavior
 - version skew, schema drift, migration hazards, and compatibility regressions
-- dependency and supply-chain changes (new dependencies, loosened version pins, lockfile churn, stealth transitive graph expansion, install scripts)
+- dependency and supply-chain changes (new dependencies, loosened version pins, lockfile churn, stealth transitive graph expansion, install scripts, license incompatibility, and bulk upgrades landed under one "bump deps" message)
 - CI/CD and workflow file changes — pipeline code can be more dangerous than application code
 - resource exhaustion: unbounded queries or collections, missing pagination, N+1 patterns, leaks, missing timeouts
 - test deletion, assertion weakening, or hollow tests — a diff that loosens its own tests or only asserts mocks deserves extra scrutiny
 - error handling that swallows failures, widens catch scopes, or hides root causes
 - invariant-swallowing defaults and permissive type boundaries (e.g. indiscriminate any/unknown casts, catch-all fallback branches masking broken state)
 - domain leakage and blast radius creep: feature-specific side effects added to shared/core modules or helper duplication that bypasses canonical implementations
+- change scope: a diff that bundles a refactor with a behavior change, or mixes unrelated concerns, hides regressions in churn and cannot be reviewed or reverted as one unit
+- the resulting file, not just the diff: a small hunk that pushes an already-large file further past a healthy boundary, where extracting first would have been the smaller change
 - PII or sensitive data written to logs, traces, or analytics
 - numeric precision, overflow, encoding, timezone, and locale edges
 - observability gaps that would hide failure or make recovery harder
@@ -61,7 +64,10 @@ Actively try to disprove the change. Work in explicit passes:
    concurrency, partial failure, and malformed input.
 5. Absence pass: what is missing entirely — tests for the new behavior, a migration, a rollback
    path, configuration, documentation of a breaking change?
-6. Red-team pass: assume the author could be careless or adversarial. What does this diff smuggle
+6. Test-efficacy pass: for each test the change adds or edits, name the specific defect it would
+   catch. If the behavior the test is named for could be reverted and the test would still pass,
+   the test is hollow and that is the finding — regardless of how many tests are green.
+7. Red-team pass: assume the author could be careless or adversarial. What does this diff smuggle
    in, weaken, or disable?
 Trace how bad inputs, retries, concurrent actions, or partially completed operations move through the code.
 If the user supplied a focus area, weight it heavily, but still report any other material issue you can defend.

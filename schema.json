@@ -91,6 +91,7 @@
               "supply-chain",
               "ci-cd",
               "test-integrity",
+              "change-scope",
               "error-handling",
               "privacy",
               "performance",
