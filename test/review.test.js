@@ -755,6 +755,45 @@ test("the review prompt names the failure classes the schema can categorize", ()
   assert.match(text, /the test is hollow/i, "missing the test-efficacy pass");
 });
 
+test("the report separates findings that gate from findings that do not", () => {
+  const findings = [
+    validFinding({ title: "Blocks the merge", severity: "high", confidence: 0.9 }),
+    validFinding({ title: "Too quiet to block", severity: "high", confidence: 0.2 }),
+    validFinding({ title: "Too mild to block", severity: "low", confidence: 0.99 })
+  ];
+  const result = validResult({ findings });
+  const derived = deriveVerdict(result, null, { failOn: "medium", minConfidence: 0.5 });
+  const report = renderReport(result, { label: "working tree" }, null, derived);
+
+  assert.match(report, /below the gate/i, "the split must be visible");
+  const divider = report.search(/below the gate/i);
+  // A high-severity finding under the confidence floor is NOT required work. Reading
+  // severity alone would put it above the divider and send the author to fix it.
+  assert.ok(report.indexOf("Blocks the merge") < divider, "a gating finding belongs above the divider");
+  assert.ok(report.indexOf("Too quiet to block") > divider, "confidence below the floor does not gate");
+  assert.ok(report.indexOf("Too mild to block") > divider, "severity below the threshold does not gate");
+});
+
+test("the report groups by the thresholds that actually set the exit code", () => {
+  // Regression guard against a second source of truth: raising --fail-on must move
+  // the divider, not just the verdict. If renderReport recomputed defaults instead of
+  // reading what deriveVerdict used, this stays above the line and the report lies.
+  const result = validResult({ findings: [validFinding({ title: "Medium risk", severity: "medium", confidence: 0.9 })] });
+  const strict = deriveVerdict(result, null, { failOn: "critical", minConfidence: 0.5 });
+  const report = renderReport(result, { label: "working tree" }, null, strict);
+  assert.match(report, /below the gate \(severity < critical/i);
+  assert.ok(report.indexOf("Medium risk") > report.search(/below the gate/i));
+});
+
+test("renderReport still renders when no gate thresholds are available", () => {
+  // The loop and quorum paths pass derived objects built elsewhere; a missing
+  // threshold must degrade to the flat list, never drop findings.
+  const result = validResult({ findings: [validFinding({ title: "Still shown" })] });
+  const flat = renderReport(result, { label: "working tree" }, null, { verdict: "needs-attention" });
+  assert.match(flat, /Still shown/);
+  assert.doesNotMatch(flat, /below the gate/i);
+});
+
 test("T11: both templates carry all three trust rules", () => {
   for (const name of ["prompt-template.md", "prompt-template-artifact.md"]) {
     const text = loadAsset(name);

@@ -333,7 +333,12 @@ export function deriveVerdict(result, assessments, { failOn = "medium", minConfi
   const gating = result.findings.filter((f, i) => isGatingFinding(f, assessments?.[i], { failOn, minConfidence }));
   return {
     verdict: gating.length ? "needs-attention" : "approve",
-    gatingCount: gating.length
+    gatingCount: gating.length,
+    // Echoed so renderReport can group findings by the SAME thresholds that set the
+    // exit code. Recomputing them from args at the render site would be a second
+    // source of truth, free to drift from the gate it claims to describe.
+    failOn,
+    minConfidence
   };
 }
 
@@ -379,7 +384,34 @@ export function renderReport(result, context, assessments = null, derived = null
     lines.push(colors.bold(`Findings (${result.findings.length})`));
     const indexed = result.findings.map((f, i) => ({ f, assessment: assessments?.[i] }));
     indexed.sort((a, b) => SEVERITY_RANK[b.f.severity] - SEVERITY_RANK[a.f.severity]);
-    for (const { f, assessment } of indexed) {
+
+    // Severity alone does not tell a reader what is required of them: a finding
+    // blocks only if it ALSO clears the confidence floor, and grounding can halve
+    // that confidence. Split the list on the real predicate so "what must I fix"
+    // is read off the report rather than recomputed in the reader's head.
+    const thresholds = typeof derived?.failOn === "string" && typeof derived?.minConfidence === "number"
+      ? { failOn: derived.failOn, minConfidence: derived.minConfidence }
+      : null;
+    const gates = ({ f, assessment }) => isGatingFinding(f, assessment, thresholds);
+    const groups = thresholds
+      ? [
+          { items: indexed.filter(gates), header: null },
+          {
+            items: indexed.filter((x) => !gates(x)),
+            header: colors.dim(
+              `  ── below the gate (severity < ${thresholds.failOn} or confidence < ${thresholds.minConfidence.toFixed(2)}) — reported, not blocking`
+            )
+          }
+        ]
+      : [{ items: indexed, header: null }];
+
+    for (const group of groups) {
+      if (!group.items.length) continue;
+      if (group.header) {
+        lines.push("");
+        lines.push(group.header);
+      }
+      for (const { f, assessment } of group.items) {
       const sev = (SEVERITY_COLOR[f.severity] || colors.gray)(f.severity.toUpperCase().padEnd(8));
       const conf = colors.dim(`conf ${f.confidence.toFixed(2)}`);
       const cat = colors.magenta(`[${f.category}]`);
@@ -398,6 +430,7 @@ export function renderReport(result, context, assessments = null, derived = null
       lines.push(`    ${colors.green("→ fix:")} ${f.recommendation}`);
       for (const note of assessment?.notes || []) {
         lines.push(`    ${colors.yellow(`⚠ ungrounded: ${note} — confidence halved for gating`)}`);
+      }
       }
     }
   } else {
@@ -636,6 +669,8 @@ export function deriveQuorumVerdict(perProvider, { failOn = "medium", minConfide
   const effectiveQuorum = Math.max(1, Math.min(quorum, perProviderVerdicts.length));
   return {
     verdict: flaggingCount >= effectiveQuorum ? "needs-attention" : "approve",
+    failOn,
+    minConfidence,
     flaggingCount,
     quorum,
     effectiveQuorum,
