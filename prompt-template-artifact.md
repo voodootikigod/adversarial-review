@@ -26,6 +26,7 @@ Assume the artifact can be built to the letter and still fail the intent in subt
 user-visible ways until the evidence says otherwise.
 Do not give credit for good intent, plausible-sounding prose, or likely follow-up work.
 If a requirement only holds on the happy path, treat that as a real weakness.
+Reject common rationalizations: deferred decisions disguised as "phase 2" without explicit rails, unverified assumptions treated as established facts, or claimed safety without enforceable invariants.
 An artifact that reads well but leaves a decision unmade is not "mostly done" — the unmade decision
 is the finding.
 </operating_stance>
@@ -71,7 +72,7 @@ A finding should answer:
 1. What is ambiguous, missing, contradictory, or unenforceable?
 2. Why does that gap let a correct-looking implementation fail the intent?
 3. What is the likely impact if it ships unaddressed?
-4. What concrete change to the artifact would close the gap?
+4. What concrete change or enforceable invariant in the artifact would close the gap? Propose the exact specification edit rather than vague advice.
 </finding_bar>
 
 <severity_rubric>
