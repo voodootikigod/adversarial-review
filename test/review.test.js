@@ -38,6 +38,20 @@ test("validateResult accepts a schema-compliant result", () => {
   assert.deepEqual(validateResult(validResult()), []);
 });
 
+test("validateResult accepts the change-scope category and still rejects unknown ones", () => {
+  // change-scope is how the reviewer reports a diff that bundles a refactor with a
+  // behavior change: reviewable-as-one-unit is a ship property, not a style opinion.
+  assert.deepEqual(
+    validateResult(validResult({ findings: [validFinding({ category: "change-scope" })] })),
+    []
+  );
+  assert.notDeepEqual(
+    validateResult(validResult({ findings: [validFinding({ category: "readability" })] })),
+    [],
+    "the enum must stay closed — an open category list lets style feedback in through the gate"
+  );
+});
+
 test("validateResult accepts a file-level finding (lines 0,0)", () => {
   const result = validResult({
     findings: [validFinding({ line_start: 0, line_end: 0, evidence: "" })]
@@ -719,6 +733,26 @@ test("T11: a directive cannot forge a data fence either", () => {
   const body = out.slice(out.indexOf("\n") + 1, out.lastIndexOf("\n"));
   assert.ok(!body.includes("<<<END:"), "forged data sentinel survived in a directive");
   assert.ok(body.includes("everything"));
+});
+
+test("the review_method steps are contiguously numbered", () => {
+  // The passes are inserted by hand over time. A duplicated or skipped number
+  // reads to the model as a missing pass, and the pass most likely to be dropped
+  // is the one added last.
+  const text = loadAsset("prompt-template.md");
+  const method = text.split("<review_method>")[1].split("</review_method>")[0];
+  const nums = [...method.matchAll(/^(\d+)\. /gm)].map((m) => Number(m[1]));
+  assert.ok(nums.length >= 6, `expected at least 6 numbered passes, found ${nums.length}`);
+  assert.deepEqual(nums, nums.map((_, i) => i + 1), `review_method numbering is not contiguous: ${nums.join(",")}`);
+});
+
+test("the review prompt names the failure classes the schema can categorize", () => {
+  // A category the model is never told to look for is a category it will not
+  // report. These three were added together; the pairing is what makes them work.
+  const text = loadAsset("prompt-template.md");
+  assert.match(text, /bundles a refactor with a behavior change/i, "missing change-scope guidance");
+  assert.match(text, /license incompatibility/i, "missing license guidance on the supply-chain bullet");
+  assert.match(text, /the test is hollow/i, "missing the test-efficacy pass");
 });
 
 test("T11: both templates carry all three trust rules", () => {
