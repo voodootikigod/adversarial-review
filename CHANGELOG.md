@@ -18,6 +18,23 @@ All notable changes to this project are documented here.
 - **Vercel AI Gateway provider**: `--provider vercel|gateway` with `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`), base `https://ai-gateway.vercel.sh/v1`, default model `anthropic/claude-sonnet-5`.
 - **One-key multi-family routing**: when only a Gateway credential is set, `--providers auto` / family tokens resolve openai + anthropic + gemini through the Gateway with distinct `provider/model` ids (native vendor keys still win when present).
 
+## [2.11.0] — 2026-09-04
+
+### Added
+- **The diff itself can now be a finding.** A new `change-scope` category reports a change that bundles a refactor with a behaviour change, or mixes unrelated concerns — one that hides regressions in churn and cannot be reviewed or reverted as a unit. It also covers the *resulting* file, not just the diff: a small hunk that pushes an already-large file further past a healthy boundary, where extracting first would have been the smaller change. Previously `--max-files`/`--max-bytes` only degraded the review to summary mode; nothing ever reported the change shape as a risk.
+- **A test-efficacy pass.** The reviewer now names the specific defect each new or changed test would catch, and reports the test as hollow when reverting the behaviour it is named for would leave it passing — regardless of how many tests are green. "Hollow tests" was already on the attack surface; nothing asked the question that finds them.
+- **Two rationalizations the reviewer must reject**, weighted for who writes code now: authors are blind to their own assumptions, and generated code needs *more* scrutiny rather than less, because it is confident and plausible exactly where it is wrong. Added to both the code and artifact prompts.
+- **Dependency licensing and bulk upgrades** on the supply-chain attack surface. License incompatibility is a ship blocker, and the riskiest upgrades are the ones landed together under one "bump deps" message.
+- **opencode failures are now diagnosed rather than collapsed.** Rate limiting/quota exhaustion and network transport failures are classified separately from model and auth problems, each with its own actionable message, and error events are parsed out of the `--format json` event stream instead of stderr alone. An idle timeout — opencode's documented permission hang — is named rather than surfacing as a generic exec error.
+
+### Changed
+- **The report separates findings that block from findings that do not.** Sorting by severity alone never told you what was required: a finding gates only if it also clears the confidence floor, and an ungrounded finding has its confidence halved first — so a `HIGH` at confidence 0.20 rendered identically to a `HIGH` at 0.90 while having no effect on the exit code. Everything below the threshold now sits under an explicit `below the gate … reported, not blocking` divider. The split is derived from the same predicate that sets the exit code; the model still does not choose what blocks.
+
+### Fixed
+- **A rate-limit false positive.** `429` was matched unanchored, so text such as `read 4291 bytes before EOF` reported a hard crash as "rate-limited — wait and retry", advice for a failure that never clears.
+- **The opencode event stream is never mirrored to stderr.** Under `--format json` every tool result is an event on stdout carrying repository file contents, including files the reviewer opened that the pre-flight secret scan never saw — streaming would put them in a CI log. The pin is now enforced by a test that fails when it is removed.
+- Error events extracted from an opencode run are capped, rather than growing with a stdout bounded only by the 10MB buffer.
+
 ## [2.10.0] — 2026-08-04
 
 ### Added
