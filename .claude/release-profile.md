@@ -13,6 +13,7 @@ landing: pr
 publishTrigger: tag
 publishEnvironment: npm-publish
 publishWorkflow: .github/workflows/publish.yml
+releaseNotes: awk '/^## \[{{version}}\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md
 verify:
   - npm view adversarial-review@{{version}} version
   - '[ "$(npm view adversarial-review dist-tags.latest)" = "{{version}}" ]'
@@ -40,15 +41,30 @@ mirror is a manual `cp`. Both are declared in `bumpSites` above; before 2.10.0 o
 was, and the release survived solely because the drift guard failed the tree for an unrelated
 reason.
 
+**`releaseNotes` extracts the changelog section, so the GitHub Release mirrors `CHANGELOG.md`.**
+Added after 2.11.0, whose Release body is a generated commit list that disagrees with the curated
+`[2.11.0]` entry describing the same release. The awk range stops at the next `## [` heading, so
+it captures exactly one version's section. It fails closed: Step 12 requires non-empty output, so
+a changelog missing a `## [X.Y.Z]` heading for the version being cut aborts the Release rather
+than publishing an empty one — which also means **the changelog section must be written before
+the tag**, not after.
+
 **No `changelogCommand` — `CHANGELOG.md` is hand-curated.** It was last cut into a version
 heading at `[2.0.0]`, so `[Unreleased]` accumulated already-published entries from 2.1–2.9,
 including a `### Breaking changes` heading that refers to **2.8.0**. Do not read that heading as
 a major-bump signal: check `git tag --contains <sha>` before letting changelog text drive the
 semver decision. 2.10.0 nearly shipped as 3.0.0 on exactly this.
 
+**The npm Trusted Publisher is configured and confirmed.** The maintainer confirmed it directly
+after the 2.11.0 release (2026-09-05), and 2.10.0 and 2.11.0 both published through it. The
+conformance checker cannot see npm-side config — an absent token and a missing trusted publisher
+are indistinguishable from the repo — so Step 8 has this record to rely on instead of asking
+again. Re-confirm only if a publish fails on auth, which is the symptom of that config changing.
+
 Publishing is tokenless via OIDC — `NPM_TOKEN` was deliberately deleted — so provenance is
 automatic; `npm view adversarial-review@{{version}} --json` should include `dist.attestations`
-with a SLSA `provenance` predicate. The precondition asserts no repo-scoped `NPM_TOKEN` has
+with a SLSA `provenance` predicate. **Provenance is the observable proof the OIDC path was taken**:
+2.11.0's attestation is what retroactively answered the trusted-publisher question above. The precondition asserts no repo-scoped `NPM_TOKEN` has
 reappeared; if one has, someone re-introduced the long-lived credential OIDC exists to remove.
 
 There is no `workflow_dispatch` — a failed publish is re-run with `gh run rerun <id>` on the
