@@ -186,6 +186,25 @@ test("configureLLM prioritizes non-Anthropic critic in Claude Code if key is pre
   }
 });
 
+test("configureLLM prioritizes non-Gemini critic in Antigravity if key is present", () => {
+  const oldEnv = { ...process.env };
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.CLAUDE_CODE;
+  delete process.env.CLAUDECODE;
+  process.env.ANTIGRAVITY_AGENT = "1";
+  process.env.GEMINI_API_KEY = "mock-gemini-key";
+  process.env.ANTHROPIC_API_KEY = "mock-anthropic-key";
+
+  try {
+    const config = configureLLM({});
+    assert.equal(config.provider, "anthropic");
+    assert.equal(config.model, "claude-sonnet-4-6");
+    assert.equal(config.apiKey, "mock-anthropic-key");
+  } finally {
+    process.env = oldEnv;
+  }
+});
+
 test("configureLLM auto-detects agy CLI when only agy is installed and no API keys", { skip: process.platform === "win32" ? "agy .cmd shim is not usable for review on Windows" : false }, () => {
   const oldEnv = { ...process.env };
   delete process.env.OPENAI_API_KEY;

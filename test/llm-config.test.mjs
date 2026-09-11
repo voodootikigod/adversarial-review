@@ -149,6 +149,9 @@ test("configureLLM honors a config model pin below --model and above the hardcod
 test("apiOutranksCliInContext: ANTHROPIC does NOT outrank CLIs in Claude Code, but does by default", () => {
   assert.equal(apiOutranksCliInContext("claudecode", { env: { ANTHROPIC_API_KEY: "a" } }), false);
   assert.equal(apiOutranksCliInContext("claudecode", { env: { GEMINI_API_KEY: "g" } }), true);
+  assert.equal(apiOutranksCliInContext("antigravity", { env: { GEMINI_API_KEY: "g" } }), false);
+  assert.equal(apiOutranksCliInContext("antigravity", { env: { ANTHROPIC_API_KEY: "a" } }), true);
+  assert.equal(apiOutranksCliInContext("antigravity", { env: { OPENAI_API_KEY: "o" } }), true);
   assert.equal(apiOutranksCliInContext("default", { env: { ANTHROPIC_API_KEY: "a" } }), true);
   assert.equal(apiOutranksCliInContext("cursor", { env: { ANTHROPIC_API_KEY: "a" } }), true);
   assert.equal(apiOutranksCliInContext("default", { env: {} }), false);

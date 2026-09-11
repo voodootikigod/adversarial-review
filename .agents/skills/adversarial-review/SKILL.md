@@ -119,9 +119,9 @@ Procedure:
 
 ## Choosing the model (Tier 1)
 
-If `--provider` is not given, the model is auto-detected. **Inside Claude Code or Cursor
-the detection order is deliberately inverted** — a model reviewing its own output is a
-weaker critic, so non-Anthropic providers are preferred first:
+If `--provider` is not given, the model is auto-detected. **Inside Claude Code, Cursor, or
+Antigravity the detection order is deliberately inverted** — a model reviewing its own output
+is a weaker critic:
 
 **Inside Claude Code** (`CLAUDECODE` / `CLAUDE_CODE` env set):
 1. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`)
@@ -138,6 +138,14 @@ weaker critic, so non-Anthropic providers are preferred first:
 4. `AI_GATEWAY_API_KEY` → Vercel AI Gateway
 5. Local `agy`, `claude`, or `codex` CLI
 6. Local `agent` (Cursor Agent CLI) ← last resort, with warning
+
+**Inside Antigravity** (`ANTIGRAVITY_AGENT` / `ANTIGRAVITY_CONVERSATION_ID` env set):
+1. `ANTHROPIC_API_KEY` → Anthropic API (`claude-sonnet-4-6`)
+2. `OPENAI_API_KEY` → OpenAI API (`gpt-5`)
+3. `AI_GATEWAY_API_KEY` → Vercel AI Gateway (non-Gemini model preferred)
+4. Local `codex`, `claude`, or `agent` CLI on `PATH`
+5. `GEMINI_API_KEY` → Gemini API (`gemini-2.5-pro`) ← last resort, with warning
+6. Local `agy` CLI on `PATH` ← last resort, with warning
 
 **Everywhere else** (default order):
 1. `ANTHROPIC_API_KEY` → Anthropic API (`claude-sonnet-4-6`)
