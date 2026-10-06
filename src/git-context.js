@@ -140,7 +140,7 @@ function collectFullFiles(cwd, files, budgetBytes) {
 }
 
 function collectWorkingTree(cwd, { maxFiles, maxBytes, contextLines, includeFiles }) {
-  const status = git(cwd, ["status", "--short", "--untracked-files=all"]).trim();
+  const status = git(cwd, ["status", "--short", "--untracked-files=all"]).trimEnd();
   const unified = `-U${contextLines}`;
   const stagedDiff = git(cwd, ["diff", "--cached", "--no-ext-diff", "--submodule=diff", unified]);
   const unstagedDiff = git(cwd, ["diff", "--no-ext-diff", "--submodule=diff", unified]);
