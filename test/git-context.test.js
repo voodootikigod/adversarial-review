@@ -77,3 +77,14 @@ test("CLI fails closed for summary-only API reviews unless explicitly allowed", 
     }
   );
 });
+
+test("collectReviewContext keeps the first path intact when the first status line is an unstaged edit", () => {
+  // Regression: trimming the whole `git status --short` output removed the
+  // leading space of " M code.js", so slice(3) produced "ode.js" and findings on
+  // that file were treated as outside the change set (confidence halved).
+  const dir = initRepo();
+  fs.appendFileSync(path.join(dir, "README.md"), "edited\n");
+  fs.writeFileSync(path.join(dir, "new.js"), "x\n");
+  const context = collectReviewContext(dir, { scope: "working-tree" });
+  assert.deepEqual([...context.changedFiles].sort(), ["README.md", "new.js"]);
+});

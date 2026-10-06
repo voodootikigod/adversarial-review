@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { log } from "../src/utils.js";
-import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, fixerKind, FIXER_PROVIDER_MAP, detectFixer, probeLinuxConstraint, probeOsConstraint } from "../src/loop.js";
+import { tailOf, buildLoopSummary, getFixFiles, sanitizeEditablePaths, buildFixPrompt, buildFixerCmd, fixerKind, FIXER_PROVIDER_MAP, detectFixer, probeLinuxConstraint, probeOsConstraint, takeSnapshot, diffedFiles } from "../src/loop.js";
 
 test("FIXER_PROVIDER_MAP maps agy to the gemini family and drops the legacy gemini key", () => {
   assert.equal(FIXER_PROVIDER_MAP.agy, "gemini");
@@ -555,4 +555,19 @@ test("T44: buildFixerCmd masks UNIX sockets with --ro-bind /dev/null", () => {
     assert.equal(args[idx - 2], "--ro-bind");
     assert.equal(args[idx - 1], "/dev/null");
   }
+});
+
+test("diffedFiles keeps the first path intact when the first status line is an unstaged edit", () => {
+  // Regression: gitRun trimmed the whole porcelain output, so " M README.md" lost
+  // its leading status column and slice(3) reported "EADME.md" in filesModified.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adversarial-review-snap-"));
+  const g = (...a) => execFileSync("git", a, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  g("init");
+  fs.writeFileSync(path.join(dir, "README.md"), "a\n");
+  g("add", "README.md");
+  g("-c", "user.name=T", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-m", "i");
+  const before = takeSnapshot(dir);
+  fs.appendFileSync(path.join(dir, "README.md"), "b\n");
+  const after = takeSnapshot(dir);
+  assert.deepEqual(diffedFiles(before, after), ["README.md"]);
 });
