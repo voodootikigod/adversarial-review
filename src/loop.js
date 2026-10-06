@@ -56,18 +56,21 @@ function buildReviewRound(args, context, prompt) {
 
 // ─── Git helpers ──────────────────────────────────────────────────────────────
 
-function gitRun(cwd, args, { allowFail = false } = {}) {
+function gitRun(cwd, args, { allowFail = false, keepLeading = false } = {}) {
   // Absolute, trusted git only — see resolveTrustedGit. Resolved outside the try
   // so an allowFail probe cannot turn a security refusal into an empty string.
   const gitBin = resolveTrustedGit();
   try {
-    return execFileSync(gitBin, args, {
+    const out = execFileSync(gitBin, args, {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 4 * 1024 * 1024,
       env: sanitizedSpawnEnv()
-    }).trim();
+    });
+    // Porcelain status lines start with a status column that may be a space, so
+    // callers that parse paths ask to keep leading whitespace.
+    return keepLeading ? out.trimEnd() : out.trim();
   } catch (err) {
     if (allowFail) return "";
     const stderr = err.stderr ? String(err.stderr).trim() : "";
@@ -76,9 +79,9 @@ function gitRun(cwd, args, { allowFail = false } = {}) {
 }
 
 // Snapshot the working tree for no-diff detection (diff + status).
-function takeSnapshot(cwd) {
+export function takeSnapshot(cwd) {
   const diff = gitRun(cwd, ["diff", "HEAD"], { allowFail: true });
-  const status = gitRun(cwd, ["status", "--porcelain"], { allowFail: true });
+  const status = gitRun(cwd, ["status", "--porcelain"], { allowFail: true, keepLeading: true });
   return diff + "\x00" + status;
 }
 
@@ -789,7 +792,7 @@ function spawnFixer(fixerCmd, prompt, cwd, constraint, timeoutMs) {
 
 // ─── Detect which files changed between two snapshots ─────────────────────────
 
-function diffedFiles(before, after) {
+export function diffedFiles(before, after) {
   if (before === after) return [];
   const afterStatus = (after.split("\x00")[1] || "").split("\n").filter(Boolean);
   const beforeStatus = new Set((before.split("\x00")[1] || "").split("\n").filter(Boolean));
