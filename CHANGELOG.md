@@ -8,7 +8,6 @@ All notable changes to this project are documented here.
 > headings. They describe behaviour that is already published; they are not pending work.
 
 ### Fixed
-- **Working-tree reviews mangled the first changed path.** The whole `git status --short` output was trimmed, so when the first entry was an unstaged edit (` M file`) its leading status column was lost and the path lost its first character (`code.js` became `ode.js`). Findings on that file were then treated as outside the change set and had their confidence halved, which could turn a needs-attention verdict into approve. The same trim made `--loop` report the fixer's first modified file without its first character in `filesModified` (log line and `fix` event). Only trailing whitespace is trimmed now.
 - **`--provider agy`**: pass `--mode plan` instead of Claude’s `--permission-mode plan` (agy 1.1.2 rejects the latter). Unknown-flag rejections from local CLIs are now reported as `provider "X" rejected flag "Y"` instead of being masked as a prompt-size error.
 
 ### Breaking changes
@@ -18,6 +17,11 @@ All notable changes to this project are documented here.
 - **Cursor Agent CLI provider**: `--provider cursor|agent` invokes `agent -p --mode plan --trust` (subscription / `CURSOR_API_KEY`). Auto-detect inside Cursor falls back to `agent` instead of a dead proxy.
 - **Vercel AI Gateway provider**: `--provider vercel|gateway` with `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`), base `https://ai-gateway.vercel.sh/v1`, default model `anthropic/claude-sonnet-5`.
 - **One-key multi-family routing**: when only a Gateway credential is set, `--providers auto` / family tokens resolve openai + anthropic + gemini through the Gateway with distinct `provider/model` ids (native vendor keys still win when present).
+
+## [2.11.1] — 2026-10-06
+
+### Fixed
+- **Working-tree reviews mangled the first changed path.** The whole `git status --short` output was trimmed, so when the first entry was an unstaged edit (` M file`) its leading status column was lost and the path lost its first character (`code.js` became `ode.js`). Findings on that file were then treated as outside the change set and had their confidence halved, which could turn a needs-attention verdict into approve. The same trim made `--loop` report the fixer's first modified file without its first character in `filesModified` (log line and `fix` event). Only trailing whitespace is trimmed now.
 
 ## [2.11.0] — 2026-09-04
 
