@@ -2179,6 +2179,10 @@ flags appear in `HELP_TEXT` only under "Optional: decision provider".
     agy supports it AND plan mode is attested for the run; otherwise the error
     stays, now naming the missing support or attestation (A11). Prompts within the
     limit are unchanged. CHANGELOG entry (Fixed).
+39. `--loop` working-tree `fix` events and the human "Files modified:" line report every path whose
+    content changed during the fix, including files that were already dirty before it (today an
+    already-modified file is omitted, because only newly appearing `git status` lines are compared).
+    Branch scope is unchanged. Ticket T118, step 2b. CHANGELOG entry (Fixed).
 New flags: `--verify-timeout`, `--verify-max`, `--loop-fixer-family` (declares a custom fixer's family), `--builder`, `--allow-same-family`, `--allow-unverified-independence`,
 `--allow-degraded-quorum`, `--loop-accept-rollback-limits`, `--concurrency`,
 `--loop-fixer-timeout`, and from v59 `--loop-seed <n>` (D8; seeds the rotation
