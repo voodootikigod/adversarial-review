@@ -2183,6 +2183,10 @@ flags appear in `HELP_TEXT` only under "Optional: decision provider".
     content changed during the fix, including files that were already dirty before it (today an
     already-modified file is omitted, because only newly appearing `git status` lines are compared).
     Branch scope is unchanged. Ticket T118, step 2b. CHANGELOG entry (Fixed).
+40. `--loop` working-tree rollback restores the user's index and worktree separately (from the
+    checkpoint stash's index tree and worktree tree), preserving the staged/unstaged split. Today the
+    per-file fallback (always taken, because the checkpoint re-applies the stash) writes the stashed
+    worktree content into both. Ticket T119, step 2b. CHANGELOG entry (Fixed).
 New flags: `--verify-timeout`, `--verify-max`, `--loop-fixer-family` (declares a custom fixer's family), `--builder`, `--allow-same-family`, `--allow-unverified-independence`,
 `--allow-degraded-quorum`, `--loop-accept-rollback-limits`, `--concurrency`,
 `--loop-fixer-timeout`, and from v59 `--loop-seed <n>` (D8; seeds the rotation
