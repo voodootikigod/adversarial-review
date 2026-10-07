@@ -1,4 +1,12 @@
 {
+  "_adlcArchive": {
+    "archivedAt": "2026-10-07T15:21:53.399Z",
+    "reason": "completed",
+    "sourceRevision": null,
+    "sourceStoreHash": "536e93a36556c7b54311763a84fcc7c8630e511831142b7b2e5f21ed8be0e420",
+    "ticketHash": "eeea6a4171a42288c943f384b2077a3f2030b04c22ba8e6c46b728286580af4a",
+    "version": 1
+  },
   "body": "Implement Linux process confinement for loop fixer execution using bubblewrap (bwrap) / Landlock LSM. Restrict filesystem write access strictly to workspace target directory, blocking home, credentials, parent dirs, and other repos. Allow loop execution on Linux without --loop-unsafe when bwrap/landlock is active.",
   "category": "feature",
   "completed": true,
