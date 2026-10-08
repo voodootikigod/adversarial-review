@@ -247,8 +247,10 @@ export function gitState(dir) {
 
 // ─── hermetic env ────────────────────────────────────────────────────────────
 
-// Fresh per-run roots + the env built from scratch. `gitPinning: false` is a
-// TEST-ONLY seam for the AP7 negative control.
+// Fresh per-run roots + the env built from scratch. `gitPinning: false` is an
+// UNUSED seam: AP7's original negative control (unpinned git makes captures
+// differ) does not hold on 2.11.1, and the sweep's negative control now disables
+// the normalization rule each pair needs instead. Rows must not pass it.
 export function prepareRun(ctx, { env = {}, configPath = null, gitPinning = true } = {}) {
   const home = ctx.track(mkTemp("parity-home-"));
   const xdg = ctx.track(mkTemp("parity-xdg-"));
