@@ -284,3 +284,70 @@ describe("AC5 mock CLI probes and queue", { skip: SKIP }, () => {
     assert.ok(!isReviewPrompt("hello") && !isVerifyPrompt("hello"));
   });
 });
+
+// ─── HTTP stub mechanics (direct requests, no CLI) ───────────────────────────
+
+import {
+  createStub,
+  providerEnv,
+  anthropicReply,
+  openaiReply,
+  geminiReply,
+  rawReply
+} from "./helpers/http-stub.mjs";
+
+async function post(url, body) {
+  const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  return { status: res.status, text: await res.text() };
+}
+
+describe("HTTP stub", { skip: SKIP }, () => {
+  test("routes by provider prefix, records prefix-relative paths, FIFO per provider", async (t) => {
+    const stub = await createStub();
+    t.after(() => stub.close());
+    stub.enqueue("anthropic", anthropicReply({ verdict: "approve" }));
+    stub.enqueue("openai", openaiReply({ verdict: "approve" }));
+    stub.enqueue("gemini", geminiReply({ verdict: "approve" }));
+    stub.enqueue("gateway", rawReply(503, "busy"));
+    const a = await post(`${stub.base("anthropic")}/messages`, { m: 1 });
+    assert.equal(a.status, 200);
+    assert.deepEqual(JSON.parse(a.text).content[0], { type: "tool_use", id: "toolu_parity", name: "submit_review", input: { verdict: "approve" } });
+    assert.equal(JSON.parse(a.text).stop_reason, "tool_use");
+    const o = await post(`${stub.base("openai")}/chat/completions`, {});
+    assert.equal(JSON.parse(JSON.parse(o.text).choices[0].message.content).verdict, "approve");
+    const g = await post(`${stub.base("gemini")}/v1beta/models/gemini-x:generateContent`, {});
+    assert.equal(JSON.parse(JSON.parse(g.text).candidates[0].content.parts[0].text).verdict, "approve");
+    const gw = await post(`${stub.base("gateway")}/chat/completions`, {});
+    assert.deepEqual(gw, { status: 503, text: "busy" });
+    assert.deepEqual(stub.requests.map((r) => [r.provider, r.path]), [
+      ["anthropic", "/v1/messages"], ["openai", "/v1/chat/completions"],
+      ["gemini", "/v1beta/models/gemini-x:generateContent"], ["gateway", "/v1/chat/completions"]
+    ]);
+    assert.deepEqual(stub.requests[0].body, { m: 1 });
+    assert.equal(stub.requests[0].rawBody, "{\"m\":1}");
+    stub.assertNoUnexpected();
+  });
+
+  test("an empty queue and an unknown path both answer 418 and land in stub.unexpected", async (t) => {
+    const stub = await createStub();
+    t.after(() => stub.close());
+    const empty = await post(`${stub.base("anthropic")}/messages`, {});
+    assert.equal(empty.status, 418);
+    assert.equal(empty.text, "parity-stub: unexpected request");
+    const decider = await post(`http://127.0.0.1:${stub.port}/v1/systemone`, {});
+    assert.equal(decider.status, 418);
+    assert.equal(stub.unexpected.length, 2);
+    assert.equal(stub.unexpected[1].path, "/v1/systemone");
+    assert.equal(stub.unexpected[1].provider, null);
+    assert.throws(() => stub.assertNoUnexpected(), /unexpected/);
+  });
+
+  test("providerEnv points each provider at its prefix with a dummy key", async (t) => {
+    const stub = await createStub();
+    t.after(() => stub.close());
+    assert.deepEqual(providerEnv(stub, "anthropic"), { ANTHROPIC_BASE_URL: `http://127.0.0.1:${stub.port}/anthropic/v1`, ANTHROPIC_API_KEY: "dummy" });
+    assert.deepEqual(providerEnv(stub, "openai"), { OPENAI_BASE_URL: `http://127.0.0.1:${stub.port}/openai/v1`, OPENAI_API_KEY: "dummy" });
+    assert.deepEqual(providerEnv(stub, "gemini"), { GEMINI_BASE_URL: `http://127.0.0.1:${stub.port}/gemini`, GEMINI_API_KEY: "dummy" });
+    assert.deepEqual(providerEnv(stub, "gateway"), { AI_GATEWAY_BASE_URL: `http://127.0.0.1:${stub.port}/gateway/v1`, AI_GATEWAY_API_KEY: "dummy" });
+  });
+});
