@@ -28,6 +28,7 @@ import { currentRow, countAssertion, ROWS_DIR, PARITY_DIR } from "./rows.mjs";
 import { LANDED_DELTAS } from "./deltas.mjs";
 import { writeMockCli, readMockRecords, readMockProbes, listMocks, hostTool, fifoPath } from "./mock-cli.mjs";
 import { createStub } from "./http-stub.mjs";
+import { snapshotRoots } from "./leak.mjs";
 
 export * from "./mock-cli.mjs";
 export * from "./http-stub.mjs";
@@ -398,6 +399,7 @@ export async function runCli(args, opts = {}) {
   const stubs = [...new Set([...ctx.stubs, ...extraStubs])];
   const prep = prepareRun(ctx, { env, configPath, gitPinning });
   const before = snapshotCounts(ctx, stubs);
+  const leakSnapshot = snapshotRoots({ ...prep.roots, repo: cwd });
   const argv = [...args];
 
   const child = spawn(process.execPath, [...nodeArgs, cliEntry, ...argv], {
@@ -492,6 +494,9 @@ export async function runCli(args, opts = {}) {
     capturePath: undefined,
     netLogPath: netLog ?? undefined
   };
+
+  // Non-enumerable: used by assertNoTokenLeak, never captured.
+  Object.defineProperties(run, { ctx: { value: ctx }, leakSnapshot: { value: leakSnapshot } });
 
   if (netLog) assertRecorderConsistent(run);
 

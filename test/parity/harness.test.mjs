@@ -1279,3 +1279,141 @@ describe("nondeterminism sweep", { skip: SKIP }, () => {
     assert.equal(compare(base, head).status, 1, "a bare ISO timestamp in a file is not normalized");
   });
 });
+
+// ─── AP10 leak sweep and mutant-ran marker (Amendment A1) ────────────────────
+
+import { assertNoTokenLeak, assertMutantRan, tokenForms } from "./helpers/leak.mjs";
+
+describe("AP10 assertNoTokenLeak / assertMutantRan", { skip: SKIP }, () => {
+  // A quote and a space make the raw, JSON-escaped and URL-encoded forms distinct.
+  const TOKEN = 'PARITY"LEAK TOKEN-Zq9';
+
+  async function cleanRun(t, { args = ["--provider", "claude", "--json"], files } = {}) {
+    const ctx = makeContext(t);
+    const repo = makeRepo({ ctx, ...(files ? { files } : {}) });
+    ctx.mock("claude", { responses: [{ stdout: J(APPROVE) }, { stdout: J(APPROVE) }], recordEnv: ["LEAK_PROBE"] });
+    const run = await runCli(args, { ctx, cwd: repo.dir });
+    assertExit(run, 0);
+    return { ctx, repo, run };
+  }
+
+  test("token forms: raw, JSON-escaped, three base64 alignments, URL-encoded", () => {
+    const forms = tokenForms('a"b/c d');
+    assert.equal(forms.raw, 'a"b/c d');
+    assert.equal(forms["json-escaped"], 'a\\"b/c d');
+    assert.equal(forms["url-encoded"], "a%22b%2Fc%20d");
+    for (const k of [0, 1, 2]) {
+      const encoded = Buffer.concat([Buffer.alloc(k, 0x41), Buffer.from('a"b/c d')]).toString("base64");
+      assert.ok(encoded.includes(forms[`base64-${k}`]), `alignment ${k}`);
+      assert.ok(forms[`base64-${k}`].length >= 6);
+    }
+  });
+
+  test("a clean run passes", async (t) => {
+    const { run } = await cleanRun(t);
+    assertNoTokenLeak(run, TOKEN);
+  });
+
+  // A copy of a run with some fields replaced, keeping its non-enumerable ctx and snapshot.
+  const withRun = (run, over) => Object.defineProperties({ ...run, ...over }, {
+    ctx: { value: run.ctx }, leakSnapshot: { value: run.leakSnapshot }
+  });
+  const FORMS = ["raw", "json-escaped", "base64-0", "base64-1", "base64-2", "url-encoded"];
+  const embed = (form) => {
+    if (form === "raw") return `x ${TOKEN} y`;
+    if (form === "json-escaped") return JSON.stringify(`q${TOKEN}`).slice(1, -1);
+    if (form === "url-encoded") return encodeURIComponent(`${TOKEN}/`);
+    const k = Number(form.slice(-1));
+    return Buffer.concat([Buffer.alloc(k, 0x7a), Buffer.from(TOKEN)]).toString("base64");
+  };
+  const surfaces = {
+    argv: (run, s) => ({ ...run, args: [...run.args, s] }),
+    stdout: (run, s) => ({ ...run, stdout: run.stdout + s }),
+    stderr: (run, s) => ({ ...run, stderr: run.stderr + s }),
+    "prompts.stdin": (run, s) => ({ ...run, prompts: [{ ...run.prompts[0], stdin: run.prompts[0].stdin + s }] }),
+    "prompts.argv": (run, s) => ({ ...run, prompts: [{ ...run.prompts[0], argv: [...run.prompts[0].argv, s] }] }),
+    "requests.body": (run, s) => ({ ...run, requests: [{ provider: "anthropic", path: "/v1/messages", body: s }] })
+  };
+  for (const [surface, inject] of Object.entries(surfaces)) {
+    test(`negative controls: ${surface} in every form`, async (t) => {
+      const { run } = await cleanRun(t);
+      for (const form of FORMS) {
+        const leaky = withRun(run, inject(run, embed(form)));
+        assert.throws(() => assertNoTokenLeak(leaky, TOKEN), new RegExp(`surface=${surface.replace(".", "\\.")}\\b.*form=${form}\\b`), `${surface}/${form}`);
+      }
+    });
+  }
+
+  test("negative controls: recorded child env, ledger bytes and new files under each swept root", async (t) => {
+    for (const form of FORMS) {
+      // env: the mock records LEAK_PROBE from the child env.
+      {
+        const ctx = makeContext(t);
+        const repo = makeRepo({ ctx });
+        ctx.mock("claude", { responses: [{ stdout: J(APPROVE) }], recordEnv: ["LEAK_PROBE"] });
+        const run = await runCli(["--provider", "claude", "--json"], { ctx, cwd: repo.dir, env: { LEAK_PROBE: embed(form) } });
+        assert.throws(() => assertNoTokenLeak(run, TOKEN), new RegExp(`surface=env\\.claude\\.LEAK_PROBE\\b.*form=${form}\\b`));
+      }
+      // ledger bytes, outside every swept root.
+      {
+        const ctx = makeContext(t);
+        const repo = makeRepo({ ctx });
+        const ledger = path.join(ctx.dir, "ledger.jsonl");
+        ctx.mock("claude", { responses: [{ stdout: J(APPROVE) }] });
+        const run = await runCli(["--provider", "claude", "--json", `--findings-ledger=${ledger}`], { ctx, cwd: repo.dir });
+        fs.writeFileSync(ledger, embed(form));
+        assert.throws(() => assertNoTokenLeak(run, TOKEN), new RegExp(`surface=ledger\\b.*form=${form}\\b`));
+      }
+    }
+    for (const root of ["home", "repo", "mocks", "tmp"]) {
+      const { run } = await cleanRun(t);
+      fs.writeFileSync(path.join(run.roots[root], "leaked.txt"), embed("base64-1"));
+      assert.throws(() => assertNoTokenLeak(run, TOKEN), new RegExp(`surface=file:${root}/leaked\\.txt\\b.*form=base64-1\\b`));
+    }
+  });
+
+  test("planted inputs and .git are excluded from the file sweep", async (t) => {
+    const { run, repo } = await cleanRun(t, { files: { "code.js": "export const x = 1;\n", "planted.txt": `${TOKEN}\n` } });
+    repo.git("commit", "-q", "--allow-empty", "-m", TOKEN);
+    assertNoTokenLeak(run, TOKEN);
+  });
+
+  test("allowStubBody, allowStdout and allowFixerStdin narrow exactly one surface", async (t) => {
+    const { run } = await cleanRun(t);
+    const body = withRun(run, { requests: [{ provider: "anthropic", path: "/v1/messages", body: TOKEN }] });
+    assertNoTokenLeak(body, TOKEN, { allowStubBody: true });
+    assert.throws(() => assertNoTokenLeak(body, TOKEN), /surface=requests\.body/);
+    const both = withRun(body, { stderr: TOKEN });
+    assert.throws(() => assertNoTokenLeak(both, TOKEN, { allowStubBody: true }), /surface=stderr/);
+    const out = withRun(run, { stdout: TOKEN });
+    assertNoTokenLeak(out, TOKEN, { allowStdout: true });
+    const fix = withRun(run, { prompts: [{ mock: "codex", n: 1, argv: ["exec", "-"], stdin: `You are a code fixer. ${TOKEN}` }] });
+    assertNoTokenLeak(fix, TOKEN, { allowFixerStdin: true });
+    assert.throws(() => assertNoTokenLeak(fix, TOKEN), /surface=prompts\.stdin/);
+  });
+
+  test("assertMutantRan requires the PARITY-MUTANT-RAN marker on stderr", () => {
+    assertMutantRan({ stderr: "x\nPARITY-MUTANT-RAN:NEG-1\n" }, "NEG-1");
+    assert.throws(() => assertMutantRan({ stderr: "x\n" }, "NEG-1"), /PARITY-MUTANT-RAN:NEG-1/);
+    assert.throws(() => assertMutantRan({ stderr: "PARITY-MUTANT-RAN:NEG-10\n" }, "NEG-1"), /PARITY-MUTANT-RAN:NEG-1/);
+  });
+});
+
+describe("AP11 harness assert helpers feed the counter", { skip: SKIP }, () => {
+  test("each assert helper call counts once inside a row context", async () => {
+    const fake = { code: 0, stderr: "hello", args: [], prompts: [], requests: [], unexpected: [] };
+    const state = await executeRow({ id: "COUNT", entry: { roadmapRef: "Step 0", futureDeltas: [], minAssertions: 4 }, landedDeltas: [] }, async () => {
+      assertExit(fake, 0);
+      assertStderrIncludes(fake, "hell");
+      assertStderrExcludes(fake, "bye");
+      assertNoProviderCalls(fake);
+    });
+    assert.equal(state.assertions, 4);
+    await assert.rejects(executeRow({ id: "COUNT5", entry: { roadmapRef: "Step 0", futureDeltas: [], minAssertions: 5 }, landedDeltas: [] }, async () => {
+      assertExit(fake, 0);
+      assertStderrIncludes(fake, "hell");
+      assertStderrExcludes(fake, "bye");
+      assertNoProviderCalls(fake);
+    }), /row COUNT5 made 4 assertions, below its floor 5/);
+  });
+});
