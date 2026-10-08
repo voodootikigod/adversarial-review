@@ -21,7 +21,7 @@ import { DELTAS, WITHDRAWN_DELTAS, LANDED_DELTAS } from "./deltas.mjs";
 export const PARITY_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const ROWS_DIR = path.join(PARITY_DIR, "rows");
 
-const SKIP = process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : true;
+const SKIP = process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : false;
 
 const rowStorage = new AsyncLocalStorage();
 
