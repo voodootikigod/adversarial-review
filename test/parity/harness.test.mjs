@@ -131,6 +131,8 @@ describe("AC14 tag validation", { skip: SKIP }, () => {
   test("rejected: duplicate [35, 35]", () => {
     const v = checkManifests({ manifests: row([35, 35]) });
     assert.equal(v.length, 1);
+    assert.equal(v[0].file, "x.json");
+    assert.equal(v[0].rowId, "R1");
     assert.equal(v[0].value, 35);
     assert.match(v[0].reason, /duplicate/);
   });
@@ -138,6 +140,9 @@ describe("AC14 tag validation", { skip: SKIP }, () => {
   test("rejected: 35 when injected LANDED_DELTAS contains 35", () => {
     const v = checkManifests({ manifests: row([35]), landedDeltas: [35] });
     assert.equal(v.length, 1);
+    assert.equal(v[0].file, "x.json");
+    assert.equal(v[0].rowId, "R1");
+    assert.equal(v[0].value, 35);
     assert.match(v[0].reason, /landed/);
     assert.deepEqual(checkManifests({ manifests: row([35]), landedDeltas: [] }), []);
   });
@@ -1215,9 +1220,20 @@ describe("AP8 FIFO handshake", { skip: SKIP }, () => {
   test("guard: no parity file skips on CI or skips a row; an injected CI skip is caught", () => {
     assert.deepEqual(scanParitySkips(), []);
     const ci = "process" + ".env.CI";
-    assert.equal(findSkipViolations(`row("X", "t", fn, { skip: ${ci} });\n`, "injected.test.mjs").length, 1);
+    const rowCall = "ro" + "w(";
+    assert.ok(findSkipViolations(`${rowCall}"X", "t", fn, { skip: ${ci} });\n`, "injected.test.mjs").length >= 1);
     assert.equal(findSkipViolations(`test${"."}skip("x", () => {});\n`, "injected.test.mjs").length, 1);
     assert.equal(findSkipViolations(`describe("x", { skip: SKIP }, () => {});\n`, "ok.test.mjs").length, 0);
+    // F2: a CI reference split from its skip option, and a skip/todo option in a row call.
+    assert.ok(findSkipViolations(`const ci = ${ci};\ndescribe("x", { skip: ci }, () => {});\n`, "split.test.mjs").length >= 1);
+    assert.ok(findSkipViolations(`${rowCall}"X", "t", fn, {\n  skip: true\n});\n`, "row.test.mjs").length >= 1);
+    assert.ok(findSkipViolations(`${rowCall}"X", "t", fn, { todo: "later" });\n`, "row.test.mjs").length >= 1);
+  });
+
+  test("row() refuses skip and todo options at registration", () => {
+    for (const opts of [{ skip: true }, { skip: false }, { todo: "x" }]) {
+      assert.throws(() => dupRows.row("REG-ONCE", "x", async () => {}, opts), /may not pass skip or todo/);
+    }
   });
 });
 

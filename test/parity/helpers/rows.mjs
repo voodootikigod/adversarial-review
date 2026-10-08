@@ -69,6 +69,10 @@ export function defineRows(stem, options = {}) {
   });
 
   function row(id, title, fn, opts = {}) {
+    // AP8: only the file-level win32 SKIP may skip a row; a row never opts out.
+    if (opts && ("skip" in opts || "todo" in opts)) {
+      throw new Error(`row ${id} may not pass skip or todo options (AP8)`);
+    }
     if (!Object.prototype.hasOwnProperty.call(manifest, id)) {
       throw new Error(`row ${id} is not in rows/${stem}.json`);
     }
@@ -77,7 +81,7 @@ export function defineRows(stem, options = {}) {
     }
     registered.add(id);
     const entry = manifest[id];
-    return test(`[row:${id}] ${title}`, { skip: SKIP, ...opts }, (t) =>
+    return test(`[row:${id}] ${title}`, { ...opts, skip: SKIP }, (t) =>
       executeRow({ id, entry, landedDeltas }, fn, t)
     );
   }
@@ -175,6 +179,27 @@ const DOT_SKIP = new RegExp("\\." + "skip\\s*\\(");
 // CI environment variable, or calls a dot-skip on a test, suite or row.
 export function findSkipViolations(text, file) {
   const out = [];
+  // A CI reference anywhere in the file plus any skip option other than the
+  // file-level SKIP constant (catches `const ci = <CI>;` ... `{ skip: ci }`).
+  if (CI_REF.test(text)) {
+    const re = /\bskip\s*:\s*([^,}\n]*)/g;
+    let m;
+    while ((m = re.exec(text))) {
+      if (m[1].trim() !== "SKIP") out.push(`${file}: skip option ${JSON.stringify(m[1].trim())} in a file that references the CI environment`);
+    }
+  }
+  // Any skip/todo option inside a row( ... ) call, however it is spread over lines.
+  const rowRe = new RegExp("\\b" + "row\\s*\\(", "g");
+  let r;
+  while ((r = rowRe.exec(text))) {
+    let depth = 0;
+    let end = r.index;
+    for (let i = text.indexOf("(", r.index); i < text.length; i++) {
+      if (text[i] === "(") depth++;
+      else if (text[i] === ")" && --depth === 0) { end = i; break; }
+    }
+    if (/\b(skip|todo)\s*:/.test(text.slice(r.index, end + 1))) out.push(`${file}: skip/todo option in a row call`);
+  }
   text.split("\n").forEach((line, i) => {
     if (CI_REF.test(line) && /skip/i.test(line)) out.push(`${file}:${i + 1}: skip conditioned on the CI environment`);
     if (DOT_SKIP.test(line)) out.push(`${file}:${i + 1}: dot-skip call on a test or row`);
