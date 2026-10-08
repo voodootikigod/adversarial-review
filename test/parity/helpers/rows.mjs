@@ -164,3 +164,34 @@ export function loadRepoManifests() {
     .sort();
   return { manifests, testStems };
 }
+
+// ─── AP8 guard: no CI-conditional skips, no skipped rows ─────────────────────
+// The patterns are assembled from fragments so this file does not trip its own scan.
+
+const CI_REF = new RegExp("process\\.env\\." + "CI\\b");
+const DOT_SKIP = new RegExp("\\." + "skip\\s*\\(");
+
+// Returns ["<file>:<line>: <reason>"] for each line that conditions a skip on the
+// CI environment variable, or calls a dot-skip on a test, suite or row.
+export function findSkipViolations(text, file) {
+  const out = [];
+  text.split("\n").forEach((line, i) => {
+    if (CI_REF.test(line) && /skip/i.test(line)) out.push(`${file}:${i + 1}: skip conditioned on the CI environment`);
+    if (DOT_SKIP.test(line)) out.push(`${file}:${i + 1}: dot-skip call on a test or row`);
+  });
+  return out;
+}
+
+// Scans every .mjs/.cjs/.js file under test/parity.
+export function scanParitySkips(dir = PARITY_DIR) {
+  const out = [];
+  const walk = (d) => {
+    for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, ent.name);
+      if (ent.isDirectory()) walk(p);
+      else if (/\.(mjs|cjs|js)$/.test(ent.name)) out.push(...findSkipViolations(fs.readFileSync(p, "utf8"), path.relative(dir, p)));
+    }
+  };
+  walk(dir);
+  return out;
+}

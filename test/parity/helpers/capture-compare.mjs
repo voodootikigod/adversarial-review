@@ -45,6 +45,12 @@
 //       FINDING_<i>, which n4's [A-Z_]+ label class does not match; the fixer's
 //       stdin is a compared `prompts` field, so without n7 every loop row that
 //       runs a fixer would differ run to run.
+//   n8  (AP7 sweep rule) the findings-ledger timestamp, in gitState string
+//       leaves only: /"ts":"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"/g -> "ts":"<ts>".
+//       toLedgerEntries (src/findings-ledger.js) stamps each entry with
+//       new Date().toISOString(), and the default --findings-ledger path
+//       (.adlc/findings.jsonl) is inside the reviewed repo, so it lands in
+//       gitState.files.
 // Nothing else is normalized. `--no-normalize n3,n4` (TEST-ONLY) disables the
 // named rules, which is possible because captures keep raw values.
 //
@@ -78,7 +84,7 @@ export const USAGE =
   "       capture-compare --print-normalized <capture.json>";
 
 export const COMPARED_FIELDS = ["argv", "code", "stdout", "stderr", "gitState", "calls", "prompts", "requests"];
-const RULES = ["n1", "n2", "n3", "n4", "n5", "n6", "n7"];
+const RULES = ["n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8"];
 
 class UsageError extends Error {}
 class FatalError extends Error {}
@@ -136,6 +142,9 @@ export function normalizeCapture(cap, disabled = new Set()) {
     if (k in cap) out[k] = mapStrings(cap[k], f);
   }
   if (typeof out.stderr === "string" && !disabled.has("n6")) out.stderr = applyN6(out.stderr);
+  if (out.gitState && !disabled.has("n8")) {
+    out.gitState = mapStrings(out.gitState, (v) => v.replace(/"ts":"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"/g, '"ts":"<ts>"'));
+  }
   return out;
 }
 

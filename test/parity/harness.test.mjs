@@ -1152,3 +1152,130 @@ describe("AC18 / AC19 / AP6 network recorder", { skip: SKIP }, () => {
     assert.throws(() => assertOnlyStubUrls(run, other), /network recorder missed traffic/);
   });
 });
+
+// ─── AP8 FIFO handshakes and the no-CI-skip guard ────────────────────────────
+
+import { findSkipViolations, scanParitySkips } from "./helpers/rows.mjs";
+
+async function sigintLoopRun(t, captureDir = null) {
+  const ctx = makeContext(t);
+  const repo = makeRepo({ ctx, files: LOOP_FILES });
+  const stub = await ctx.stub();
+  stub.enqueue("anthropic", anthropicReply(FLAG));
+  ctx.mock("codex", { responses: [{ waitFifo: "fix" }] });
+  const run = await runCli(LOOP_ARGV, {
+    ctx,
+    cwd: repo.dir,
+    env: providerEnv(stub, "anthropic"),
+    signalAfter: { waitForFile: `${ctx.fifo("fix")}.marker`, signal: "SIGINT", fifo: "fix" },
+    ...(captureDir ? { capture: { dir: captureDir, rowId: "SWEEP-SIGINT-LOOP" } } : {})
+  });
+  return { run, ctx, repo };
+}
+
+describe("AP8 FIFO handshake", { skip: SKIP }, () => {
+  test("a SIGINT loop through the FIFO handshake has identical outcomes 20 times", async (t) => {
+    const outcomes = [];
+    for (let i = 0; i < 20; i++) {
+      const { run, repo, ctx } = await sigintLoopRun(t);
+      const state = gitState(repo.dir);
+      outcomes.push(J({
+        code: run.code,
+        signal: run.signal,
+        events: run.events.map((e) => e.type),
+        interrupted: run.stderr.includes("Interrupted."),
+        checkpoint: run.stderr.includes("Stash checkpoint: stash@{0}"),
+        stash: state.stashList.replace(/adversarial-review-loop-\d+/, "<ts>"),
+        status: state.statusPorcelain,
+        codexCalls: ctx.records("codex").length
+      }));
+      await ctx.cleanup();
+    }
+    assert.equal(new Set(outcomes).size, 1, outcomes.join("\n"));
+    assert.deepEqual(JSON.parse(outcomes[0]), {
+      code: 1, signal: null, events: ["loop_start", "review", "stash_created"], interrupted: true, checkpoint: true,
+      stash: "stash@{0} On main: <ts>-iter0\n", status: " M code.js\n", codexCalls: 1
+    });
+  });
+
+  test("signalAfter refuses a context with a sleeping mock response", async (t) => {
+    const ctx = makeContext(t);
+    const repo = makeRepo({ ctx });
+    ctx.mock("claude", { responses: [{ sleep: 1, stdout: J(APPROVE) }] });
+    await assert.rejects(runCli(["--provider", "claude"], { ctx, cwd: repo.dir, signalAfter: { waitForFile: "/nonexistent", signal: "SIGINT" } }),
+      /signalAfter may not be combined with a sleeping mock/);
+  });
+
+  test("guard: no parity file skips on CI or skips a row; an injected CI skip is caught", () => {
+    assert.deepEqual(scanParitySkips(), []);
+    const ci = "process" + ".env.CI";
+    assert.equal(findSkipViolations(`row("X", "t", fn, { skip: ${ci} });\n`, "injected.test.mjs").length, 1);
+    assert.equal(findSkipViolations(`test${"."}skip("x", () => {});\n`, "injected.test.mjs").length, 1);
+    assert.equal(findSkipViolations(`describe("x", { skip: SKIP }, () => {});\n`, "ok.test.mjs").length, 0);
+  });
+});
+
+// ─── AP7 nondeterminism sweep ────────────────────────────────────────────────
+
+describe("nondeterminism sweep", { skip: SKIP }, () => {
+  const shapes = {
+    "SWEEP-AUTO-DETECT": async (t, dir) => {
+      const ctx = makeContext(t);
+      const repo = makeRepo({ ctx });
+      ctx.mock("claude", { responses: [{ stdout: J(APPROVE) }] });
+      const run = await runCli(["--json"], { ctx, cwd: repo.dir, capture: { dir, rowId: "SWEEP-AUTO-DETECT" } });
+      assertExit(run, 0);
+      assert.ok(JSON.parse(fs.readFileSync(run.configPath, "utf8")), "auto-detection wrote the config cache");
+    },
+    "SWEEP-LEDGER": async (t, dir) => {
+      const ctx = makeContext(t);
+      const repo = makeRepo({ ctx });
+      ctx.mock("claude", { responses: [{ stdout: J(FLAG) }] });
+      const run = await runCli(["--provider", "claude", "--json", "--findings-ledger"], { ctx, cwd: repo.dir, capture: { dir, rowId: "SWEEP-LEDGER" } });
+      assertExit(run, 2);
+      assert.match(fs.readFileSync(path.join(repo.dir, ".adlc", "findings.jsonl"), "utf8"), /"ts":"\d{4}-\d\d-\d\dT/);
+    },
+    "SWEEP-CLAUDE-RETRY": async (t, dir) => {
+      const ctx = makeContext(t);
+      const repo = makeRepo({ ctx });
+      ctx.mock("claude", { responses: [{ stderr: "API Error: 500 Internal Server Error\n", exit: 1 }, { stdout: J(APPROVE) }] });
+      const run = await runCli(["--provider", "claude", "--json"], { ctx, cwd: repo.dir, capture: { dir, rowId: "SWEEP-CLAUDE-RETRY" } });
+      assertExit(run, 0);
+      assertCallCount(run, "claude", 2);
+    },
+    "SWEEP-SIGINT-LOOP": async (t, dir) => {
+      const { run } = await sigintLoopRun(t, dir);
+      assertExit(run, 1);
+    },
+    "SWEEP-PROMPT-ONLY": async (t, dir) => {
+      const ctx = makeContext(t);
+      const repo = makeRepo({ ctx });
+      const run = await runCli(["--prompt-only"], { ctx, cwd: repo.dir, capture: { dir, rowId: "SWEEP-PROMPT-ONLY" } });
+      assertExit(run, 0);
+    }
+  };
+  for (const [name, shape] of Object.entries(shapes)) {
+    test(`${name}: two independent captures compare equal`, async (t) => {
+      const holder = makeContext(t);
+      const [a, b] = [captureTree(holder), captureTree(holder)];
+      await shape(t, a);
+      await shape(t, b);
+      const r = compare(a, b);
+      assert.equal(r.status, 0, r.out);
+    });
+  }
+
+  test("n8: the findings-ledger ts in gitState is normalized; elsewhere, or with n8 disabled, it differs", (t) => {
+    const ledger = (ts) => `{"ts":"${ts}","tool":"adversarial-review","file":"code.js"}\n`;
+    const gs = (ts) => ({ ...synthCapture("A").gitState, files: { "code.js": "x\n", ".adlc/findings.jsonl": ledger(ts) } });
+    const T1 = "2026-10-08T01:18:28.553Z";
+    const T2 = "2026-10-08T01:18:28.660Z";
+    let [base, head] = pair(t, { gitState: gs(T1) }, { gitState: gs(T2) });
+    assert.equal(compare(base, head).status, 0);
+    assert.equal(compare(base, head, "--no-normalize", "n8").status, 1);
+    [base, head] = pair(t, { stdout: ledger(T1) }, { stdout: ledger(T2) });
+    assert.equal(compare(base, head).status, 1, "n8 applies to gitState only");
+    [base, head] = pair(t, { gitState: { ...gs(T1), files: { "code.js": `at ${T1}\n` } } }, { gitState: { ...gs(T1), files: { "code.js": `at ${T2}\n` } } });
+    assert.equal(compare(base, head).status, 1, "a bare ISO timestamp in a file is not normalized");
+  });
+});
