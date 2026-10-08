@@ -2,7 +2,14 @@
   "body": "CONTEXT\nA Cursor/Grok project review raised 8 reliability findings. On 2026-10-07 a code check confirmed all 8 fixes are in the code on main (2.11.1). Two of them lack the test their acceptance criteria required. This ticket adds only those tests and changes no production code.\n\nGOAL\nRegression tests for two shipped behaviors.\n\nACCEPTANCE CRITERIA\nAC1 CLI timeout fails fast (finding #5). A #!/bin/sh mock CLI on a curated PATH sleeps 30 s. Running the review through that provider with --timeout 1 exits 1 within 10 s (wall-clock assertion), stderr contains the timeoutExceededMessage text (src/llm.js), and the mock was invoked exactly once. Verified in test/llm.test.js. Negative control: the same test with a mock that sleeps 0 s and prints a valid result passes without the timeout message.\nAC2 429 Retry-After is honored (finding #8). A fake fetch (or local HTTP stub) answers the first API request with 429 and Retry-After: 2, then 200 with a valid result. The second request is sent no earlier than 1.9 s after the first (recorded timestamps), and the review succeeds. Verified in test/llm.test.js. Negative control: Retry-After: 0 retries without the wait.\nAC3 No production file changes (`git diff --exit-code HEAD -- src bin`).\n\nVERIFICATION COMMAND\nnode --test test/llm.test.js",
   "category": "bug",
   "duration": 3,
-  "edges": [],
+  "edges": [
+    {
+      "to": "T49"
+    },
+    {
+      "to": "T18"
+    }
+  ],
   "id": "T-01KXHVRMKGPH3BPN6CWT4H3XTK",
   "rails": [
     "schema.json",
