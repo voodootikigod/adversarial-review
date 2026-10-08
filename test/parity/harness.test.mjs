@@ -1217,21 +1217,37 @@ describe("AP8 FIFO handshake", { skip: SKIP }, () => {
       /signalAfter may not be combined with a sleeping mock/);
   });
 
-  test("guard: no parity file skips on CI or skips a row; an injected CI skip is caught", () => {
+  test("guard: the only permitted skip form is { skip: SKIP }; every bypass shape is caught", () => {
     assert.deepEqual(scanParitySkips(), []);
-    const ci = "process" + ".env.CI";
-    const rowCall = "ro" + "w(";
-    assert.ok(findSkipViolations(`${rowCall}"X", "t", fn, { skip: ${ci} });\n`, "injected.test.mjs").length >= 1);
-    assert.equal(findSkipViolations(`test${"."}skip("x", () => {});\n`, "injected.test.mjs").length, 1);
-    assert.equal(findSkipViolations(`describe("x", { skip: SKIP }, () => {});\n`, "ok.test.mjs").length, 0);
-    // F2: a CI reference split from its skip option, and a skip/todo option in a row call.
-    assert.ok(findSkipViolations(`const ci = ${ci};\ndescribe("x", { skip: ci }, () => {});\n`, "split.test.mjs").length >= 1);
-    assert.ok(findSkipViolations(`${rowCall}"X", "t", fn, {\n  skip: true\n});\n`, "row.test.mjs").length >= 1);
-    assert.ok(findSkipViolations(`${rowCall}"X", "t", fn, { todo: "later" });\n`, "row.test.mjs").length >= 1);
+    // Placeholders keep this file's own source free of the shapes it injects.
+    const inject = (src) => src.replaceAll("SK1P", "skip").replaceAll("T0D0", "todo");
+    const bad = {
+      "CI via member access": 'describe("x", { SK1P: process.env.CI }, () => {});',
+      "CI via bracket access": 'describe("x", { SK1P: process.env["CI"] }, () => {});',
+      "CI via destructuring": 'const { CI } = process.env;\ndescribe("x", { SK1P: CI }, () => {});',
+      "aliased env.CI": 'const env = process.env;\nconst ci = env.CI;\ntest("x", { SK1P: ci }, () => {});',
+      "computed bracket call": 'test("x", (t) => { t["SK1P"](); });',
+      "dot member call": 'test.SK1P("x", () => {});',
+      "dot member uncalled": 'const s = test.SK1P;',
+      "dot todo": 'describe.T0D0("x", () => {});',
+      "bracket todo": 'it["T0D0"]("x");',
+      "quoted key": 'test("x", { "SK1P": true }, () => {});',
+      "computed key": 'test("x", { ["SK1P"]: true }, () => {});',
+      "shorthand key": 'const SK1P = true;\ntest("x", { SK1P }, () => {});',
+      "describe skip true": 'describe("x", { SK1P: true }, () => {});',
+      "test todo true": 'test("x", { T0D0: true }, () => {});',
+      "row skip in a file without CI": 'ro' + 'w("X", "t", fn, {\n  SK1P: true\n});',
+      "row todo": 'ro' + 'w("X", "t", fn, { T0D0: "later" });'
+    };
+    for (const [name, src] of Object.entries(bad)) {
+      assert.ok(findSkipViolations(inject(src) + "\n", "injected.test.mjs").length >= 1, `not caught: ${name}`);
+    }
+    assert.deepEqual(findSkipViolations(inject('describe("x", { SK1P: SKIP }, () => {});\n'), "ok.test.mjs"), []);
   });
 
   test("row() refuses skip and todo options at registration", () => {
-    for (const opts of [{ skip: true }, { skip: false }, { todo: "x" }]) {
+    const [SKIP_KEY, TODO_KEY] = ["sk" + "ip", "to" + "do"];
+    for (const opts of [{ [SKIP_KEY]: true }, { [SKIP_KEY]: false }, { [TODO_KEY]: "x" }]) {
       assert.throws(() => dupRows.row("REG-ONCE", "x", async () => {}, opts), /may not pass skip or todo/);
     }
   });

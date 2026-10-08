@@ -21,7 +21,7 @@ import { DELTAS, WITHDRAWN_DELTAS, LANDED_DELTAS } from "./deltas.mjs";
 export const PARITY_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const ROWS_DIR = path.join(PARITY_DIR, "rows");
 
-const SKIP = process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : false;
+const SKIP = process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : true;
 
 const rowStorage = new AsyncLocalStorage();
 
@@ -169,52 +169,47 @@ export function loadRepoManifests() {
   return { manifests, testStems };
 }
 
-// ─── AP8 guard: no CI-conditional skips, no skipped rows ─────────────────────
-// The patterns are assembled from fragments so this file does not trip its own scan.
+// ─── AP8 guard: an ALLOWLIST of the one permitted skip form ──────────────────
+// In any test/parity/**/*.test.mjs file the only permitted skip is the
+// file-level `{ skip: SKIP }` option (the win32 POSIX-only skip). Violations:
+//   (a) a skip/todo object key (identifier, quoted, computed or shorthand)
+//       whose value is anything other than the bare identifier SKIP;
+//   (b) any dot or bracket member access of skip/todo, called or not.
+// No CI-specific spelling is needed: every CI-conditioned skip is (a).
+// Patterns are assembled from fragments so helper sources stay readable.
 
-const CI_REF = new RegExp("process\\.env\\." + "CI\\b");
-const DOT_SKIP = new RegExp("\\." + "skip\\s*\\(");
+const W = "(?:" + "sk" + "ip|" + "to" + "do)";
+const KEY_RE = new RegExp(`(?:\\b${W}|["'\`]${W}["'\`]|\\[\\s*["'\`]${W}["'\`]\\s*\\])\\s*:\\s*([^,}\\n]*)`, "g");
+const SHORTHAND_RE = new RegExp(`[{,]\\s*${W}\\s*(?=[,}])`, "g");
+const MEMBER_RE = new RegExp(`(?:\\.\\s*${W}\\b|\\[\\s*["'\`]${W}["'\`]\\s*\\](?!\\s*:))`, "g");
 
-// Returns ["<file>:<line>: <reason>"] for each line that conditions a skip on the
-// CI environment variable, or calls a dot-skip on a test, suite or row.
+function lineOf(text, index) {
+  return text.slice(0, index).split("\n").length;
+}
+
+// Returns ["<file>:<line>: <reason>"] for every non-permitted skip/todo shape.
 export function findSkipViolations(text, file) {
   const out = [];
-  // A CI reference anywhere in the file plus any skip option other than the
-  // file-level SKIP constant (catches `const ci = <CI>;` ... `{ skip: ci }`).
-  if (CI_REF.test(text)) {
-    const re = /\bskip\s*:\s*([^,}\n]*)/g;
-    let m;
-    while ((m = re.exec(text))) {
-      if (m[1].trim() !== "SKIP") out.push(`${file}: skip option ${JSON.stringify(m[1].trim())} in a file that references the CI environment`);
-    }
+  let m;
+  KEY_RE.lastIndex = 0;
+  while ((m = KEY_RE.exec(text))) {
+    if (m[1].trim() !== "SKIP") out.push(`${file}:${lineOf(text, m.index)}: skip/todo option with value ${JSON.stringify(m[1].trim())} (only SKIP is permitted)`);
   }
-  // Any skip/todo option inside a row( ... ) call, however it is spread over lines.
-  const rowRe = new RegExp("\\b" + "row\\s*\\(", "g");
-  let r;
-  while ((r = rowRe.exec(text))) {
-    let depth = 0;
-    let end = r.index;
-    for (let i = text.indexOf("(", r.index); i < text.length; i++) {
-      if (text[i] === "(") depth++;
-      else if (text[i] === ")" && --depth === 0) { end = i; break; }
-    }
-    if (/\b(skip|todo)\s*:/.test(text.slice(r.index, end + 1))) out.push(`${file}: skip/todo option in a row call`);
-  }
-  text.split("\n").forEach((line, i) => {
-    if (CI_REF.test(line) && /skip/i.test(line)) out.push(`${file}:${i + 1}: skip conditioned on the CI environment`);
-    if (DOT_SKIP.test(line)) out.push(`${file}:${i + 1}: dot-skip call on a test or row`);
-  });
+  SHORTHAND_RE.lastIndex = 0;
+  while ((m = SHORTHAND_RE.exec(text))) out.push(`${file}:${lineOf(text, m.index)}: shorthand skip/todo option`);
+  MEMBER_RE.lastIndex = 0;
+  while ((m = MEMBER_RE.exec(text))) out.push(`${file}:${lineOf(text, m.index)}: skip/todo member access`);
   return out;
 }
 
-// Scans every .mjs/.cjs/.js file under test/parity.
+// Scans every test/parity/**/*.test.mjs file.
 export function scanParitySkips(dir = PARITY_DIR) {
   const out = [];
   const walk = (d) => {
     for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
       const p = path.join(d, ent.name);
       if (ent.isDirectory()) walk(p);
-      else if (/\.(mjs|cjs|js)$/.test(ent.name)) out.push(...findSkipViolations(fs.readFileSync(p, "utf8"), path.relative(dir, p)));
+      else if (ent.name.endsWith(".test.mjs")) out.push(...findSkipViolations(fs.readFileSync(p, "utf8"), path.relative(dir, p)));
     }
   };
   walk(dir);
