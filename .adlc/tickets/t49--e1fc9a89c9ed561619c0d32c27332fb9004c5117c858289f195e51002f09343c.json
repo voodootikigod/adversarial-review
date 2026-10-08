@@ -4,7 +4,17 @@
   "duration": 2,
   "edges": [],
   "id": "T49",
-  "rails": [],
+  "rails": [
+    "bin/cli.js",
+    "src/utils.js",
+    "src/git-context.js",
+    "src/loop.js",
+    "src/review.js",
+    "schema.json",
+    "prompt-template.md",
+    "prompt-template-artifact.md",
+    "test/parity/**"
+  ],
   "scope": [
     "src/llm.js",
     "test/opencode-sandbox.test.mjs",
