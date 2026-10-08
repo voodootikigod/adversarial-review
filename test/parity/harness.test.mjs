@@ -493,6 +493,13 @@ smoke.row("SMOKE-API", "anthropic stub reviewer, working tree, --json", async (t
   assert.ok(isReviewPrompt(JSON.parse(run.requests[0].body).messages[0].content));
   stub.assertNoUnexpected();
   for (const r of runs) assert.deepEqual({ code: r.code, json: r.json }, { code: run.code, json: run.json });
+  // AC19 / AP6(a): the same run through the network recorder logs exactly the stub URL, via fetch.
+  stub.enqueue("anthropic", anthropicReply(APPROVE));
+  const rec = await runCli(["--provider", "anthropic", "--json"], withFetchRecorder({ ctx, cwd: repo.dir, env: providerEnv(stub, "anthropic") }));
+  assertExit(rec, 0);
+  assert.deepEqual(readNetLog(rec), [{ api: "fetch", url: `http://127.0.0.1:${stub.port}/anthropic/v1/messages` }]);
+  assertOnlyStubUrls(rec, stub);
+  stub.assertNoUnexpected();
 });
 
 describe("AC3/AC4 negative controls", { skip: SKIP }, () => {
@@ -1055,5 +1062,93 @@ describe("AC6 / AP9 mutants", { skip: SKIP }, () => {
     const bad = checkMutants([...all, { id: "STALE-ONE", file: "bin/cli.js", find: "no longer in the file", replace: "" }]);
     assert.equal(bad.length, 1);
     assert.match(bad[0], /STALE-ONE/);
+  });
+});
+
+// ─── AC18 / AC19 / AP6 network recorder ──────────────────────────────────────
+
+import { spawn } from "node:child_process";
+import {
+  withFetchRecorder,
+  readFetchLog,
+  readNetLog,
+  assertOnlyStubUrls,
+  FETCH_RECORDER
+} from "./helpers/harness.mjs";
+
+function spawnAsync(cmd, args, { env }) {
+  return new Promise((resolve, reject) => {
+    const c = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+    let out = ""; let err = "";
+    c.stdout.on("data", (d) => { out += d; });
+    c.stderr.on("data", (d) => { err += d; });
+    c.on("error", reject);
+    c.on("close", (code) => resolve({ code, stdout: out, stderr: err }));
+  });
+}
+
+describe("AC18 / AC19 / AP6 network recorder", { skip: SKIP }, () => {
+  test("fetch-recorder.cjs run directly with PARITY_FETCH_LOG unset exits 0 silently", () => {
+    const r = spawnSync(process.execPath, [FETCH_RECORDER], { env: { PATH: process.env.PATH }, encoding: "utf8" });
+    assert.deepEqual([r.status, r.stdout, r.stderr], [0, "", ""]);
+  });
+
+  test("a CLI run against a second stub is recorded with that port and fails assertOnlyStubUrls", async (t) => {
+    const ctx = makeContext(t);
+    const repo = makeRepo({ ctx });
+    const stub = await ctx.stub();
+    const other = await ctx.stub();
+    other.enqueue("anthropic", anthropicReply(APPROVE));
+    const run = await runCli(["--provider", "anthropic", "--json"],
+      withFetchRecorder({ ctx, cwd: repo.dir, env: providerEnv(other, "anthropic") }));
+    assertExit(run, 0);
+    assert.deepEqual(readFetchLog(run), [`http://127.0.0.1:${other.port}/anthropic/v1/messages`]);
+    assert.throws(() => assertOnlyStubUrls(run, stub), new RegExp(`127\\.0\\.0\\.1:${other.port}/anthropic/v1/messages`));
+    assertOnlyStubUrls(run, other);
+  });
+
+  test("the recorder sees a request the stub answers 418", async (t) => {
+    const ctx = makeContext(t);
+    const repo = makeRepo({ ctx });
+    const stub = await ctx.stub();
+    const run = await runCli(["--provider", "anthropic", "--json"],
+      withFetchRecorder({ ctx, cwd: repo.dir, env: providerEnv(stub, "anthropic") }));
+    assertExit(run, 1);
+    assert.equal(stub.unexpected.length, 1);
+    assert.deepEqual(readNetLog(run), [{ api: "fetch", url: `http://127.0.0.1:${stub.port}/anthropic/v1/messages` }]);
+  });
+
+  const HTTPS_SCRIPT = (port) => `
+    const http = require("http"); const https = require("https");
+    const req = https.request({ protocol: "http:", agent: new http.Agent(), host: "127.0.0.1", port: ${port},
+      path: "/anthropic/v1/messages", method: "POST", headers: { "content-type": "application/json" } },
+      (res) => { res.resume(); res.on("end", () => process.exit(0)); });
+    req.on("error", (e) => { console.error(e); process.exit(1); });
+    req.end("{}");`;
+
+  test("(b) https.request from a child script is recorded with api https.request", async (t) => {
+    const ctx = makeContext(t);
+    const other = await ctx.stub();
+    other.enqueue("anthropic", anthropicReply(APPROVE));
+    const log = path.join(ctx.dir, "net.ndjson");
+    const r = await spawnAsync(process.execPath, ["--require", FETCH_RECORDER, "-e", HTTPS_SCRIPT(other.port)],
+      { env: { PATH: process.env.PATH, PARITY_FETCH_LOG: log } });
+    assert.equal(r.code, 0, r.stderr);
+    const run = { netLogPath: log, stubTraffic: { [other.port]: other.requests.length + other.unexpected.length } };
+    assert.deepEqual(readNetLog(run), [{ api: "https.request", url: `http://127.0.0.1:${other.port}/anthropic/v1/messages` }]);
+    assertOnlyStubUrls(run, other);
+  });
+
+  test("(c) with the http hook disabled the consistency check fails instead of passing vacuously", async (t) => {
+    const ctx = makeContext(t);
+    const other = await ctx.stub();
+    other.enqueue("anthropic", anthropicReply(APPROVE));
+    const log = path.join(ctx.dir, "net.ndjson");
+    const r = await spawnAsync(process.execPath, ["--require", FETCH_RECORDER, "-e", HTTPS_SCRIPT(other.port)],
+      { env: { PATH: process.env.PATH, PARITY_FETCH_LOG: log, PARITY_NET_HOOK_DISABLE: "http" } });
+    assert.equal(r.code, 0, r.stderr);
+    const run = { netLogPath: log, stubTraffic: { [other.port]: other.requests.length + other.unexpected.length } };
+    assert.deepEqual(readNetLog(run), []);
+    assert.throws(() => assertOnlyStubUrls(run, other), /network recorder missed traffic/);
   });
 });
