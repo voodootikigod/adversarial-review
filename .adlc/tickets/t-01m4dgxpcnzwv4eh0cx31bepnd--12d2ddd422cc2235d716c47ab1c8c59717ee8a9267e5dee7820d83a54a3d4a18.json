@@ -1,0 +1,26 @@
+{
+  "body": "CONTEXT\nThe live, PATH-gated test in test/opencode-sandbox.test.mjs (around L380-425: runs a real `opencode` review in a temp repo) failed 2 of 5 runs on 2026-10-07 on the maintainer's machine during the T50 build, and passed 3 of 3 on 2026-10-08. It is the only flaky test seen in `npm test` there. The test passes when the review completes (stdout or stderr matches /Findings|verdict|APPROVE|NEEDS ATTENTION/i), skips when the run errors or stderr matches isOpencodeUnavailable (src/llm.js), and otherwise fails with 'review did not complete'. The likely cause is a real opencode outcome that matches neither branch (a transient upstream, rate-limit or model error phrased in a way isOpencodeUnavailable does not recognize). A flaky test in npm test weakens every later P5 gate.\n\nGOAL\nThe live test is deterministic: it passes on a completed review, skips with a recorded reason on a recognized environmental failure, and fails only on a genuine regression.\n\nACCEPTANCE CRITERIA\nAC1 Capture the failure first: run `for i in $(seq 1 20); do node --test test/opencode-sandbox.test.mjs; done` with opencode installed, and record every distinct failing stderr (scrubbed) in the PR description. If no failure reproduces in 20 runs, record that and proceed with AC2 using the stderr shapes visible in src/llm.js's opencode classifiers.\nAC2 Each failing shape is classified: an environmental or transient failure (rate limit, transport, model unavailable, auth) is recognized by isOpencodeUnavailable or the existing classifiers (isOpencodeRateLimited, TransportFailure, ModelUnavailable) and makes the test SKIP with that reason; a real sandbox or review regression still FAILS. Verified in test/llm.test.js with one unit case per captured shape (classifier returns true), plus a negative control (a 'review completed with Findings' text, and a sandbox-escape-like error, both return false).\nAC3 The live test's skip and fail decision is unchanged in order (completed first, then unavailable, else fail), and the skip message includes the matched classifier name.\nAC4 `for i in $(seq 1 10); do node --test test/opencode-sandbox.test.mjs || exit 1; done` passes (skips allowed) with opencode installed. Record the output in the PR.\nAC5 npm test passes.\n\nNON-GOALS\nNo change to the opencode sandbox itself (T46/T48 behavior) or to T49's attestation work.\n\nVERIFICATION COMMAND\nnode --test test/llm.test.js test/opencode-sandbox.test.mjs",
+  "category": "fix",
+  "duration": 1,
+  "edges": [
+    {
+      "to": "T49"
+    }
+  ],
+  "id": "T-01M4DGXPCNZWV4EH0CX31BEPND",
+  "rails": [
+    "bin/cli.js",
+    "src/loop.js",
+    "src/review.js",
+    "schema.json",
+    "prompt-template.md",
+    "prompt-template-artifact.md",
+    "test/parity/**"
+  ],
+  "scope": [
+    "test/opencode-sandbox.test.mjs",
+    "src/llm.js",
+    "test/llm.test.js"
+  ],
+  "title": "De-flake the live opencode sandbox test (test/opencode-sandbox.test.mjs)"
+}
