@@ -21,7 +21,10 @@ import { DELTAS, WITHDRAWN_DELTAS, LANDED_DELTAS } from "./deltas.mjs";
 export const PARITY_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const ROWS_DIR = path.join(PARITY_DIR, "rows");
 
-const SKIP = process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : false;
+// The canonical file-level skip: the ONLY value a parity test file may pass as
+// `skip`. Test files import it (from here or harness.mjs) and may never define
+// their own (findSkipViolations enforces that).
+export const SKIP = process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : false;
 
 const rowStorage = new AsyncLocalStorage();
 
@@ -199,6 +202,16 @@ export function findSkipViolations(text, file) {
   while ((m = SHORTHAND_RE.exec(text))) out.push(`${file}:${lineOf(text, m.index)}: shorthand skip/todo option`);
   MEMBER_RE.lastIndex = 0;
   while ((m = MEMBER_RE.exec(text))) out.push(`${file}:${lineOf(text, m.index)}: skip/todo member access`);
+  // SKIP must be imported, never declared or assigned in a test file.
+  for (const re of [/\b(?:const|let|var)\s+SKIP\b/g, /\bfunction\s*\*?\s*SKIP\b/g, /(?<![.\w$])SKIP\s*=(?![=>])/g]) {
+    while ((m = re.exec(text))) out.push(`${file}:${lineOf(text, m.index)}: SKIP declared or assigned (import the canonical SKIP)`);
+  }
+  const BIND_RE = /[{,]\s*(?:\.\.\.\s*)?SKIP\s*(?=[,}=])/g;
+  while ((m = BIND_RE.exec(text))) {
+    const close = text.indexOf("}", m.index + 1);
+    if (close !== -1 && /^\}\s*from\b/.test(text.slice(close))) continue; // import { SKIP } from ...
+    out.push(`${file}:${lineOf(text, m.index)}: SKIP bound by destructuring (import the canonical SKIP)`);
+  }
   return out;
 }
 

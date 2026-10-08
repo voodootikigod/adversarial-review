@@ -15,12 +15,12 @@ import {
   checkManifests,
   loadRepoManifests,
   executeRow,
-  countAssertion
+  countAssertion,
+  SKIP
 } from "./helpers/rows.mjs";
 
 const PARITY_HELPERS = path.join(path.dirname(fileURLToPath(import.meta.url)), "helpers");
 const REPO_ROOT_FOR_TEST = path.resolve(PARITY_HELPERS, "..", "..", "..");
-const SKIP = process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : false;
 
 // ─── AC13: registry content ──────────────────────────────────────────────────
 
@@ -1243,6 +1243,22 @@ describe("AP8 FIFO handshake", { skip: SKIP }, () => {
       assert.ok(findSkipViolations(inject(src) + "\n", "injected.test.mjs").length >= 1, `not caught: ${name}`);
     }
     assert.deepEqual(findSkipViolations(inject('describe("x", { SK1P: SKIP }, () => {});\n'), "ok.test.mjs"), []);
+    // A file may not define its own SKIP: it must import the canonical one.
+    const own = (src) => inject(src).replaceAll("V4R", "SKIP");
+    const redefinitions = {
+      "const from CI": 'const V4R = !!process.env.CI;\ndescribe("x", { SK1P: V4R }, () => {});',
+      "let": 'let V4R = true;',
+      "var": 'var V4R = 1;',
+      "function": 'function V4R() {}',
+      "destructuring assignment": '({ V4R } = obj);',
+      "destructuring declaration": 'const { a, V4R } = obj;',
+      "plain assignment": 'V4R = true;'
+    };
+    for (const [name, src] of Object.entries(redefinitions)) {
+      assert.ok(findSkipViolations(own(src) + "\n", "injected.test.mjs").some((v) => /SKIP/.test(v)), `not caught: ${name}`);
+    }
+    assert.deepEqual(findSkipViolations(own('import { V4R } from "./helpers/harness.mjs";\ndescribe("x", { SK1P: V4R }, () => {});\n'), "ok.test.mjs"), []);
+    assert.equal(SKIP, process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : false);
   });
 
   test("row() refuses skip and todo options at registration", () => {
