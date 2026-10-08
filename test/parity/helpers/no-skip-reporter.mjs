@@ -12,6 +12,9 @@
 // (SKIP), so skips are reported but not fatal. Failures keep their own
 // non-zero exit from the runner. This is the AUTHORITATIVE no-skip check; the
 // source scan in rows.mjs and the row() throw are best-effort early warnings.
+// ": <reason>" when the skip/todo carried a reason string, else nothing.
+const reason = (v) => (typeof v === "string" && v ? `: ${v}` : "");
+
 export default async function* noSkipReporter(source) {
   const counts = { pass: 0, fail: 0, skip: 0, todo: 0 };
   const offenders = [];
@@ -21,10 +24,10 @@ export default async function* noSkipReporter(source) {
     const where = data?.file ? ` (${data.file})` : "";
     if (type === "test:skip" || (data && data.skip !== undefined && data.skip !== false)) {
       counts.skip++;
-      offenders.push(`SKIPPED ${data?.name}${where}: ${data?.skip === true ? "" : data?.skip ?? ""}`.trimEnd());
+      offenders.push(`SKIPPED ${data?.name}${where}${reason(data?.skip)}`);
     } else if (type === "test:todo" || (data && data.todo !== undefined && data.todo !== false)) {
       counts.todo++;
-      offenders.push(`TODO ${data?.name}${where}: ${data?.todo === true ? "" : data?.todo ?? ""}`.trimEnd());
+      offenders.push(`TODO ${data?.name}${where}${reason(data?.todo)}`);
     } else if (type === "test:pass") {
       counts.pass++;
     } else {

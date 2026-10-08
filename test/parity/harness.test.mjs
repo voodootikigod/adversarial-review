@@ -1290,7 +1290,6 @@ describe("AP8 FIFO handshake", { skip: SKIP }, () => {
       assert.ok(findSkipViolations(own(src) + "\n", "injected.test.mjs").some((v) => /SKIP/.test(v)), `not caught: ${name}`);
     }
     assert.deepEqual(findSkipViolations(own('import { V4R } from "./helpers/harness.mjs";\ndescribe("x", { SK1P: V4R }, () => {});\n'), "ok.test.mjs"), []);
-    assert.equal(SKIP, process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : false);
   });
 
   test("row() refuses skip and todo options at registration", () => {
@@ -1616,4 +1615,35 @@ describe("AP15 token length boundary", { skip: SKIP }, () => {
     assert.throws(() => assertNoTokenLeak(run, "Zq9#xY"[0] + "q9#x"), /at least 6 bytes/);
     assertNoTokenLeak(run, "Zq9#xY");
   });
+});
+
+// ─── Ungated checks (deliberate exception to the SKIP gating) ────────────────
+// These tests take NO skip option and sit outside every SKIP-gated describe on
+// purpose: a mutation that makes SKIP true on POSIX would skip any gated test,
+// including one that checks SKIP itself, and the run would still pass. They are
+// platform-independent, so they run everywhere, win32 included.
+
+test("canonical SKIP: false on POSIX, the POSIX-only reason on win32 (ungated)", () => {
+  assert.equal(SKIP, process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : false);
+});
+
+test("no-skip reporter counts synthetic test:skip and test:todo events (ungated)", async () => {
+  const { default: reporter } = await import("./helpers/no-skip-reporter.mjs");
+  const savedExit = process.exitCode;
+  try {
+    async function* events() {
+      yield { type: "test:todo", data: { name: "x" } };
+      yield { type: "test:skip", data: { name: "y" } };
+      yield { type: "test:pass", data: { name: "z" } };
+      yield { type: "test:diagnostic", data: { message: "ignored" } };
+    }
+    let out = "";
+    for await (const chunk of reporter(events())) out += chunk;
+    assert.match(out, /^TODO x$/m);
+    assert.match(out, /^SKIPPED y$/m);
+    assert.match(out, /pass 1 fail 0 skip 1 todo 1/);
+    if (process.platform !== "win32") assert.equal(process.exitCode, 1);
+  } finally {
+    process.exitCode = savedExit;
+  }
 });
