@@ -19,6 +19,7 @@ import {
 } from "./helpers/rows.mjs";
 
 const PARITY_HELPERS = path.join(path.dirname(fileURLToPath(import.meta.url)), "helpers");
+const REPO_ROOT_FOR_TEST = path.resolve(PARITY_HELPERS, "..", "..", "..");
 const SKIP = process.platform === "win32" ? "parity suite is POSIX-only (#!/bin/sh mock CLIs)" : false;
 
 // ─── AC13: registry content ──────────────────────────────────────────────────
@@ -988,4 +989,71 @@ smoke.row("SMOKE-PROMPTONLY", "--prompt-only on a one-line diff prints the fence
   const raw = compare(treeA, treeB, "--no-normalize", "n3,n4");
   assert.equal(raw.status, 1, raw.out);
   assert.match(raw.stdout, /SMOKE-PROMPTONLY/);
+});
+
+// ─── AC6 / AP9 mutant support ────────────────────────────────────────────────
+
+import { withMutant, checkMutants, collectMutants } from "./helpers/mutant.mjs";
+
+// Registered mutants of this file (AP9 staleness check reads every
+// test/parity/*.test.mjs `export const MUTANTS = [...]` literal).
+export const MUTANTS = [
+  {
+    id: "AC6-SINGLE-MODE-EXIT",
+    file: "bin/cli.js",
+    find: '// Exit code conveys the derived verdict: 0 approve, 2 needs-attention.\n  process.exit(derived.verdict === "needs-attention" ? 2 : 0);',
+    replace: "// mutant\n  process.exit(0);"
+  }
+];
+
+async function needsAttentionRun(t, cliEntry) {
+  const ctx = makeContext(t);
+  const repo = makeRepo({ ctx });
+  const stub = await ctx.stub();
+  stub.enqueue("anthropic", anthropicReply(FLAG));
+  const opts = { ctx, cwd: repo.dir, env: providerEnv(stub, "anthropic") };
+  if (cliEntry) opts.cliEntry = cliEntry;
+  return runCli(["--provider", "anthropic", "--json"], opts);
+}
+
+describe("AC6 / AP9 mutants", { skip: SKIP }, () => {
+  test("a needs-attention single-API run exits 2 on the original and 0 on the mutant (which was loaded)", async (t) => {
+    const original = await needsAttentionRun(t);
+    assertExit(original, 2);
+    let mutantDir;
+    await withMutant(MUTANTS, async (cliEntry, info) => {
+      mutantDir = info.dir;
+      assert.notEqual(cliEntry, path.join(REPO_ROOT_FOR_TEST, "bin", "cli.js"));
+      const mutated = await needsAttentionRun(t, cliEntry);
+      assertExit(mutated, 0);
+      assert.ok(fs.existsSync(path.join(info.dir, ".mutant-loaded-0")), "sentinel marker written");
+    });
+    assert.ok(!fs.existsSync(mutantDir), "mutant dir cleaned up");
+  });
+
+  test("withMutant throws when find is absent and when it matches twice", async () => {
+    await assert.rejects(withMutant([{ file: "bin/cli.js", find: "this text is not in cli.js", replace: "" }], async () => {}), /stale mutant/);
+    await assert.rejects(withMutant([{ file: "bin/cli.js", find: 'process.exit(derived.verdict === "needs-attention" ? 2 : 0);', replace: "" }], async () => {}), /ambiguous mutant.*2 times/);
+  });
+
+  test("a mutant of a file the CLI never imports throws 'mutant was not loaded'", async (t) => {
+    const m = [{ file: "prompt-template-artifact.md", find: "ticket, plan, or declared set of rails/invariants", replace: "ticket" }];
+    await assert.rejects(withMutant(m, async (cliEntry) => {
+      const run = await needsAttentionRun(t, cliEntry);
+      assertExit(run, 2);
+    }), /mutant was not loaded/);
+  });
+
+  test("the original error wins when fn throws", async () => {
+    await assert.rejects(withMutant(MUTANTS, async () => { throw new Error("boom from fn"); }), /boom from fn/);
+  });
+
+  test("staleness: every registered MUTANTS find occurs exactly once at HEAD; an injected stale one is named", () => {
+    const all = collectMutants();
+    assert.ok(all.some((m) => m.id === "AC6-SINGLE-MODE-EXIT" && m.source === "harness.test.mjs"), JSON.stringify(all.map((m) => m.id)));
+    assert.deepEqual(checkMutants(all), []);
+    const bad = checkMutants([...all, { id: "STALE-ONE", file: "bin/cli.js", find: "no longer in the file", replace: "" }]);
+    assert.equal(bad.length, 1);
+    assert.match(bad[0], /STALE-ONE/);
+  });
 });
