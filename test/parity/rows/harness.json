@@ -1,0 +1,34 @@
+{
+  "SMOKE-CLI": {
+    "roadmapRef": "Step 0. Parity suite (harness self-test)",
+    "futureDeltas": [1, 8]
+  },
+  "SMOKE-API": {
+    "roadmapRef": "Step 0. Parity suite (harness self-test)",
+    "futureDeltas": [1, 8]
+  },
+  "SMOKE-LOOP": {
+    "roadmapRef": "Step 0. Parity suite (harness self-test)",
+    "futureDeltas": [
+      1,
+      8,
+      18,
+      21
+    ]
+  },
+  "SMOKE-PROMPTONLY": {
+    "roadmapRef": "Step 0. Parity suite (harness self-test)",
+    "futureDeltas": [
+      9
+    ]
+  },
+  "SMOKE-CODEX": {
+    "roadmapRef": "Step 0. Parity suite (harness self-test)",
+    "futureDeltas": [
+      1,
+      8,
+      9,
+      31
+    ]
+  }
+}
