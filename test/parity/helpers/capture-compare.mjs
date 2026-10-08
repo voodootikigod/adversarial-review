@@ -51,6 +51,11 @@
 //       new Date().toISOString(), and the default --findings-ledger path
 //       (.adlc/findings.jsonl) is inside the reviewed repo, so it lands in
 //       gitState.files.
+//   n9  the codex private temp dir (callCodexCli mkdtemp, 6-character
+//       [A-Za-z0-9] suffix observed on 2.11.1, e.g. adv-review-codex-5yWoVm):
+//       /adv-review-codex-[A-Za-z0-9]{6}(?![A-Za-z0-9])/g -> adv-review-codex-<rand>,
+//       in argv, stdout, stderr and prompts (the codex reviewer's own argv,
+//       --output-last-message/--output-schema, is recorded in prompts[].argv).
 // Nothing else is normalized. `--no-normalize n3,n4` (TEST-ONLY) disables the
 // named rules, which is possible because captures keep raw values.
 //
@@ -84,7 +89,7 @@ export const USAGE =
   "       capture-compare --print-normalized <capture.json>";
 
 export const COMPARED_FIELDS = ["argv", "code", "stdout", "stderr", "gitState", "calls", "prompts", "requests"];
-const RULES = ["n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8"];
+const RULES = ["n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9"];
 
 class UsageError extends Error {}
 class FatalError extends Error {}
@@ -142,6 +147,10 @@ export function normalizeCapture(cap, disabled = new Set()) {
     if (k in cap) out[k] = mapStrings(cap[k], f);
   }
   if (typeof out.stderr === "string" && !disabled.has("n6")) out.stderr = applyN6(out.stderr);
+  if (!disabled.has("n9")) {
+    const n9 = (v) => v.replace(/adv-review-codex-[A-Za-z0-9]{6}(?![A-Za-z0-9])/g, "adv-review-codex-<rand>");
+    for (const k of ["argv", "stdout", "stderr", "prompts"]) if (k in out) out[k] = mapStrings(out[k], n9);
+  }
   if (out.gitState && !disabled.has("n8")) {
     out.gitState = mapStrings(out.gitState, (v) => v.replace(/"ts":"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"/g, '"ts":"<ts>"'));
   }

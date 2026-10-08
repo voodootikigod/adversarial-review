@@ -732,6 +732,10 @@ describe("AC17 normalization rules", { skip: SKIP }, () => {
     "n7 fix-prompt FINDING_<i> fence nonce": [(c, label) => ({
       prompts: [{ ...c.prompts[0], stdin: `<<<UNTRUSTED:FINDING_1:${label === "A" ? "abcdEFGH_-12" : "zyxwVUTS-_98"}>>>\nTitle: t\n` }]
     })],
+    "n9 codex private temp dir suffix": [(c, label) => ({
+      prompts: [{ ...c.prompts[0], argv: ["exec", "--output-last-message", `${c.roots.tmp}/adv-review-codex-${label === "A" ? "5yWoVm" : "Qa81zZ"}/out.txt`] }],
+      stderr: `wrote adv-review-codex-${label === "A" ? "5yWoVm" : "Qa81zZ"}\n`
+    })],
     "n5 raw dump name": [(c, label) => ({ stderr: `raw output in ${c.roots.tmp}/adversarial-review-raw-${label === "A" ? "111-1759500000000" : "222-1759500000999"}.txt\n` })]
   };
   for (const [name, [f]] of Object.entries(cases)) {
@@ -751,6 +755,8 @@ describe("AC17 normalization rules", { skip: SKIP }, () => {
     "a FINDING_<i> nonce with n7 disabled": [
       "<<<UNTRUSTED:FINDING_1:abcdEFGH_-12>>>\n", "<<<UNTRUSTED:FINDING_1:zyxwVUTS-_98>>>\n", ["--no-normalize", "n7"]
     ],
+    "an adv-review-codex- suffix that is not 6 alphanumerics": ["adv-review-codex-5yWoV\n", "adv-review-codex-5yWoX\n"],
+    "a codex temp dir suffix with n9 disabled": ["adv-review-codex-5yWoVm\n", "adv-review-codex-Qa81zZ\n", ["--no-normalize", "n9"]],
     "adversarial-review-loop- with a non-digit suffix": ["adversarial-review-loop-abc\n", "adversarial-review-loop-abd\n"],
     "a tmp-like path that is not a recorded root": [
       `${path.join(tmpBase(), "parity-zz-A")}/f\n`, `${path.join(tmpBase(), "parity-zz-B")}/f\n`
@@ -1217,6 +1223,16 @@ describe("AP8 FIFO handshake", { skip: SKIP }, () => {
 
 // ─── AP7 nondeterminism sweep ────────────────────────────────────────────────
 
+// The rule each sweep pair needs (its per-run value): review prompts carry fence
+// nonces (n4), the SIGINT loop a stash timestamp (n3), the ledger a ts (n8).
+const SWEEP_RULES = {
+  "SWEEP-AUTO-DETECT": "n4",
+  "SWEEP-LEDGER": "n8",
+  "SWEEP-CLAUDE-RETRY": "n4",
+  "SWEEP-SIGINT-LOOP": "n3",
+  "SWEEP-PROMPT-ONLY": "n4"
+};
+
 describe("nondeterminism sweep", { skip: SKIP }, () => {
   const shapes = {
     "SWEEP-AUTO-DETECT": async (t, dir) => {
@@ -1262,6 +1278,10 @@ describe("nondeterminism sweep", { skip: SKIP }, () => {
       await shape(t, b);
       const r = compare(a, b);
       assert.equal(r.status, 0, r.out);
+      // Negative control: the same pair with the rule that absorbs its per-run value disabled.
+      const raw = compare(a, b, "--no-normalize", SWEEP_RULES[name]);
+      assert.equal(raw.status, 1, raw.out);
+      assert.match(raw.stdout, new RegExp(name));
     });
   }
 
@@ -1416,4 +1436,32 @@ describe("AP11 harness assert helpers feed the counter", { skip: SKIP }, () => {
       assertNoProviderCalls(fake);
     }), /row COUNT5 made 4 assertions, below its floor 5/);
   });
+});
+
+// ─── SMOKE-CODEX: codex reviewer, private temp dir normalized by n9 ──────────
+
+smoke.row("SMOKE-CODEX", "codex mock reviewer writing --output-last-message, working tree, --json", async (t) => {
+  const holder = makeContext(t);
+  const [treeA, treeB] = [captureTree(holder), captureTree(holder)];
+  const runs = [];
+  for (const tree of [treeA, treeB]) {
+    const ctx = makeContext(t);
+    const repo = makeRepo({ ctx });
+    ctx.mock("codex", { responses: [{ stdout: J(APPROVE) }] });
+    runs.push({ ctx, run: await runCli(["--provider", "codex", "--json"], { ctx, cwd: repo.dir, capture: { dir: tree } }) });
+  }
+  const { ctx, run } = runs[0];
+  assertExit(run, 0);
+  assert.equal(run.json.verdict, "approve");
+  assertCallCount(run, "codex", 1);
+  const argv = ctx.records("codex")[0].argv;
+  const olm = argv[argv.indexOf("--output-last-message") + 1];
+  assert.match(olm, /\/adv-review-codex-[A-Za-z0-9]{6}\/out\.txt$/);
+  assert.ok(olm.startsWith(run.roots.tmp + path.sep), "codex temp dir lives under the run TMPDIR");
+  assert.ok(isReviewPrompt(run.prompts[0].stdin));
+  const same = compare(treeA, treeB);
+  assert.equal(same.status, 0, same.out);
+  const raw = compare(treeA, treeB, "--no-normalize", "n9");
+  assert.equal(raw.status, 1, raw.out);
+  assert.match(raw.stdout, /SMOKE-CODEX#1 fields: prompts/);
 });
