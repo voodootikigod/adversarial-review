@@ -38,6 +38,11 @@ jobs:
       - name: Capture SMOKE-API parity row
         run: PARITY_CAPTURE=$RUNNER_TEMP/parity-capture node --test --test-name-pattern 'row:SMOKE-API' test/parity/harness.test.mjs
 
+      # AP14 (T50): the authoritative no-skip check. Fails the leg when any
+      # parity test is skipped or todo on this (non-win32) runner.
+      - name: Parity suite with the no-skip reporter
+        run: node --test --test-reporter=./test/parity/helpers/no-skip-reporter.mjs --test-reporter-destination=stdout test/parity/*.test.mjs
+
       - name: Upload SMOKE-API parity capture
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

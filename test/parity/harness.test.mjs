@@ -1217,7 +1217,7 @@ describe("AP8 FIFO handshake", { skip: SKIP }, () => {
       /signalAfter may not be combined with a sleeping mock/);
   });
 
-  test("guard: the only permitted skip form is { skip: SKIP }; every bypass shape is caught", () => {
+  test("guard: known bypass shapes are flagged (best effort; the AP14 runtime reporter is authoritative)", () => {
     assert.deepEqual(scanParitySkips(), []);
     // Placeholders keep this file's own source free of the shapes it injects.
     const inject = (src) => src.replaceAll("SK1P", "skip").replaceAll("T0D0", "todo");
@@ -1512,4 +1512,61 @@ smoke.row("SMOKE-CODEX", "codex mock reviewer writing --output-last-message, wor
   const raw = compare(treeA, treeB, "--no-normalize", "n9");
   assert.equal(raw.status, 1, raw.out);
   assert.match(raw.stdout, /SMOKE-CODEX#1 fields: prompts/);
+});
+
+// ─── AP14 runtime no-skip reporter ───────────────────────────────────────────
+
+const REPORTER = path.join(PARITY_HELPERS, "no-skip-reporter.mjs");
+
+describe("AP14 no-skip reporter", { skip: SKIP }, () => {
+  // Placeholders keep this file's own source free of the shapes it writes.
+  const fixture = (body) => 'import test from "node:test";\n' + body.replaceAll("SK1P", "skip").replaceAll("T0D0", "todo").replaceAll("V4R", "SKIP");
+  const runReporter = (t, body) => {
+    const dir = fs.mkdtempSync(path.join(tmpBase(), "parity-reporter-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, "fixture.test.mjs");
+    fs.writeFileSync(file, fixture(body));
+    const r = spawnSync(process.execPath, ["--test", `--test-reporter=${REPORTER}`, "--test-reporter-destination=stdout", file], {
+      encoding: "utf8",
+      // A fresh runner: without this the child sees the parent's test context and refuses to run.
+      env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "NODE_TEST_CONTEXT"))
+    });
+    return { status: r.status, out: r.stdout + r.stderr };
+  };
+
+  test("(a) one skipped test exits non-zero naming it", (t) => {
+    const r = runReporter(t, 'test("passes", () => {});\ntest("the skipped one", { SK1P: "because" }, () => {});\n');
+    assert.notEqual(r.status, 0, r.out);
+    assert.match(r.out, /SKIPPED the skipped one/);
+  });
+  test("(b) one todo test exits non-zero naming it", (t) => {
+    const r = runReporter(t, 'test("the todo one", { T0D0: "later" }, () => {});\n');
+    assert.notEqual(r.status, 0, r.out);
+    assert.match(r.out, /TODO the todo one/);
+  });
+  test("(c) all passing exits 0", (t) => {
+    const r = runReporter(t, 'test("one", () => {});\ntest("two", () => {});\n');
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.out, /pass 2 fail 0 skip 0 todo 0/);
+  });
+  test("(d) a shared SKIP forced true on every test exits non-zero", (t) => {
+    const r = runReporter(t, 'const V4R = true;\ntest("one", { SK1P: V4R }, () => {});\ntest("two", { SK1P: V4R }, () => {});\n');
+    assert.notEqual(r.status, 0, r.out);
+    assert.match(r.out, /skip 2/);
+  });
+});
+
+// ─── AP15 leak token length boundary ─────────────────────────────────────────
+
+describe("AP15 token length boundary", { skip: SKIP }, () => {
+  test("a 5-byte token is rejected; a 6-byte token is accepted", async (t) => {
+    assert.throws(() => tokenForms("12345"), /at least 6 bytes/);
+    assert.ok(tokenForms("123456").raw === "123456");
+    const ctx = makeContext(t);
+    const repo = makeRepo({ ctx });
+    ctx.mock("claude", { responses: [{ stdout: J(APPROVE) }] });
+    const run = await runCli(["--provider", "claude", "--json"], { ctx, cwd: repo.dir });
+    assert.throws(() => assertNoTokenLeak(run, "Zq9#xY"[0] + "q9#x"), /at least 6 bytes/);
+    assertNoTokenLeak(run, "Zq9#xY");
+  });
 });
