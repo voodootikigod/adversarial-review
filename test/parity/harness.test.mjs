@@ -1554,6 +1554,21 @@ describe("AP14 no-skip reporter", { skip: SKIP }, () => {
     assert.notEqual(r.status, 0, r.out);
     assert.match(r.out, /skip 2/);
   });
+  test("(e) a skipped describe() exits non-zero naming the suite", (t) => {
+    const r = runReporter(t, 'import { describe } from "node:test";\ndescribe("suite", { SK1P: true }, () => { test("inner", () => {}); });\n');
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.out, /SKIPPED suite/);
+  });
+  test("(f) a todo describe() exits non-zero naming the suite", (t) => {
+    const r = runReporter(t, 'import { describe } from "node:test";\ndescribe("suite", { T0D0: true }, () => { test("inner", () => {}); });\n');
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.out, /TODO suite/);
+  });
+  test("(g) a parity file that throws at import exits non-zero with FAIL", (t) => {
+    const r = runReporter(t, 'throw new Error("boom at import");\n');
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.out, /FAIL/);
+  });
 });
 
 // ─── AP15 leak token length boundary ─────────────────────────────────────────
