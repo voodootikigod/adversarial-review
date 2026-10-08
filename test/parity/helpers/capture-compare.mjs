@@ -5,7 +5,7 @@
 //   capture-compare.mjs <baseDir> <headDir> [--delta <n>]
 //                       [--allow <id,id,...> --allow-reason "<text>"]
 //                       [--no-normalize <n1,...>]          (TEST-ONLY switch)
-//   capture-compare.mjs --cross-node --field <field> <node24Dir> <legDir>
+//   capture-compare.mjs --cross-node --field <field> [--require-row <id>]... <node24Dir> <legDir>
 //   capture-compare.mjs --print-normalized <capture.json>
 // With NO arguments (as `node --test` discovery runs it) it exits 0 silently.
 // Any other malformed argument list exits 2 with a usage line on stderr.
@@ -76,6 +76,12 @@
 // setup` on a detecting run (argv not exempt, no preResolution) when BASE has no
 // such line.
 //
+// --cross-node: a row present in only one tree prints `MISSING <rowId> in
+// <BASE|HEAD>` and exits 1, and a run that compared zero rows prints
+// `cross-node compared 0 rows` and exits 1, so an empty or misnamed capture
+// can never pass. --require-row <id> (repeatable, any mode) exits 1 with
+// `MISSING <id> in <BASE|HEAD>` unless the row is present in both trees.
+//
 // --allow <ids> requires --allow-reason (one reason covers all ids), prints
 // `ALLOWED <rowId>: <reason>` for each allowed differing row, and is refused
 // (exit 2) for a row tagged for the active --delta.
@@ -85,7 +91,7 @@ import { fileURLToPath } from "node:url";
 
 export const USAGE =
   "usage: capture-compare <baseDir> <headDir> [--delta <n>] [--allow <ids> --allow-reason <text>] [--no-normalize <rules>]\n" +
-  "       capture-compare --cross-node --field <field> <baseDir> <headDir>\n" +
+  "       capture-compare --cross-node --field <field> [--require-row <id>]... <baseDir> <headDir>\n" +
   "       capture-compare --print-normalized <capture.json>";
 
 export const COMPARED_FIELDS = ["argv", "code", "stdout", "stderr", "gitState", "calls", "prompts", "requests"];
@@ -367,7 +373,7 @@ function major(v) {
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const opts = { positional: [], allow: null, allowReason: null, delta: null, disabled: new Set(), crossNode: false, field: null, printNormalized: null };
+  const opts = { positional: [], allow: null, allowReason: null, delta: null, disabled: new Set(), crossNode: false, field: null, printNormalized: null, requireRows: [] };
   const takeValue = (i, flag) => {
     if (i + 1 >= argv.length) throw new UsageError(`${flag} needs a value`);
     return argv[i + 1];
@@ -388,6 +394,8 @@ function parseArgs(argv) {
         opts.disabled.add(r);
       }
       i++;
+    } else if (a === "--require-row") {
+      opts.requireRows.push(takeValue(i, a)); i++;
     } else if (a === "--cross-node") {
       opts.crossNode = true;
     } else if (a === "--field") {
@@ -481,20 +489,28 @@ async function compareTrees(opts, out) {
   const fields = opts.crossNode ? [opts.field] : COMPARED_FIELDS;
   const env = delta?.envelope ?? null;
   let failed = false;
+  for (const id of opts.requireRows) {
+    for (const [label, tree] of [["BASE", base], ["HEAD", head]]) {
+      if (!tree.has(id)) { out(`MISSING ${id} in ${label}`); failed = true; }
+    }
+  }
+  let comparedRows = 0;
   const ids = [...new Set([...base.keys(), ...head.keys()])].sort();
   for (const id of ids) {
     const bc = base.get(id);
     const hc = head.get(id);
     if (!hc) {
-      if (opts.crossNode) continue;
+      if (opts.crossNode) { if (!opts.requireRows.includes(id)) out(`MISSING ${id} in HEAD`); failed = true; continue; }
       if (allowed.has(id)) out(`ALLOWED ${id}: ${opts.allowReason}`);
       else { out(`REMOVED row ${id}`); failed = true; }
       continue;
     }
     if (!bc) {
-      if (!opts.crossNode) out(`NEW row ${id}`);
+      if (opts.crossNode) { if (!opts.requireRows.includes(id)) out(`MISSING ${id} in BASE`); failed = true; continue; }
+      out(`NEW row ${id}`);
       continue;
     }
+    comparedRows++;
     const rowLines = [];
     let rowDiffers = false;
     let rowFails = false;
@@ -539,6 +555,10 @@ async function compareTrees(opts, out) {
     }
     for (const l of rowLines) out(l);
     if (rowFails) failed = true;
+  }
+  if (opts.crossNode && comparedRows === 0) {
+    out("cross-node compared 0 rows");
+    failed = true;
   }
   return failed ? 1 : 0;
 }

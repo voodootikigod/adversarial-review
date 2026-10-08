@@ -826,6 +826,38 @@ describe("AP2 n6 and the Node-major guard", { skip: SKIP }, () => {
   });
 });
 
+describe("cross-node completeness", { skip: SKIP }, () => {
+  const cn = (...a) => compare("--cross-node", "--field", "stderr", ...a);
+  test("a full tree vs an empty tree exits 1 with MISSING and a zero-rows notice", (t) => {
+    const full = writeTree({ "SMOKE-API": [synthCapture("A")] });
+    const empty = fs.mkdtempSync(path.join(tmpBase(), "parity-tree-"));
+    t.after(() => { fs.rmSync(full, { recursive: true, force: true }); fs.rmSync(empty, { recursive: true, force: true }); });
+    const r = cn(full, empty);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.out, /MISSING SMOKE-API in HEAD/);
+    assert.match(r.out, /cross-node compared 0 rows/);
+  });
+  test("HEAD missing SMOKE-API while BASE has it exits 1 naming it; matching trees exit 0", (t) => {
+    const a = writeTree({ "SMOKE-API": [synthCapture("A")], "SMOKE-CLI": [synthCapture("A")] });
+    const b = writeTree({ "SMOKE-CLI": [synthCapture("B")] });
+    const c = writeTree({ "SMOKE-API": [synthCapture("B")], "SMOKE-CLI": [synthCapture("B")] });
+    t.after(() => [a, b, c].forEach((d) => fs.rmSync(d, { recursive: true, force: true })));
+    const r = cn(a, b);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.out, /MISSING SMOKE-API in HEAD/);
+    assert.equal(cn(a, c).status, 0, cn(a, c).out);
+    assert.equal(cn("--require-row", "SMOKE-API", a, c).status, 0);
+  });
+  test("--require-row with the row absent from both trees exits 1", (t) => {
+    const a = writeTree({ "SMOKE-CLI": [synthCapture("A")] });
+    const b = writeTree({ "SMOKE-CLI": [synthCapture("B")] });
+    t.after(() => [a, b].forEach((d) => fs.rmSync(d, { recursive: true, force: true })));
+    const r = cn("--require-row", "SMOKE-API", a, b);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.out, /MISSING SMOKE-API in BASE/);
+  });
+});
+
 describe("AP3 tag scope", { skip: SKIP }, () => {
   test("tagged-for-8 row differing in stdout -> exit 0 with the diff printed; also code -> exit 1 naming code", (t) => {
     const opts = { base: { manifests: manifestWith([8]) }, head: { manifests: manifestWith([]), landed: [8] } };

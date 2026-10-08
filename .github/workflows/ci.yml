@@ -75,7 +75,7 @@ jobs:
         run: |
           set -e
           for n in 18 20 22; do
-            node test/parity/helpers/capture-compare.mjs --cross-node --field stderr \
+            node test/parity/helpers/capture-compare.mjs --cross-node --field stderr --require-row SMOKE-API \
               "$RUNNER_TEMP/parity/parity-smoke-api-node24" "$RUNNER_TEMP/parity/parity-smoke-api-node$n"
           done
 

@@ -422,6 +422,10 @@ export async function runCli(args, opts = {}) {
     child.on("error", reject);
     child.on("close", (code, signal) => { done = true; resolve({ code, signal }); });
   });
+  // Known limitation (process leak, not a hang): SIGKILL reaches only the CLI.
+  // A mock it was still running sits in its own process group (exec-watchdog
+  // spawns provider CLIs detached), so that mock may be orphaned and keep
+  // running until it exits on its own. runCli still returns promptly.
   const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
 
   let signalSent = false;
