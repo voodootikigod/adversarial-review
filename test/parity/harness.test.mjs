@@ -179,3 +179,108 @@ describe("AP11 assertion floor", { skip: SKIP }, () => {
     await executeRow({ id: "FLOOR", entry: entry(2), landedDeltas: [] }, twoAsserts);
   });
 });
+
+// ─── AC5 and mock CLI mechanics (direct spawn, no CLI) ───────────────────────
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import {
+  writeMockCli,
+  readMockRecords,
+  readMockProbes,
+  failTwice,
+  isReviewPrompt,
+  isVerifyPrompt
+} from "./helpers/mock-cli.mjs";
+
+function tmpDirs() {
+  const base = fs.realpathSync(os.tmpdir());
+  const mocksDir = fs.mkdtempSync(path.join(base, "parity-selftest-mocks-"));
+  const recordsDir = fs.mkdtempSync(path.join(base, "parity-selftest-records-"));
+  const fifoDir = fs.mkdtempSync(path.join(base, "parity-selftest-fifo-"));
+  return { mocksDir, recordsDir, fifoDir, cleanup: () => [mocksDir, recordsDir, fifoDir].forEach((d) => fs.rmSync(d, { recursive: true, force: true })) };
+}
+
+function spawnMock(file, args, { input = "", cwd, env } = {}) {
+  return spawnSync(file, args, { input, cwd, env: env ?? { PATH: "/nonexistent" }, encoding: "utf8" });
+}
+
+describe("AC5 mock CLI probes and queue", { skip: SKIP }, () => {
+  test("a --version probe prints 1.0.0, is recorded under probes/, and does not consume response #1", (t) => {
+    const d = tmpDirs();
+    t.after(d.cleanup);
+    const file = writeMockCli(d.mocksDir, "claude", { responses: [{ stdout: "RESPONSE-ONE" }], recordsDir: d.recordsDir, fifoDir: d.fifoDir });
+    const probe = spawnMock(file, ["--version"]);
+    assert.equal(probe.status, 0);
+    assert.equal(probe.stdout, "1.0.0\n");
+    assert.ok(fs.existsSync(path.join(d.recordsDir, "claude", "probes", "1.argv")));
+    const call = spawnMock(file, ["-p", "-"], { input: "the prompt" });
+    assert.equal(call.status, 0, call.stderr);
+    assert.equal(call.stdout, "RESPONSE-ONE");
+    const recs = readMockRecords(d.recordsDir, "claude");
+    assert.equal(recs.length, 1);
+    assert.equal(recs[0].n, 1);
+    assert.deepEqual(recs[0].argv, ["-p", "-"]);
+    assert.equal(recs[0].stdin, "the prompt");
+    assert.equal(fs.readFileSync(path.join(d.recordsDir, "claude", "1.argv"), "utf8"), "-p\n-\n");
+    assert.equal(readMockProbes(d.recordsDir, "claude").length, 1);
+  });
+
+  test("an exhausted queue exits 97 with 'parity-mock: unexpected call'; repeatLast repeats", (t) => {
+    const d = tmpDirs();
+    t.after(d.cleanup);
+    const strict = writeMockCli(d.mocksDir, "agy", { responses: [{ stdout: "A" }], recordsDir: d.recordsDir, fifoDir: d.fifoDir });
+    assert.equal(spawnMock(strict, []).stdout, "A");
+    const extra = spawnMock(strict, []);
+    assert.equal(extra.status, 97);
+    assert.match(extra.stderr, /parity-mock: unexpected call/);
+    assert.equal(readMockRecords(d.recordsDir, "agy").length, 2, "the extra call is still recorded");
+    const lenient = writeMockCli(d.mocksDir, "copilot", { responses: [{ stdout: "B" }], repeatLast: true, recordsDir: d.recordsDir, fifoDir: d.fifoDir });
+    assert.equal(spawnMock(lenient, []).stdout, "B");
+    assert.equal(spawnMock(lenient, []).stdout, "B");
+  });
+
+  test("stderr, exit code, recordEnv, nested writeFiles, argv with newlines, and --output-last-message", (t) => {
+    const d = tmpDirs();
+    const cwd = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "parity-selftest-cwd-"));
+    t.after(() => { d.cleanup(); fs.rmSync(cwd, { recursive: true, force: true }); });
+    const file = writeMockCli(d.mocksDir, "codex", {
+      responses: [
+        { stdout: "OUT", stderr: "ERR\n", exit: 3, writeFiles: { "a/b/c.txt": "nested\n" } },
+        { stdout: "{\"verdict\":\"approve\"}" }
+      ],
+      recordEnv: ["FOO", "UNSET_VAR"],
+      recordsDir: d.recordsDir,
+      fifoDir: d.fifoDir
+    });
+    const r1 = spawnMock(file, ["exec", "line1\nline2"], { cwd, env: { PATH: "/nonexistent", FOO: "bar" } });
+    assert.equal(r1.status, 3);
+    assert.equal(r1.stdout, "OUT");
+    assert.equal(r1.stderr, "ERR\n");
+    assert.equal(fs.readFileSync(path.join(cwd, "a/b/c.txt"), "utf8"), "nested\n");
+    const outFile = path.join(cwd, "last.txt");
+    const r2 = spawnMock(file, ["exec", "--output-last-message", outFile, "-"], { cwd });
+    assert.equal(r2.status, 0);
+    assert.equal(r2.stdout, "", "codex contract: the response goes to the --output-last-message file");
+    assert.equal(fs.readFileSync(outFile, "utf8"), "{\"verdict\":\"approve\"}");
+    const recs = readMockRecords(d.recordsDir, "codex");
+    assert.deepEqual(recs[0].argv, ["exec", "line1\nline2"]);
+    assert.deepEqual(recs[0].env, { FOO: "bar", UNSET_VAR: "" });
+    assert.equal(fs.readFileSync(path.join(d.recordsDir, "codex", "1.env"), "utf8"), "FOO=bar\nUNSET_VAR=\n");
+    assert.ok(recs[0].seq < recs[1].seq, "global sequence orders invocations");
+  });
+
+  test("failTwice scripts two identical failure responses", () => {
+    assert.deepEqual(failTwice({ stderr: "boom", exit: 1 }), [{ stderr: "boom", exit: 1 }, { stderr: "boom", exit: 1 }]);
+  });
+
+  test("isReviewPrompt / isVerifyPrompt classify the fixed role text", () => {
+    assert.ok(isReviewPrompt("Prompt:\n<role>\nYou are performing an adversarial software review.\n"));
+    assert.ok(!isVerifyPrompt("You are performing an adversarial software review."));
+    assert.ok(isVerifyPrompt("<role>\nYou are re-examining a single code-review finding. Your job is to REFUTE it only when you can."));
+    assert.ok(!isReviewPrompt("You are re-examining a single code-review finding."));
+    assert.ok(!isReviewPrompt("hello") && !isVerifyPrompt("hello"));
+  });
+});
