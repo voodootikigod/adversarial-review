@@ -84,7 +84,7 @@ Each round $r$ ($r \ge 1$) executes:
    - `0`: Approve.
    - `2`: Needs-attention (findings present).
    - `1`: Error. Stop immediately with exitReason `review-error` and print the stderr tail.
-2. **Independence check** (round 1 only): Read stderr and verify reviewer independence.
+2. **Independence check**: Read `.stderr.txt` on every round and verify reviewer independence (ensuring no mid-loop fallback to a same-family reviewer).
 3. **Gating set computation**: Calculate $G_r$. If empty and exit code was 0, evaluate stops.
 4. **Fix step**: Fix or decline every finding in $G_r$. Increments fix round counter $F$.
 5. **Validation**: Run the project validation command. Fix test breakages before re-review.
@@ -92,7 +92,7 @@ Each round $r$ ($r \ge 1$) executes:
 
 ## Independence
 
-From the first review's `.stderr.txt`, read the reviewer identity line:
+On every review round, read the reviewer identity line from `.stderr.txt`:
 `Using local CLI agent: <cmd>` or `Using LLM provider: <provider> (model: <m>)`.
 
 ### Family classification
