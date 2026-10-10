@@ -44,9 +44,9 @@ npx adversarial-review --help
 
 ## Installing as a Claude Code skill
 
-The npm package ships a bundled Claude Code skill under `skills/adversarial-review/`.
-Installing it lets Claude Code invoke the review automatically when you type phrases like
-"review this branch" or "is this safe to ship", and gives it the full three-tier fallback
+The npm package ships bundled skills under `skills/adversarial-review/` and `skills/adversarial-review-loop/`.
+Installing them lets Claude Code invoke the review automatically when you type phrases like
+"review this branch" or "is this safe to ship" (for `adversarial-review`), or "arl" and "review and fix until clean" (for `adversarial-review-loop`), and gives it the full three-tier fallback
 (Tier 3 works with no CLI and no API key).
 
 **Global skill (available in all projects):**
@@ -54,9 +54,11 @@ Installing it lets Claude Code invoke the review automatically when you type phr
 ```bash
 # After npm install -g:
 cp -r "$(npm root -g)/adversarial-review/skills/adversarial-review" ~/.claude/skills/
+cp -r "$(npm root -g)/adversarial-review/skills/adversarial-review-loop" ~/.claude/skills/
 
 # Or from a cloned repo:
 cp -r skills/adversarial-review ~/.claude/skills/
+cp -r skills/adversarial-review-loop ~/.claude/skills/
 ```
 
 **Project skill (this repo only):**
@@ -64,6 +66,7 @@ cp -r skills/adversarial-review ~/.claude/skills/
 ```bash
 mkdir -p .claude/skills
 cp -r "$(npm root -g)/adversarial-review/skills/adversarial-review" .claude/skills/
+cp -r "$(npm root -g)/adversarial-review/skills/adversarial-review-loop" .claude/skills/
 ```
 
 Restart Claude Code after copying. Verify with `/find-skills adversarial-review` or by asking
@@ -434,6 +437,10 @@ npx adversarial-review --providers auto --quorum 2
 - `--providers` cannot be combined with `--provider` (or `--model`).
 
 ## Loop mode (`--loop`)
+
+### Two loops: which one
+
+There are two loops. `arl` (the `adversarial-review-loop` skill) is for an agent session: the session that wrote the code fixes, an independent model reviews, and the human ratifies declines. `--loop` is for unattended runs (CI, a bot converging a branch) where no calling agent exists; it spawns a separate fixer CLI and is the subject of the 3.0.0 independence work. Inside an agent harness, prefer `arl`.
 
 `--loop` runs an autonomous **review → fix → re-review** cycle until no gating finding
 remains (or a stop condition is hit). Each round reviews the working tree, hands the gating

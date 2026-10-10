@@ -14,9 +14,13 @@ All notable changes to this project are documented here.
 - **`--provider cursor` no longer targets a localhost HTTP proxy** (`http://127.0.0.1:8765`). It now resolves to the official Cursor Agent CLI (`agent` / `cursor-agent`) in plan/read-only mode. Third-party OpenAI-compatible proxies: `--provider openai --api-base <url>`. *(Shipped in 2.8.0.)*
 
 ### Added
+- **`adversarial-review-loop` (arl) skill**: An interactive review-and-repair loop protocol for agent sessions (`skills/adversarial-review-loop/SKILL.md` and `.agents/skills/adversarial-review-loop/SKILL.md`). Drives `npx adversarial-review --json` with an independent model reviewer while the calling context fixes inline, validates project tests each round, and provides written justifications for any declined findings.
 - **Cursor Agent CLI provider**: `--provider cursor|agent` invokes `agent -p --mode plan --trust` (subscription / `CURSOR_API_KEY`). Auto-detect inside Cursor falls back to `agent` instead of a dead proxy.
 - **Vercel AI Gateway provider**: `--provider vercel|gateway` with `AI_GATEWAY_API_KEY` (or `VERCEL_OIDC_TOKEN`), base `https://ai-gateway.vercel.sh/v1`, default model `anthropic/claude-sonnet-5`.
 - **One-key multi-family routing**: when only a Gateway credential is set, `--providers auto` / family tokens resolve openai + anthropic + gemini through the Gateway with distinct `provider/model` ids (native vendor keys still win when present).
+
+### Changed
+- **Reposition `--loop` as unattended/CI mode**: Updated `README.md` and `skills/adversarial-review/SKILL.md` to clarify that `--loop` is designed for unattended/CI runs (spawning a separate fixer CLI), and redirected in-session agent usage to the `adversarial-review-loop` (arl) skill.
 
 ## [2.11.1] — 2026-10-06
 
