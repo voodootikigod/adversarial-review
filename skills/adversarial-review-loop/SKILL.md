@@ -69,7 +69,7 @@ Checked before the first review call:
    - Record the starting HEAD commit hash as `originalHead`.
 3. **Working-tree mode check**: No git cleanliness precondition is enforced.
 4. **Validation command**: Discover or resolve the test command (see "Validation"). The resolved command is printed before the first run.
-5. **Reviewer independence**: Evaluated on the first review's stderr (see "Independence").
+5. **Reviewer independence**: Evaluated on each review's stderr (see "Independence").
 
 ## Round structure
 
@@ -182,7 +182,7 @@ Evaluated in order after each review:
 2. **converged-with-accepted**: Exit code 0 and contested set is non-empty $\to$ exitReason `converged-with-accepted`, verdict `needs-attention`.
 3. **no-progress checkpoint**: Three consecutive identical gating sets ($G_r = G_{r-1} = G_{r-2}$) $\to$ trigger checkpoint (`three consecutive`).
 4. **ceiling checkpoint**: Fix count $F ==$ `--max-rounds` (`20`) $\to$ trigger checkpoint.
-5. **time checkpoint**: Wall-clock time since start $\ge$ `--max-time` (`2h`) $\to$ trigger checkpoint (exitReason `checkpoint-time` if stopped).
+5. **time checkpoint**: Wall-clock time since the block started $\ge$ `--max-time` (`2h`) $\to$ trigger checkpoint (exitReason `checkpoint-time` if stopped). When continuing for another block, reset `blockStart` to the current time.
 6. **builder-stuck**: The builder may raise a checkpoint on architectural ambiguity.
 
 ### Checkpoint pause
