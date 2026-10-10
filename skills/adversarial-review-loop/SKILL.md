@@ -79,6 +79,7 @@ Each round $r$ ($r \ge 1$) executes:
    npx adversarial-review --json <pass-through-flags> [focus] > <scratchpad>/arl/<run-id>/round-<r>.stdout.json 2> <scratchpad>/arl/<run-id>/round-<r>.stderr.txt
    ```
    Stdout and stderr are captured to separate files and never merged (`.stdout.json` and `.stderr.txt`).
+   *Execution note:* Invoke the reviewer with arguments passed as distinct argv elements or strictly quoted strings, avoiding raw shell interpolation of external focus or justifications. In repositories with local dependencies, `npx --no-install adversarial-review` can be used.
    Exit codes:
    - `0`: Approve.
    - `2`: Needs-attention (findings present).

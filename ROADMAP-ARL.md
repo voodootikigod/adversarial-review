@@ -22,11 +22,13 @@ built the code:
 **Decision:** the external model reviews, the calling (builder) context fixes, the human ratifies
 declines. That is the `arl` skill. `--loop` stays as the unattended/CI mode.
 
-## 2. Binding artifacts (read these first)
+## 2. Session reference artifacts
 
-| What | Where | State |
+This section references artifacts produced during ticket T120 planning. (Note: These documents record planning history and do not constrain or substitute for independent code review of the change set).
+
+| Artifact | Location | Status |
 |---|---|---|
-| Spec (D1–D28 decisions, protocol, 10 ACs, premortem) | `.adlc/specs/T120.md` (tracked) | P1 approved, hash bound in manifest seq 175 |
+| Spec (D1–D28 decisions, protocol, 10 ACs, premortem) | `.adlc/specs/T120.md` (tracked) | Approved spec, hash bound in manifest seq 175 |
 | Ticket T120 | `.adlc/tickets/t120--*.json` (store) | created seq 166, updated seq 173 (authorized scope widening) |
 | Ticket drafts T121, T122, T123, ADLC-ARL | `.adlc/plans/arl-ticket-drafts.json` (gitignored, local only) | drafts; not in the store |
 | Deltas 41–43 registry amendment | `.adlc/plans/3.0.0-decisions.md` (gitignored, local only) | recorded as P0-approved |
