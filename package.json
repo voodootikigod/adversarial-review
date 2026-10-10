@@ -16,6 +16,7 @@
     "bin/",
     "src/",
     "skills/adversarial-review/",
+    "skills/adversarial-review-loop/",
     "prompt-template.md",
     "prompt-template-artifact.md",
     "schema.json",

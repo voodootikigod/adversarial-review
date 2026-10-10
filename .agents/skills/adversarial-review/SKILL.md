@@ -68,7 +68,7 @@ failed).
 
 Useful hardening flags:
 
-- `--loop` — autonomous fix loop that re-reviews findings and invokes a fixer CLI until clean. On Linux, kernel-level write confinement via bubblewrap (`bwrap`) restricts fixer write access strictly to the target workspace. `--loop-unsafe` is required when write confinement is unavailable (e.g. macOS).
+- `--loop` — not for use inside an agent session: use the `adversarial-review-loop` (arl) skill, which fixes in this context. `--loop` is the unattended/CI mode: an autonomous fix loop that re-reviews findings and invokes a fixer CLI until clean. On Linux, kernel-level write confinement via bubblewrap (`bwrap`) restricts fixer write access strictly to the target workspace. `--loop-unsafe` is required when write confinement is unavailable (e.g. macOS).
 - `--fail-on <severity>` / `--min-confidence <x>` — the deterministic gate: exit 2 iff any
   finding is at/above the severity threshold (default `medium`) with confidence at/above
   the floor (default `0.5`). The model's own verdict is advisory; disagreement is reported.
