@@ -42,9 +42,34 @@ npm install -g adversarial-review
 npx adversarial-review --help
 ```
 
-## Installing as a Claude Code skill
+## Installing agent skills (skills.sh, Claude Code, Cursor, Codex, Antigravity)
 
-The npm package ships bundled skills under `skills/adversarial-review/` and `skills/adversarial-review-loop/`.
+The repository provides three installable agent skills:
+- `/adversarial-review` (`skills/adversarial-review/`): Skeptical, single-pass ship/no-ship code review of a git diff or branch.
+- `/adversarial-review-loop` (`skills/adversarial-review-loop/`): Canonical full name for the iterative review-fix-validate loop.
+- `/arl` (`skills/arl/`): Fast short command for the iterative review-fix-validate loop.
+
+### Via skills.sh / npx skills (Recommended)
+
+Install all skills interactively across supported agents (Claude Code, Cursor, Codex, Antigravity, OpenCode):
+
+```bash
+npx skills add voodootikigod/adversarial-review
+```
+
+Or install a specific skill (e.g. `/arl` or `/adversarial-review`):
+
+```bash
+# Install /arl globally
+npx skills add voodootikigod/adversarial-review --skill arl -g
+
+# Install /adversarial-review and /adversarial-review-loop into current project
+npx skills add voodootikigod/adversarial-review --skill adversarial-review --skill adversarial-review-loop
+```
+
+### Manual installation (Claude Code)
+
+The npm package ships bundled skills under `skills/adversarial-review/`, `skills/adversarial-review-loop/`, and `skills/arl/`.
 Installing them lets Claude Code invoke the review automatically when you type phrases like
 "review this branch" or "is this safe to ship" (for `adversarial-review`), or "arl" and "review and fix until clean" (for `adversarial-review-loop`), and gives it the full three-tier fallback
 (Tier 3 works with no CLI and no API key).
@@ -55,10 +80,12 @@ Installing them lets Claude Code invoke the review automatically when you type p
 # After npm install -g:
 cp -r "$(npm root -g)/adversarial-review/skills/adversarial-review" ~/.claude/skills/
 cp -r "$(npm root -g)/adversarial-review/skills/adversarial-review-loop" ~/.claude/skills/
+cp -r "$(npm root -g)/adversarial-review/skills/arl" ~/.claude/skills/
 
 # Or from a cloned repo:
 cp -r skills/adversarial-review ~/.claude/skills/
 cp -r skills/adversarial-review-loop ~/.claude/skills/
+cp -r skills/arl ~/.claude/skills/
 ```
 
 **Project skill (this repo only):**
@@ -67,6 +94,7 @@ cp -r skills/adversarial-review-loop ~/.claude/skills/
 mkdir -p .claude/skills
 cp -r "$(npm root -g)/adversarial-review/skills/adversarial-review" .claude/skills/
 cp -r "$(npm root -g)/adversarial-review/skills/adversarial-review-loop" .claude/skills/
+cp -r "$(npm root -g)/adversarial-review/skills/arl" .claude/skills/
 ```
 
 Restart Claude Code after copying. Verify with `/find-skills adversarial-review` or by asking

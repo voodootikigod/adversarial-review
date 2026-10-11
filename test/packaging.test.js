@@ -40,3 +40,21 @@ test('package.json files includes skills/adversarial-review-loop/ and packs SKIL
     'npm pack must include skills/adversarial-review-loop/SKILL.md'
   );
 });
+
+test('package.json files includes skills/arl/ and packs SKILL.md', () => {
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  const shipped = new Set(pkg.files);
+  assert.ok(
+    shipped.has('skills/arl/'),
+    'package.json "files" must include skills/arl/'
+  );
+
+  const packOutput = execSync('npm pack --dry-run --json --ignore-scripts', { cwd: root, encoding: 'utf8' });
+  const packInfo = JSON.parse(packOutput);
+  const packedPaths = new Set(packInfo[0].files.map((f) => f.path));
+  assert.ok(
+    packedPaths.has('skills/arl/SKILL.md'),
+    'npm pack must include skills/arl/SKILL.md'
+  );
+});
+
