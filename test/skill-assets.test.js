@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { syncSkills } from '../scripts/sync-skill.mjs';
 
 // Drift guard: skill bundles must stay byte-for-byte identical to repo-root originals.
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -223,6 +224,44 @@ test('arl body matches adversarial-review-loop body', () => {
   const arlBody = arlContent.replace(/^---[\s\S]*?---\r?\n/, '');
   assert.equal(arlBody, loopBody, 'arl markdown body must be identical to adversarial-review-loop body');
 });
+
+test('syncSkills generates valid arl skills and fails closed on corrupted frontmatter', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'sync-skill-test-'));
+  try {
+    // Scaffold minimal directory structure in tmpDir
+    mkdirSync(join(tmpDir, 'skills/adversarial-review'), { recursive: true });
+    mkdirSync(join(tmpDir, 'skills/adversarial-review-loop'), { recursive: true });
+    writeFileSync(join(tmpDir, 'prompt-template.md'), 'test prompt', 'utf8');
+    writeFileSync(join(tmpDir, 'prompt-template-artifact.md'), 'test artifact', 'utf8');
+    writeFileSync(join(tmpDir, 'schema.json'), '{}', 'utf8');
+    writeFileSync(join(tmpDir, 'skills/adversarial-review/SKILL.md'), '---\nname: adversarial-review\n---\n# Adv Review\n', 'utf8');
+
+    // 1. Valid loop skill
+    const validLoop = readFileSync(join(root, 'skills/adversarial-review-loop/SKILL.md'), 'utf8');
+    writeFileSync(join(tmpDir, 'skills/adversarial-review-loop/SKILL.md'), validLoop, 'utf8');
+
+    syncSkills(tmpDir);
+
+    const generatedArl = readFileSync(join(tmpDir, 'skills/arl/SKILL.md'), 'utf8');
+    assert.ok(/^name:\s*arl\b/m.test(generatedArl), 'generated arl must have "name: arl"');
+    assert.ok(generatedArl.includes('"/arl"'), 'generated arl must include "/arl" trigger');
+    const agentsArl = readFileSync(join(tmpDir, '.agents/skills/arl/SKILL.md'), 'utf8');
+    assert.equal(generatedArl, agentsArl, 'skills/arl and .agents/skills/arl must be byte-identical');
+
+    // 2. Fails closed if name replacement fails
+    const corruptedNameLoop = validLoop.replace(/^name:\s*adversarial-review-loop\b/m, 'name: corrupted-name');
+    writeFileSync(join(tmpDir, 'skills/adversarial-review-loop/SKILL.md'), corruptedNameLoop, 'utf8');
+    assert.throws(() => syncSkills(tmpDir), /failed to replace "name: adversarial-review-loop"/);
+
+    // 3. Fails closed if trigger replacement fails
+    const corruptedTriggerLoop = validLoop.replace(/Triggers on "arl",\s*/m, 'Triggers on nothing: ');
+    writeFileSync(join(tmpDir, 'skills/adversarial-review-loop/SKILL.md'), corruptedTriggerLoop, 'utf8');
+    assert.throws(() => syncSkills(tmpDir), /failed to insert "\/arl" trigger/);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 // AC4: Required headings and literal strings in adversarial-review-loop/SKILL.md
 test('adversarial-review-loop contains required headings and literal strings (AC4)', () => {
