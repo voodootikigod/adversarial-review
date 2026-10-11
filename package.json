@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "sync-skill": "node --input-type=module -e \"import{copyFileSync,mkdirSync,existsSync}from'fs';const files=['prompt-template.md','prompt-template-artifact.md','schema.json'];const dests=['skills/adversarial-review/references','.agents/skills/adversarial-review/references'];for(const d of dests){mkdirSync(d,{recursive:true});for(const f of files)copyFileSync(f,d+'/'+f);}\"",
+    "sync-skill": "node scripts/sync-skill.mjs",
     "prepublishOnly": "npm run sync-skill && npm test"
   },
   "bin": {
@@ -17,6 +17,7 @@
     "src/",
     "skills/adversarial-review/",
     "skills/adversarial-review-loop/",
+    "skills/arl/",
     "prompt-template.md",
     "prompt-template-artifact.md",
     "schema.json",

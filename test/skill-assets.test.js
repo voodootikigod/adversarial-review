@@ -40,6 +40,7 @@ for (const dir of skillDirs) {
 const skillPairs = [
   'adversarial-review',
   'adversarial-review-loop',
+  'arl',
 ];
 
 for (const skill of skillPairs) {
@@ -184,6 +185,45 @@ test('adversarial-review-loop frontmatter parses and meets AC3', () => {
   );
 });
 
+// Frontmatter parsing and validation for arl
+test('arl frontmatter parses and meets requirements', () => {
+  const skillPath = join(root, 'skills', 'arl', 'SKILL.md');
+  assert.ok(existsSync(skillPath), `${skillPath} must exist`);
+  const content = readFileSync(skillPath, 'utf8');
+  const fm = parseFrontmatter(content);
+  assert.equal(fm.name, 'arl');
+  assert.equal(fm['user-invocable'], true);
+  assert.equal(fm.license, 'Apache-2.0');
+
+  const argHint = fm['argument-hint'] || '';
+  assert.ok(argHint.includes('--max-rounds'), 'argument-hint must list --max-rounds');
+  assert.ok(argHint.includes('--max-time'), 'argument-hint must list --max-time');
+  assert.ok(argHint.includes('--test'), 'argument-hint must list --test');
+
+  const desc = fm.description || '';
+  assert.ok(desc.includes('arl'), 'description must contain "arl"');
+  assert.ok(desc.includes('/arl'), 'description must contain "/arl"');
+  assert.ok(desc.includes('review and fix until clean'), 'description must contain "review and fix until clean"');
+  assert.ok(desc.includes('converge the review'), 'description must contain "converge the review"');
+  assert.ok(desc.includes('--loop'), 'description must contain "--loop"');
+
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  assert.ok(fm.metadata, 'metadata block must be present in frontmatter');
+  assert.equal(
+    fm.metadata.version,
+    pkg.version,
+    'metadata.version must equal package.json version'
+  );
+});
+
+test('arl body matches adversarial-review-loop body', () => {
+  const loopContent = readFileSync(join(root, 'skills', 'adversarial-review-loop', 'SKILL.md'), 'utf8');
+  const arlContent = readFileSync(join(root, 'skills', 'arl', 'SKILL.md'), 'utf8');
+  const loopBody = loopContent.replace(/^---[\s\S]*?---\r?\n/, '');
+  const arlBody = arlContent.replace(/^---[\s\S]*?---\r?\n/, '');
+  assert.equal(arlBody, loopBody, 'arl markdown body must be identical to adversarial-review-loop body');
+});
+
 // AC4: Required headings and literal strings in adversarial-review-loop/SKILL.md
 test('adversarial-review-loop contains required headings and literal strings (AC4)', () => {
   const skillPath = join(root, 'skills', 'adversarial-review-loop', 'SKILL.md');
@@ -300,8 +340,8 @@ test('CHANGELOG [Unreleased] contains Added and Changed entries for arl (AC6)', 
   );
 });
 
-// AC7: skills-lock.json parses and contains adversarial-review-loop
-test('skills-lock.json parses and contains adversarial-review-loop (AC7)', () => {
+// AC7: skills-lock.json parses and contains adversarial-review-loop and arl
+test('skills-lock.json parses and contains adversarial-review-loop and arl (AC7)', () => {
   const lockPath = join(root, 'skills-lock.json');
   assert.ok(existsSync(lockPath), 'skills-lock.json must exist');
   const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
@@ -310,6 +350,23 @@ test('skills-lock.json parses and contains adversarial-review-loop (AC7)', () =>
     lock.skills['adversarial-review-loop'],
     'skills-lock.json must contain entry for adversarial-review-loop'
   );
+  assert.ok(
+    lock.skills['arl'],
+    'skills-lock.json must contain entry for arl'
+  );
+});
+
+// skills.sh.json exists, adheres to schema, and defines groupings with all three skills
+test('skills.sh.json exists and defines groupings with all three skills', () => {
+  const manifestPath = join(root, 'skills.sh.json');
+  assert.ok(existsSync(manifestPath), 'skills.sh.json must exist');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  assert.equal(manifest.$schema, 'https://skills.sh/schemas/skills.sh.schema.json');
+  assert.ok(Array.isArray(manifest.groupings), 'groupings must be an array');
+  const allSkills = manifest.groupings.flatMap((g) => g.skills);
+  assert.ok(allSkills.includes('adversarial-review'), 'skills.sh.json must include adversarial-review');
+  assert.ok(allSkills.includes('adversarial-review-loop'), 'skills.sh.json must include adversarial-review-loop');
+  assert.ok(allSkills.includes('arl'), 'skills.sh.json must include arl');
 });
 
 // AC10 (D25): src/llm.js identity and fallback strings pin.

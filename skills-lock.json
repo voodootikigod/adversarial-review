@@ -12,6 +12,12 @@
       "sourceType": "github",
       "skillPath": "skills/adversarial-review-loop/SKILL.md",
       "computedHash": "8ab286433c7cc823d1a5250ac21d92f04a50c31c20175a9d48d618d2d2692c42"
+    },
+    "arl": {
+      "source": "voodootikigod/adversarial-review",
+      "sourceType": "github",
+      "skillPath": "skills/arl/SKILL.md",
+      "computedHash": "66e4b20200ec8e1e1316263f161179be3abc9ad7e04f357a2e35c30ffb4a3311"
     }
   }
 }

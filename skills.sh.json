@@ -1,0 +1,15 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "notGrouped": "bottom",
+  "groupings": [
+    {
+      "title": "Adversarial Review",
+      "description": "Adversarial, ship/no-ship code review and iterative repair loops for AI coding agents.",
+      "skills": [
+        "adversarial-review",
+        "adversarial-review-loop",
+        "arl"
+      ]
+    }
+  ]
+}
